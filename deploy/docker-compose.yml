@@ -1,0 +1,49 @@
+services:
+  asterisk:
+    build: ./asterisk
+    networks:
+      vaani_net:
+        ipv4_address: 172.28.0.10
+    ports:
+      - "5060:5060/udp"
+      - "10000-19999:10000-19999/udp"
+    healthcheck:
+      test: ["CMD", "asterisk", "-rx", "core show uptime"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  vaani:
+    build: ..
+    depends_on:
+      asterisk:
+        condition: service_healthy
+    networks:
+      vaani_net:
+        ipv4_address: 172.28.0.20
+    environment:
+      ARI_URL: http://172.28.0.10:8088/ari
+      ARI_USER: vaani
+      ARI_PASS: vaani
+      ARI_APP: vaani
+      # MEDIA_IP is this service's own static IP on vaani_net: the address Asterisk
+      # dials RTP back to. See the MEDIA_IP decision in internal/config/config.go.
+      MEDIA_IP: 172.28.0.20
+      MEDIA_PORT_BASE: "20000"
+      MEDIA_PORT_COUNT: "256"
+      METRICS_ADDR: ":9091"
+    ports:
+      - "20000-20255:20000-20255/udp"
+      - "9091:9091/tcp"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9091/metrics"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+networks:
+  vaani_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
