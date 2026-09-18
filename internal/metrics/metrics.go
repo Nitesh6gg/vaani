@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"net/http/pprof"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -60,6 +61,47 @@ var (
 		Name: "vaani_ari_reconnects_total",
 		Help: "Total number of times the ARI WebSocket had to reconnect.",
 	})
+
+	RTPSendErrors = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "vaani_rtp_send_errors_total",
+		Help: "Total outbound RTP writes that failed (excludes swallowed ICMP unreachable).",
+	})
+
+	RTPLate = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "vaani_rtp_late_total",
+		Help: "Total inbound RTP packets discarded by the jitter buffer as arriving too late.",
+	})
+
+	RTPDuplicates = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "vaani_rtp_duplicates_total",
+		Help: "Total inbound RTP packets discarded by the jitter buffer as duplicates.",
+	})
+
+	RTPSilenceInserted = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "vaani_rtp_silence_inserted_total",
+		Help: "Total frames where the jitter buffer released concealment silence instead of real audio.",
+	})
+
+	RTPSSRCChanges = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "vaani_rtp_ssrc_changes_total",
+		Help: "Total mid-call SSRC changes observed on the inbound RTP stream.",
+	})
+
+	MediaWatchdogTimeouts = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "vaani_media_watchdog_timeouts_total",
+		Help: "Total times the media watchdog logged a call with no inbound packets for 5s.",
+	})
+
+	PacerDriftMs = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "vaani_pacer_drift_ms",
+		Help:    "Absolute difference between the writer loop's actual tick interval and the nominal 20ms.",
+		Buckets: []float64{0.5, 1, 2, 3, 5, 8, 13, 21},
+	})
+
+	AudioRMS = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "vaani_audio_rms",
+		Help: "RMS level of the last released inbound audio frame (not VAD; proves audio is flowing).",
+	})
 )
 
 // Sink adapts the package-level RTP counters to the media.Sink interface, keeping
@@ -71,15 +113,28 @@ func (Sink) PacketIn(bytes int) {
 	RTPBytesIn.Add(float64(bytes))
 }
 
-func (Sink) PacketOut() { RTPPacketsOut.Inc() }
-func (Sink) SeqGap()    { RTPSeqGaps.Inc() }
-func (Sink) Malformed() { RTPMalformed.Inc() }
+func (Sink) PacketOut()             { RTPPacketsOut.Inc() }
+func (Sink) SeqGap()                { RTPSeqGaps.Inc() }
+func (Sink) Malformed()             { RTPMalformed.Inc() }
+func (Sink) SendError()             { RTPSendErrors.Inc() }
+func (Sink) Late()                  { RTPLate.Inc() }
+func (Sink) Duplicate()             { RTPDuplicates.Inc() }
+func (Sink) SilenceInserted()       { RTPSilenceInserted.Inc() }
+func (Sink) SSRCChange()            { RTPSSRCChanges.Inc() }
+func (Sink) WatchdogTimeout()       { MediaWatchdogTimeouts.Inc() }
+func (Sink) PacerDrift(ms float64)  { PacerDriftMs.Observe(ms) }
+func (Sink) AudioLevel(rms float64) { AudioRMS.Set(rms) }
 
 // Serve runs the /metrics HTTP server on addr until ctx is cancelled, then shuts it
 // down gracefully.
 func Serve(ctx context.Context, addr string) error {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 
 	srv := &http.Server{
 		Addr:              addr,

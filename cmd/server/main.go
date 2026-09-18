@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -25,6 +26,10 @@ func run() error {
 	cfg, err := config.Load()
 	if err != nil {
 		return err
+	}
+
+	if cfg.AppMode == "agent" {
+		return fmt.Errorf("APP_MODE=agent has no Handler implementation yet (Phase 3); use APP_MODE=loopback")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

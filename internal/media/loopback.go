@@ -2,7 +2,9 @@ package media
 
 import (
 	"context"
+	"encoding/binary"
 	"log/slog"
+	"math"
 	"net"
 	"time"
 )
@@ -14,56 +16,110 @@ type Sink interface {
 	PacketOut()
 	SeqGap()
 	Malformed()
+	SendError()
+	Late()
+	Duplicate()
+	SilenceInserted()
+	SSRCChange()
+	WatchdogTimeout()
+	PacerDrift(ms float64)
+	AudioLevel(rms float64)
 }
 
-// CallMedia runs the loop-back media plane for exactly one call: one reader
-// goroutine (UDP -> buffered channel) and one writer goroutine (pacer -> UDP),
-// per the no-goroutine-per-frame invariant. Frames are recycled through the shared
-// sync.Pool on both sides.
-type CallMedia struct {
-	callID string
-	ep     *Endpoint
-	pacer  *Pacer
-	sender *Sender
-	sink   Sink
+// Config bundles a call's media pipeline tunables, kept separate from the fixed
+// callID/conn/sink triple so NewCallMedia's signature doesn't grow with every
+// phase. Handler defaults to LoopbackHandler if nil.
+type Config struct {
+	JitterBufferPackets int
+	FromWire            Endianness
+	Handler             Handler
+	RecordDir           string
+}
 
-	frames chan *[]byte
-	seq    SeqTracker
+// CallMedia runs the media pipeline for exactly one call:
+//
+//	UDP reader -> jitter buffer -> (20ms release tick) -> byte-order normalize ->
+//	Handler.ProcessFrame -> outbound queue -> (20ms write tick) -> UDP
+//
+// Release and write run on independent tickers so a slow Handler (an LLM call, in
+// Phase 3) never delays the paced outbound RTP stream -- a slow tick just means the
+// writer falls back to silence for that frame, per the pacer invariant that it
+// always emits exactly one packet per tick.
+type CallMedia struct {
+	callID   string
+	ep       *Endpoint
+	sink     Sink
+	jb       *JitterBuffer
+	handler  Handler
+	fromWire Endianness
+	recorder *WavRecorder
+	watchdog *Watchdog
+	seq      SeqTracker
+
+	releasePacer *Pacer
+	writePacer   *Pacer
+	sender       *Sender
+	outbound     chan *[]byte
+
+	prevRelease time.Time
 }
 
 // NewCallMedia wraps conn (already bound to the call's allocated port) into a
-// running loop-back media plane.
-func NewCallMedia(callID string, conn *net.UDPConn, sink Sink) *CallMedia {
+// running media pipeline.
+func NewCallMedia(callID string, conn *net.UDPConn, sink Sink, cfg Config) *CallMedia {
+	handler := cfg.Handler
+	if handler == nil {
+		handler = LoopbackHandler{}
+	}
+
 	return &CallMedia{
-		callID: callID,
-		ep:     NewEndpoint(conn),
-		pacer:  NewPacer(FrameInterval),
-		sender: NewSender(),
-		sink:   sink,
-		frames: make(chan *[]byte, 5),
+		callID:       callID,
+		ep:           NewEndpoint(conn),
+		sink:         sink,
+		jb:           NewJitterBuffer(cfg.JitterBufferPackets, sink),
+		handler:      handler,
+		fromWire:     cfg.FromWire,
+		recorder:     NewWavRecorder(cfg.RecordDir, callID),
+		watchdog:     NewWatchdog(callID, WatchdogTimeout, sink),
+		releasePacer: NewPacer(FrameInterval),
+		writePacer:   NewPacer(FrameInterval),
+		sender:       NewSender(),
+		outbound:     make(chan *[]byte, 5),
 	}
 }
 
-// Run starts the reader and writer goroutines and blocks until ctx is cancelled or
-// the UDP socket is closed. Cancelling ctx (or calling Close) is the mechanism by
-// which a caller tears down a call's media plane.
+// Run starts the pipeline's goroutines and blocks until ctx is cancelled or the
+// UDP socket errors out.
 func (c *CallMedia) Run(ctx context.Context) {
-	done := make(chan struct{})
+	readDone := make(chan struct{})
 
+	go c.watchdog.Run(ctx)
+	go c.releaseLoop(ctx)
 	go c.writeLoop(ctx)
-	go c.readLoop(ctx, done)
+	go c.readLoop(ctx, readDone)
 
 	<-ctx.Done()
-	c.pacer.Stop()
+	c.releasePacer.Stop()
+	c.writePacer.Stop()
 	_ = c.ep.Close()
-	<-done
+	<-readDone
+	c.recorder.Close()
 }
 
 // Close tears down the call's media plane; equivalent to cancelling the context
 // passed to Run, provided for callers that don't otherwise hold that cancel func.
 func (c *CallMedia) Close() {
-	c.pacer.Stop()
+	c.releasePacer.Stop()
+	c.writePacer.Stop()
 	_ = c.ep.Close()
+	c.recorder.Close()
+}
+
+// RemoteLocked reports whether a valid inbound packet has ever locked the outbound
+// RTP destination for this call. Callers should WARN at teardown if this is still
+// false -- it means no audio was ever received from Asterisk for the whole call.
+func (c *CallMedia) RemoteLocked() bool {
+	return c.ep.Remote() != nil
 }
 
 func (c *CallMedia) readLoop(ctx context.Context, done chan<- struct{}) {
@@ -95,9 +151,13 @@ func (c *CallMedia) readLoop(ctx context.Context, done chan<- struct{}) {
 			continue
 		}
 
-		c.ep.LockRemote(addr)
+		if c.ep.LockRemote(addr) {
+			slog.Info("rtp remote locked", "call_id", c.callID, "addr", addr)
+		}
+
 		c.sender.SetPayloadType(pkt.PayloadType)
 		c.sink.PacketIn(len(pkt.Payload))
+		c.watchdog.Touch()
 
 		if c.seq.Observe(pkt.SequenceNumber) {
 			c.sink.SeqGap()
@@ -107,55 +167,120 @@ func (c *CallMedia) readLoop(ctx context.Context, done chan<- struct{}) {
 		*frame = (*frame)[:0]
 		*frame = append(*frame, pkt.Payload...)
 
-		select {
-		case c.frames <- frame:
-		default:
-			// Buffered chan (capacity 5) is full: drop the oldest behavior would
-			// require an extra goroutine; instead drop this frame to keep the
-			// reader from ever blocking on the writer.
-			PutFrame(frame)
-		}
+		c.jb.Push(pkt.SequenceNumber, pkt.SSRC, frame)
 	}
 }
 
-func (c *CallMedia) writeLoop(ctx context.Context) {
-	c.pacer.Run(func(_ time.Time) {
+// releaseLoop pops one frame per tick from the jitter buffer, normalizes it to LE
+// PCM16, runs it through the Handler, and queues the result(s) for the writer.
+func (c *CallMedia) releaseLoop(ctx context.Context) {
+	c.releasePacer.Run(func(now time.Time) {
 		if ctx.Err() != nil {
 			return
 		}
 
-		var payload []byte
+		c.observeDrift(now)
 
-		select {
-		case frame := <-c.frames:
-			payload = *frame
+		raw := c.jb.Release()
+		pcm := *raw
 
-			defer PutFrame(frame)
-		default:
-			// No inbound frame ready yet: still emit on schedule so the far end's
-			// jitter buffer sees a steady 20ms cadence, per the pacer invariant.
-			silence := GetFrame()
-			defer PutFrame(silence)
+		NormalizeToLE(pcm, c.fromWire)
+		c.recorder.WriteIn(pcm)
+		c.sink.AudioLevel(rms(pcm))
 
-			payload = *silence
-			for i := range payload {
-				payload[i] = 0
+		for _, frame := range c.handler.ProcessFrame(ctx, c.callID, pcm) {
+			out := GetFrame()
+			*out = (*out)[:0]
+			*out = append(*out, frame...)
+
+			select {
+			case c.outbound <- out:
+			default:
+				// Writer isn't keeping up; drop rather than block release/handler.
+				PutFrame(out)
 			}
 		}
 
-		pkt := c.sender.Build(payload)
+		PutFrame(raw)
+	})
+}
+
+// writeLoop drains the outbound queue on its own tick and sends each frame as
+// paced RTP. If nothing is queued yet (handler underrun, or startup), it still
+// emits a silence frame on schedule, per the pacer invariant.
+func (c *CallMedia) writeLoop(ctx context.Context) {
+	c.writePacer.Run(func(_ time.Time) {
+		if ctx.Err() != nil {
+			return
+		}
+
+		var frame *[]byte
+
+		select {
+		case f := <-c.outbound:
+			frame = f
+		default:
+			frame = GetFrame()
+			*frame = (*frame)[:FrameSize]
+
+			for i := range *frame {
+				(*frame)[i] = 0
+			}
+		}
+
+		c.recorder.WriteOut(*frame)
+
+		pkt := c.sender.Build(*frame)
 
 		out, err := pkt.Marshal()
+
+		PutFrame(frame)
+
 		if err != nil {
 			slog.Error("rtp marshal error", "call_id", c.callID, "error", err)
 			return
 		}
 
-		if err := c.ep.WriteTo(out); err != nil {
+		sent, err := c.ep.WriteTo(out)
+		if err != nil {
+			c.sink.SendError()
 			slog.Warn("rtp write error", "call_id", c.callID, "error", err)
+
 			return
 		}
 
-		c.sink.PacketOut()
+		if sent {
+			c.sink.PacketOut()
+		}
 	})
+}
+
+// observeDrift reports the absolute difference between this release tick's actual
+// interval and the nominal 20ms, for the vaani_pacer_drift_ms histogram.
+func (c *CallMedia) observeDrift(now time.Time) {
+	if !c.prevRelease.IsZero() {
+		delta := now.Sub(c.prevRelease)
+		driftMs := math.Abs(float64(delta-FrameInterval)) / float64(time.Millisecond)
+		c.sink.PacerDrift(driftMs)
+	}
+
+	c.prevRelease = now
+}
+
+// rms computes the root-mean-square level of a little-endian PCM16 buffer. Not
+// VAD -- just an observability signal that real audio (not silence) is flowing.
+func rms(pcm []byte) float64 {
+	n := len(pcm) / 2
+	if n == 0 {
+		return 0
+	}
+
+	var sumSq float64
+
+	for i := 0; i < n; i++ {
+		s := float64(int16(binary.LittleEndian.Uint16(pcm[i*2:])))
+		sumSq += s * s
+	}
+
+	return math.Sqrt(sumSq / float64(n))
 }

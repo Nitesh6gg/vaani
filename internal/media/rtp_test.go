@@ -1,7 +1,9 @@
 package media
 
 import (
+	"net"
 	"testing"
+	"time"
 
 	"github.com/pion/rtp"
 	"github.com/stretchr/testify/assert"
@@ -82,4 +84,52 @@ func TestSeqTracker(t *testing.T) {
 	tr = SeqTracker{}
 	tr.Observe(65535)
 	assert.False(t, tr.Observe(0), "sequence wraparound must not be flagged as a gap")
+}
+
+// TestEndpoint_NoSendBeforeLock is the Phase 1 carryover invariant: zero outbound
+// packets until a valid inbound packet locks the remote address -- no fallback
+// destination, ever.
+func TestEndpoint_NoSendBeforeLock(t *testing.T) {
+	local, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	defer func() { _ = local.Close() }()
+
+	ep := NewEndpoint(local)
+
+	sent, err := ep.WriteTo([]byte("hello"))
+	require.NoError(t, err)
+	assert.False(t, sent, "WriteTo must not send anything before a remote is locked")
+}
+
+// TestEndpoint_LockRemoteThenSend confirms the full contract: LockRemote reports
+// true exactly once (the first caller), and WriteTo only reports sent=true once a
+// remote is known, with a real packet actually observed on the wire.
+func TestEndpoint_LockRemoteThenSend(t *testing.T) {
+	server, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	defer func() { _ = server.Close() }()
+
+	client, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+
+	ep := NewEndpoint(server)
+
+	clientAddr := client.LocalAddr().(*net.UDPAddr)
+
+	assert.True(t, ep.LockRemote(clientAddr), "first LockRemote call must report locked=true")
+	assert.False(t, ep.LockRemote(&net.UDPAddr{IP: net.IPv4(9, 9, 9, 9), Port: 1}),
+		"a second LockRemote call must be a no-op and report false")
+	assert.Equal(t, clientAddr.String(), ep.Remote().String(), "remote must stay the first address, not the second")
+
+	sent, err := ep.WriteTo([]byte("payload"))
+	require.NoError(t, err)
+	assert.True(t, sent, "WriteTo must report sent=true once a remote is locked")
+
+	buf := make([]byte, 64)
+	_ = client.SetReadDeadline(time.Now().Add(2 * time.Second))
+
+	n, _, err := client.ReadFromUDP(buf)
+	require.NoError(t, err, "the packet must actually arrive at the locked remote")
+	assert.Equal(t, "payload", string(buf[:n]))
 }

@@ -20,10 +20,18 @@ Register a softphone (Zoiper, Linphone, ...) against the Asterisk container:
 - SIP server: `localhost:5060` (UDP)
 - Username / password: `1001` / `vaani1001` (`deploy/asterisk/pjsip.conf`)
 
-Dial extension `1001`. You should hear your own voice echoed back with low
-latency -- that's the Phase 1 loop-back path
-(`deploy/asterisk/extensions.conf` -> `Stasis(vaani)` -> externalMedia RTP ->
-`internal/media` loop-back -> back to you).
+Dial extension `1001`. You should hear your own voice echoed back -- that's the
+loop-back path (`deploy/asterisk/extensions.conf` -> `Stasis(vaani)` ->
+externalMedia RTP -> `internal/media` pipeline -> back to you).
+
+**Expected latency (Phase 2):** perceived round-trip latency is higher than
+Phase 1's direct passthrough by roughly one jitter buffer window --
+**~60ms at the default `JITTER_BUFFER_PACKETS=3`** -- since audio is now held
+briefly for possible reordering before release (see "Jitter Buffer" in
+`docs/AUDIO_PIPELINE.md`). This is expected, not a regression. For latency-
+sensitive manual ear-testing, set `JITTER_BUFFER_PACKETS=1` (20ms window); leave
+it at the default for load testing, since loss concealment is what that
+validates.
 
 ## Metrics
 

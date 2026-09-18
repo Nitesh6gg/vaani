@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/nitesh/vaani/internal/media"
 )
 
 // Config holds all environment-derived settings for the server.
@@ -32,6 +34,23 @@ type Config struct {
 
 	// MetricsAddr is the listen address for the Prometheus /metrics endpoint.
 	MetricsAddr string
+
+	// AudioL16Endianness is "le" or "be": the wire byte order of inbound RTP L16
+	// payloads, from the cmd/endianness-check finding recorded in
+	// docs/AUDIO_PIPELINE.md. Everything past the jitter buffer is normalized to LE.
+	AudioL16Endianness string
+
+	// JitterBufferPackets is the fixed reorder window size, in 20ms packets
+	// (default 3 = 60ms). Range 1-10.
+	JitterBufferPackets int
+
+	// RecordDir, if set, enables per-call debug WAV recording (both directions,
+	// post-normalization) under this directory. Empty disables recording.
+	RecordDir string
+
+	// AppMode selects the per-call Handler: "loopback" (default, Phase 1 behavior)
+	// or "agent" (Phase 3).
+	AppMode string
 }
 
 // Load reads configuration from the environment, applying local-dev defaults that
@@ -42,14 +61,18 @@ func Load() (Config, error) {
 	loadDotenv()
 
 	cfg := Config{
-		AriURL:         getEnv("ARI_URL", "http://localhost:8088/ari"),
-		AriUser:        getEnv("ARI_USER", "vaani"),
-		AriPass:        getEnv("ARI_PASS", "vaani"),
-		AriApp:         getEnv("ARI_APP", "vaani"),
-		MediaIP:        getEnv("MEDIA_IP", "127.0.0.1"),
-		MediaPortBase:  20000,
-		MediaPortCount: 256,
-		MetricsAddr:    getEnv("METRICS_ADDR", ":9091"),
+		AriURL:              getEnv("ARI_URL", "http://localhost:8088/ari"),
+		AriUser:             getEnv("ARI_USER", "vaani"),
+		AriPass:             getEnv("ARI_PASS", "vaani"),
+		AriApp:              getEnv("ARI_APP", "vaani"),
+		MediaIP:             getEnv("MEDIA_IP", "127.0.0.1"),
+		MediaPortBase:       20000,
+		MediaPortCount:      256,
+		MetricsAddr:         getEnv("METRICS_ADDR", ":9091"),
+		AudioL16Endianness:  getEnv("AUDIO_L16_ENDIANNESS", "le"),
+		JitterBufferPackets: 3,
+		RecordDir:           getEnv("RECORD_DIR", ""),
+		AppMode:             getEnv("APP_MODE", "loopback"),
 	}
 
 	var err error
@@ -64,6 +87,22 @@ func Load() (Config, error) {
 
 	if cfg.MediaPortCount <= 0 {
 		return Config{}, fmt.Errorf("config: MEDIA_PORT_COUNT must be positive, got %d", cfg.MediaPortCount)
+	}
+
+	if cfg.JitterBufferPackets, err = getEnvInt("JITTER_BUFFER_PACKETS", cfg.JitterBufferPackets); err != nil {
+		return Config{}, err
+	}
+
+	if cfg.JitterBufferPackets < 1 || cfg.JitterBufferPackets > 10 {
+		return Config{}, fmt.Errorf("config: JITTER_BUFFER_PACKETS must be 1-10, got %d", cfg.JitterBufferPackets)
+	}
+
+	if _, err := media.ParseEndianness(cfg.AudioL16Endianness); err != nil {
+		return Config{}, err
+	}
+
+	if cfg.AppMode != "loopback" && cfg.AppMode != "agent" {
+		return Config{}, fmt.Errorf("config: APP_MODE must be \"loopback\" or \"agent\", got %q", cfg.AppMode)
 	}
 
 	return cfg, nil

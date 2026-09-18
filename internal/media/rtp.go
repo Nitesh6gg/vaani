@@ -158,14 +158,19 @@ func (e *Endpoint) ReadFrom(buf []byte) (int, *net.UDPAddr, error) {
 }
 
 // LockRemote sets the outbound destination the first time it's called; later calls
-// are no-ops, per the "lock to first inbound packet" invariant.
-func (e *Endpoint) LockRemote(addr *net.UDPAddr) {
+// are no-ops, per the "lock to first inbound packet" invariant. It reports whether
+// this call was the one that performed the lock, so callers can log the transition
+// exactly once.
+func (e *Endpoint) LockRemote(addr *net.UDPAddr) (locked bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	if e.remote == nil {
 		e.remote = addr
+		return true
 	}
+
+	return false
 }
 
 // Remote returns the locked outbound destination, or nil if none is known yet.
@@ -176,21 +181,27 @@ func (e *Endpoint) Remote() *net.UDPAddr {
 	return e.remote
 }
 
-// WriteTo sends b to the locked remote address. It is a silent no-op if no remote
-// is known yet, and swallows ICMP-induced connection-refused errors from a closed
-// or unreachable peer rather than propagating them as call-ending failures.
-func (e *Endpoint) WriteTo(b []byte) error {
+// WriteTo sends b to the locked remote address. sent is true only when a packet
+// was actually handed to the kernel successfully -- never true before a remote is
+// locked, and never true on error, so callers can count real transmissions instead
+// of attempts. ICMP-induced connection-refused errors from a closed or unreachable
+// peer are swallowed (sent=false, err=nil) rather than propagated as call-ending
+// failures.
+func (e *Endpoint) WriteTo(b []byte) (sent bool, err error) {
 	remote := e.Remote()
 	if remote == nil {
-		return nil
+		return false, nil
 	}
 
-	_, err := e.conn.WriteToUDP(b, remote)
-	if err != nil && errors.Is(err, syscall.ECONNREFUSED) {
-		return nil
+	if _, err = e.conn.WriteToUDP(b, remote); err != nil {
+		if errors.Is(err, syscall.ECONNREFUSED) {
+			return false, nil
+		}
+
+		return false, err
 	}
 
-	return err
+	return true, nil
 }
 
 // Close closes the underlying UDP socket.

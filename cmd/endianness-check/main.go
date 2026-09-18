@@ -252,7 +252,7 @@ func probe(port int) ([]byte, error) {
 				return
 			}
 
-			_ = ep.WriteTo(out)
+			_, _ = ep.WriteTo(out)
 		})
 		close(done)
 	}()

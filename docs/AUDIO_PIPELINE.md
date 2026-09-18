@@ -2,8 +2,70 @@
 
 Audio path: Asterisk PJSIP endpoint (ulaw) -> Asterisk transcodes -> externalMedia
 RTP/UDP leg to the Go service, slin16 (16kHz 16-bit mono PCM) end-to-end on that leg.
-See `internal/media/` for the RTP endpoint, pacer, buffer pool, and loop-back
-handler, and `CLAUDE.md` for the invariants they implement.
+See `internal/media/` for the RTP endpoint, pacer, buffer pool, jitter buffer, and
+Handler pipeline, and `CLAUDE.md` for the invariants they implement.
+
+## Pipeline (Phase 2)
+
+```
+UDP reader -> jitter buffer -> (20ms release tick) -> byte-order normalize
+  -> Handler.ProcessFrame -> outbound queue -> (20ms write tick) -> UDP
+```
+
+Release and write run on independent 20ms tickers (`internal/media/pacer.go`),
+connected by a small buffered channel. This decouples Handler processing time
+from RTP pacing: once Phase 3 puts an LLM/TTS call inside `ProcessFrame`, a slow
+tick just falls back to a silence-filled outbound frame for that interval rather
+than delaying or bursting the paced RTP stream. See `internal/media/loopback.go`.
+
+## Jitter Buffer
+
+`internal/media/jitterbuffer.go` is a fixed-size ring buffer (`JITTER_BUFFER_PACKETS`,
+default 3 = 60ms) keyed by RTP sequence number, using RFC 1982 serial-number
+arithmetic so 16-bit sequence wraparound is handled correctly:
+
+- **Reorder**: packets arriving within the window ahead of the next-expected
+  sequence are held and released in order, not lateness.
+- **Late** (`vaani_rtp_late_total`): a packet behind the window's current
+  position is discarded -- releasing it now would be out of order.
+- **Duplicate** (`vaani_rtp_duplicates_total`): a second packet for a sequence
+  number already buffered is discarded.
+- **Loss concealment** (`vaani_rtp_silence_inserted_total`): if the
+  next-expected sequence hasn't arrived by its release tick, a pooled, zeroed
+  silence frame is released instead -- one per missing packet, not a stall.
+- **SSRC change** (`vaani_rtp_ssrc_changes_total`): a new SSRC drops every
+  buffered frame and re-anchors the window on the new stream's sequence number.
+
+It owns pooled frame buffers end-to-end (`internal/media/pool.go`): frames pushed
+in are either stored or immediately returned to the pool if discarded; frames
+released out are the caller's responsibility to return. Zero allocations in
+steady state, verified by `TestJitterBuffer_ZeroAllocInSteadyState`.
+
+Ear-test note: the jitter buffer adds up to one window's worth of latency (60ms
+at the default `JITTER_BUFFER_PACKETS=3`) versus Phase 1's direct passthrough,
+since audio is now held for possible reordering before release. Set
+`JITTER_BUFFER_PACKETS=1` for latency-sensitive manual testing; the load test
+should use the default, since loss concealment is exactly what it validates.
+
+## The Handler Contract
+
+`internal/media/handler.go` defines the seam Phase 3 plugs into:
+
+```go
+type Handler interface {
+    ProcessFrame(ctx context.Context, callID string, pcm []byte) [][]byte
+}
+```
+
+`pcm` is always exactly one 20ms frame (640 bytes) of **little-endian PCM16**,
+already jitter-buffered and byte-order-normalized -- Handler implementations
+never see raw wire bytes or need to know the actual `AUDIO_L16_ENDIANNESS`.
+Called once per release tick, from a single goroutine per call, so
+implementations need no internal locking. `LoopbackHandler`
+(`internal/media/handler.go`) is Phase 1's behavior preserved as the first
+implementation: return the input frame unchanged. When Phase 3 arrives, STT
+feeding, LLM streaming, and TTS playout become one `ProcessFrame` implementation
+plus per-call state -- no transport code changes.
 
 ## Endianness Verification
 
@@ -11,6 +73,13 @@ RTP L16 payloads are nominally big-endian per RFC 3551, but that's a generic
 profile default, not a guarantee about a specific Asterisk build's externalMedia
 implementation -- so it's checked empirically rather than assumed, since Phase 3
 (STT) needs to know which byte order it's receiving.
+
+The result feeds `AUDIO_L16_ENDIANNESS` (`le` or `be`, see `.env.example`), which
+`internal/media.NormalizeToLE` uses to convert inbound payloads to little-endian
+before they ever reach the jitter buffer's release or a Handler -- see "The
+Handler Contract" below. **Status: defaults to `le` pending an actual probe run
+against a live stack; the probe below has not yet been executed and appended.**
+Run it and set `AUDIO_L16_ENDIANNESS` accordingly before trusting Phase 3 audio.
 
 Run `cmd/endianness-check` against a live `make up` stack:
 
