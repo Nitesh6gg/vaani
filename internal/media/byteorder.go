@@ -2,6 +2,8 @@ package media
 
 import (
 	"fmt"
+	"log/slog"
+	"os"
 	"strings"
 )
 
@@ -28,6 +30,18 @@ func ParseEndianness(s string) (Endianness, error) {
 		return BigEndian, nil
 	default:
 		return LittleEndian, fmt.Errorf("media: invalid AUDIO_L16_ENDIANNESS %q (want \"le\" or \"be\")", s)
+	}
+}
+
+// WarnIfUnset logs a startup warning if AUDIO_L16_ENDIANNESS was never
+// explicitly configured (real environment or .env, both of which config.Load
+// resolves into the real process environment before this runs) -- the "le"
+// default is an assumption, not a verified fact, until cmd/endianness-check has
+// actually run against the live stack. Call this once at startup, after
+// config.Load.
+func WarnIfUnset() {
+	if v, ok := os.LookupEnv("AUDIO_L16_ENDIANNESS"); !ok || v == "" {
+		slog.Warn("endianness unverified -- set AUDIO_L16_ENDIANNESS after running cmd/endianness-check")
 	}
 }
 

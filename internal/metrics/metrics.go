@@ -92,6 +92,11 @@ var (
 		Help: "Total times the jitter buffer froze after sustained misses and re-anchored on a later packet.",
 	})
 
+	RTPSilenceSent = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "vaani_rtp_silence_sent_total",
+		Help: "Total outbound RTP packets that were zeroed silence because the handler's outbound queue was empty on that tick.",
+	})
+
 	MediaWatchdogTimeouts = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "vaani_media_watchdog_timeouts_total",
 		Help: "Total times the media watchdog logged a call with no inbound packets for 5s.",
@@ -127,6 +132,7 @@ func (Sink) Duplicate()             { RTPDuplicates.Inc() }
 func (Sink) SilenceInserted()       { RTPSilenceInserted.Inc() }
 func (Sink) SSRCChange()            { RTPSSRCChanges.Inc() }
 func (Sink) Reanchor()              { JitterBufferReanchors.Inc() }
+func (Sink) SilenceSent()           { RTPSilenceSent.Inc() }
 func (Sink) WatchdogTimeout()       { MediaWatchdogTimeouts.Inc() }
 func (Sink) PacerDrift(ms float64)  { PacerDriftMs.Observe(ms) }
 func (Sink) AudioLevel(rms float64) { AudioRMS.Set(rms) }

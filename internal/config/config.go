@@ -51,6 +51,12 @@ type Config struct {
 	// AppMode selects the per-call Handler: "loopback" (default, Phase 1 behavior)
 	// or "agent" (Phase 3).
 	AppMode string
+
+	// TestSilentHandler, when true (TEST_SILENT_HANDLER=1), forces every call to
+	// use media.SilentHandler regardless of AppMode -- a debug hook for
+	// deterministically exercising the write tick's silence-fallback path. Never
+	// set this in production; it means calls carry no audio at all.
+	TestSilentHandler bool
 }
 
 // Load reads configuration from the environment, applying local-dev defaults that
@@ -73,6 +79,7 @@ func Load() (Config, error) {
 		JitterBufferPackets: 3,
 		RecordDir:           getEnv("RECORD_DIR", ""),
 		AppMode:             getEnv("APP_MODE", "loopback"),
+		TestSilentHandler:   getEnv("TEST_SILENT_HANDLER", "") == "1",
 	}
 
 	var err error

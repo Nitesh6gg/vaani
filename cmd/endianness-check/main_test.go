@@ -30,6 +30,16 @@ func TestAnalyze_DetectsBigEndian(t *testing.T) {
 	assert.Less(t, v.BigEndianScore, v.LittleEndianScore)
 }
 
+// TestVerdict_EnvValue confirms EnvValue's output is ready to paste as-is into
+// AUDIO_L16_ENDIANNESS -- it must agree with LittleEndian() in both directions.
+func TestVerdict_EnvValue(t *testing.T) {
+	le := analyze(encodeTone(t, binary.LittleEndian))
+	assert.Equal(t, "le", le.EnvValue())
+
+	be := analyze(encodeTone(t, binary.BigEndian))
+	assert.Equal(t, "be", be.EnvValue())
+}
+
 func encodeTone(t *testing.T, order binary.ByteOrder) []byte {
 	t.Helper()
 

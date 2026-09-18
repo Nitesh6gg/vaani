@@ -22,6 +22,7 @@ type Sink interface {
 	SilenceInserted()
 	SSRCChange()
 	Reanchor()
+	SilenceSent()
 	WatchdogTimeout()
 	PacerDrift(ms float64)
 	AudioLevel(rms float64)
@@ -207,8 +208,11 @@ func (c *CallMedia) releaseLoop(ctx context.Context) {
 }
 
 // writeLoop drains the outbound queue on its own tick and sends each frame as
-// paced RTP. If nothing is queued yet (handler underrun, or startup), it still
-// emits a silence frame on schedule, per the pacer invariant.
+// paced RTP. RTP must never starve on an active call: if the queue is empty --
+// handler underrun, startup, or a Handler that legitimately has nothing to say
+// this tick -- it still transmits a zeroed silence frame on schedule, per the
+// pacer invariant that exactly one packet goes out every tick once a remote is
+// locked.
 func (c *CallMedia) writeLoop(ctx context.Context) {
 	c.writePacer.Run(func(_ time.Time) {
 		if ctx.Err() != nil {
@@ -217,11 +221,14 @@ func (c *CallMedia) writeLoop(ctx context.Context) {
 
 		var frame *[]byte
 
+		isSilenceFallback := false
+
 		select {
 		case f := <-c.outbound:
 			frame = f
 		default:
 			frame = silentFrame()
+			isSilenceFallback = true
 		}
 
 		c.recorder.WriteOut(*frame)
@@ -247,6 +254,10 @@ func (c *CallMedia) writeLoop(ctx context.Context) {
 
 		if sent {
 			c.sink.PacketOut()
+
+			if isSilenceFallback {
+				c.sink.SilenceSent()
+			}
 		}
 	})
 }

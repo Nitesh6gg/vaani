@@ -1,8 +1,11 @@
 package media
 
 import (
+	"bytes"
 	"encoding/binary"
+	"log/slog"
 	"math"
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -72,4 +75,48 @@ func TestNormalizeToLE_OddTrailingByteLeftAlone(t *testing.T) {
 
 	assert.NotPanics(t, func() { NormalizeToLE(pcm, BigEndian) })
 	assert.Equal(t, byte(0x03), pcm[2], "trailing unpaired byte must be left untouched")
+}
+
+func TestWarnIfUnset_LogsWhenEnvVarAbsent(t *testing.T) {
+	restoreLogger := captureSlog(t)
+
+	orig, existed := os.LookupEnv("AUDIO_L16_ENDIANNESS")
+	require.NoError(t, os.Unsetenv("AUDIO_L16_ENDIANNESS"))
+
+	t.Cleanup(func() {
+		if existed {
+			_ = os.Setenv("AUDIO_L16_ENDIANNESS", orig)
+		}
+	})
+
+	buf := restoreLogger()
+	WarnIfUnset()
+
+	assert.Contains(t, buf.String(), "endianness unverified")
+}
+
+func TestWarnIfUnset_SilentWhenEnvVarSet(t *testing.T) {
+	restoreLogger := captureSlog(t)
+
+	t.Setenv("AUDIO_L16_ENDIANNESS", "le")
+
+	buf := restoreLogger()
+	WarnIfUnset()
+
+	assert.Empty(t, buf.String(), "must not warn once AUDIO_L16_ENDIANNESS is explicitly set")
+}
+
+// captureSlog swaps the default slog logger for one writing to a buffer, restores
+// it on test cleanup, and returns a function that hands back that buffer (called
+// after any env setup so log output from unrelated setup doesn't pollute it).
+func captureSlog(t *testing.T) func() *bytes.Buffer {
+	t.Helper()
+
+	buf := &bytes.Buffer{}
+	original := slog.Default()
+
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(original) })
+
+	return func() *bytes.Buffer { return buf }
 }

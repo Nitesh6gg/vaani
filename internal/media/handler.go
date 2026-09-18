@@ -24,3 +24,14 @@ type LoopbackHandler struct{}
 func (LoopbackHandler) ProcessFrame(_ context.Context, _ string, pcm []byte) [][]byte {
 	return [][]byte{pcm}
 }
+
+// SilentHandler returns zero frames for every input. It's a debug hook
+// (TEST_SILENT_HANDLER=1) for deterministically exercising the write tick's
+// silence-fallback path -- RTP must never starve on an active call even when a
+// Handler has nothing to send.
+type SilentHandler struct{}
+
+// ProcessFrame implements Handler by always returning no frames.
+func (SilentHandler) ProcessFrame(_ context.Context, _ string, _ []byte) [][]byte {
+	return nil
+}

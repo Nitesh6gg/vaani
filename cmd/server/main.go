@@ -32,6 +32,8 @@ func run() error {
 		return fmt.Errorf("APP_MODE=agent has no Handler implementation yet (Phase 3); use APP_MODE=loopback")
 	}
 
+	media.WarnIfUnset()
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 

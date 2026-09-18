@@ -151,6 +151,7 @@ func run() error {
 	slog.Info("endianness verdict", "result", verdict.String())
 
 	fmt.Println(verdict.String())
+	fmt.Printf("\nSet this in the service's environment (.env or real env):\n\nAUDIO_L16_ENDIANNESS=%s\n\n", verdict.EnvValue())
 
 	return appendToDocs(verdict)
 }
@@ -298,6 +299,16 @@ type Verdict struct {
 // LittleEndian reports whether the little-endian interpretation is the smoother
 // (and therefore correct) one.
 func (v Verdict) LittleEndian() bool { return v.LittleEndianScore <= v.BigEndianScore }
+
+// EnvValue returns the AUDIO_L16_ENDIANNESS value ("le" or "be") this verdict
+// implies, ready to paste into the service's environment/.env.
+func (v Verdict) EnvValue() string {
+	if v.LittleEndian() {
+		return "le"
+	}
+
+	return "be"
+}
 
 func (v Verdict) String() string {
 	order := "big-endian (s16be)"

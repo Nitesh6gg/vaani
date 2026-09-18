@@ -211,11 +211,19 @@ func (m *Manager) completeBridge(c *call) {
 		slog.Error("invalid AUDIO_L16_ENDIANNESS", "call_id", c.ID, "error", err)
 	}
 
+	var handler media.Handler
+	if m.cfg.TestSilentHandler {
+		slog.Warn("TEST_SILENT_HANDLER=1: this call will carry no audio", "call_id", c.ID)
+
+		handler = media.SilentHandler{}
+	}
+
 	c.bridge = bh
 	c.cm = media.NewCallMedia(c.ID, conn, metrics.Sink{}, media.Config{
 		JitterBufferPackets: m.cfg.JitterBufferPackets,
 		FromWire:            fromWire,
 		RecordDir:           m.cfg.RecordDir,
+		Handler:             handler,
 	})
 
 	m.mu.Lock()

@@ -18,6 +18,16 @@ from RTP pacing: once Phase 3 puts an LLM/TTS call inside `ProcessFrame`, a slow
 tick just falls back to a silence-filled outbound frame for that interval rather
 than delaying or bursting the paced RTP stream. See `internal/media/loopback.go`.
 
+**RTP must never starve on an active call.** Once a remote is locked, the write
+tick always transmits exactly one packet every 20ms: a real frame from the
+handler's outbound queue, or a zeroed LE PCM16 silence frame
+(`vaani_rtp_silence_sent_total`) if the queue is empty that tick -- handler
+underrun, startup, or a Handler that legitimately produced nothing. Set
+`TEST_SILENT_HANDLER=1` to force every call's Handler to produce zero frames on
+every tick, deterministically exercising this path (never set it in production --
+calls carry no audio at all); see `TestCallMedia_SilentHandlerAlwaysTransmitsSilence`
+in `internal/media/loopback_test.go`.
+
 ## Jitter Buffer
 
 `internal/media/jitterbuffer.go` is a fixed-size ring buffer (`JITTER_BUFFER_PACKETS`,
@@ -103,6 +113,9 @@ before they ever reach the jitter buffer's release or a Handler -- see "The
 Handler Contract" below. **Status: defaults to `le` pending an actual probe run
 against a live stack; the probe below has not yet been executed and appended.**
 Run it and set `AUDIO_L16_ENDIANNESS` accordingly before trusting Phase 3 audio.
+Until it's explicitly set (real environment or `.env`), `cmd/server` logs a
+startup warning (`internal/media.WarnIfUnset`) so an unverified assumption never
+passes silently.
 
 Run `cmd/endianness-check` against a live `make up` stack:
 
@@ -115,7 +128,8 @@ It originates a dialplan `Echo()` leg (`deploy/asterisk/extensions.conf`, contex
 sends a 2s 440Hz tone as little-endian PCM16, and scores what echoes back under
 both byte-order interpretations by mean absolute sample-to-sample delta -- a real
 waveform has small deltas, and byte-swapping a smooth waveform scrambles it into
-large ones, so the lower-scoring interpretation is the correct one. The tool prints
-its verdict and appends it below.
+large ones, so the lower-scoring interpretation is the correct one. On success it
+prints its verdict, an `AUDIO_L16_ENDIANNESS=le`/`be` line ready to paste into the
+service's environment, and appends the verdict below.
 
 <!-- cmd/endianness-check appends its result below this line; do not hand-edit -->
