@@ -21,6 +21,7 @@ type Sink interface {
 	Duplicate()
 	SilenceInserted()
 	SSRCChange()
+	Reanchor()
 	WatchdogTimeout()
 	PacerDrift(ms float64)
 	AudioLevel(rms float64)
@@ -220,12 +221,7 @@ func (c *CallMedia) writeLoop(ctx context.Context) {
 		case f := <-c.outbound:
 			frame = f
 		default:
-			frame = GetFrame()
-			*frame = (*frame)[:FrameSize]
-
-			for i := range *frame {
-				(*frame)[i] = 0
-			}
+			frame = silentFrame()
 		}
 
 		c.recorder.WriteOut(*frame)

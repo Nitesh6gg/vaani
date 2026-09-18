@@ -87,6 +87,11 @@ var (
 		Help: "Total mid-call SSRC changes observed on the inbound RTP stream.",
 	})
 
+	JitterBufferReanchors = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "vaani_jb_reanchors_total",
+		Help: "Total times the jitter buffer froze after sustained misses and re-anchored on a later packet.",
+	})
+
 	MediaWatchdogTimeouts = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "vaani_media_watchdog_timeouts_total",
 		Help: "Total times the media watchdog logged a call with no inbound packets for 5s.",
@@ -121,6 +126,7 @@ func (Sink) Late()                  { RTPLate.Inc() }
 func (Sink) Duplicate()             { RTPDuplicates.Inc() }
 func (Sink) SilenceInserted()       { RTPSilenceInserted.Inc() }
 func (Sink) SSRCChange()            { RTPSSRCChanges.Inc() }
+func (Sink) Reanchor()              { JitterBufferReanchors.Inc() }
 func (Sink) WatchdogTimeout()       { MediaWatchdogTimeouts.Inc() }
 func (Sink) PacerDrift(ms float64)  { PacerDriftMs.Observe(ms) }
 func (Sink) AudioLevel(rms float64) { AudioRMS.Set(rms) }

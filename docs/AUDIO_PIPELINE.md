@@ -35,6 +35,29 @@ arithmetic so 16-bit sequence wraparound is handled correctly:
   silence frame is released instead -- one per missing packet, not a stall.
 - **SSRC change** (`vaani_rtp_ssrc_changes_total`): a new SSRC drops every
   buffered frame and re-anchors the window on the new stream's sequence number.
+- **Priming**: releases are a pure no-op (no metric, no state change) until at
+  least `JITTER_BUFFER_PACKETS` real packets are buffered. Without this, the
+  release ticker -- which starts firing the instant the media plane starts, on
+  its own fixed schedule, independent of when RTP actually begins flowing --
+  could advance past sequence numbers no packet had reached yet, permanently
+  racing ahead of the real stream. This was a real production bug (see below).
+- **Starve-freeze + re-anchor** (`vaani_jb_reanchors_total`): Vaani's release
+  ticker and Asterisk's RTP pacing clock are two independent, unsynchronized
+  20ms clocks that drift relative to each other over a long call. After 3
+  consecutive missed releases, the window freezes (stops advancing) rather than
+  keep guessing; the next packet that arrives at or after the frozen position
+  re-anchors the window there and re-primes.
+
+**Production incident (fixed in the commit that added priming/starve-freeze/
+re-anchor):** a live call showed `vaani_rtp_late_total` at 94.5% of inbound
+packets, `vaani_audio_rms` pinned at 0, and total silence for the caller, despite
+clean bidirectional RTP confirmed by `tcpdump` on the Asterisk box. Root cause:
+the release ticker fired before the first packet ever arrived and kept advancing
+`expected` with no way to recover once out of phase with the real stream --
+exactly the failure priming and starve-freeze/re-anchor exist to prevent. Verified
+by reproducing the old (pre-fix) logic against the same adversarial-timing test
+and confirming it hit 99.98% late on a scenario the fixed buffer bounds to ~12%
+(`internal/media/jitterbuffer_test.go`).
 
 It owns pooled frame buffers end-to-end (`internal/media/pool.go`): frames pushed
 in are either stored or immediately returned to the pool if discarded; frames

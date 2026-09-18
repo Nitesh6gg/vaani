@@ -23,6 +23,7 @@ func (fakeCallSink) Late()              {}
 func (fakeCallSink) Duplicate()         {}
 func (fakeCallSink) SilenceInserted()   {}
 func (fakeCallSink) SSRCChange()        {}
+func (fakeCallSink) Reanchor()          {}
 func (fakeCallSink) WatchdogTimeout()   {}
 func (fakeCallSink) PacerDrift(float64) {}
 func (fakeCallSink) AudioLevel(float64) {}
