@@ -23,6 +23,9 @@ import (
 type call struct {
 	*session.Call
 
+	// conn is bound before Asterisk is ever told the address, so no RTP can
+	// arrive at a closed port -- see startCall.
+	conn   *net.UDPConn
 	bridge *ari.BridgeHandle
 	cm     *media.CallMedia
 }
@@ -83,14 +86,19 @@ func (m *Manager) onStasisStart(ctx context.Context, e *ari.StasisStart) {
 	id := e.Channel.ID
 
 	m.mu.Lock()
-	pending, isExternal := m.pending[id]
+	pc, found := m.pending[id]
+	// pending is keyed by both IDs (so a hangup during setup can find the call by
+	// either), so confirm this really is the externalMedia leg arriving.
+	isExternal := found && pc.ExternalID == id
+
 	if isExternal {
-		delete(m.pending, id)
+		delete(m.pending, pc.ID)
+		delete(m.pending, pc.ExternalID)
 	}
 	m.mu.Unlock()
 
 	if isExternal {
-		m.completeBridge(pending)
+		m.completeBridge(pc)
 		return
 	}
 
@@ -119,6 +127,23 @@ func (m *Manager) startCall(ctx context.Context, e *ari.StasisStart) {
 
 	metrics.MediaPortsInUse.Set(float64(m.ports.InUse()))
 
+	// Bind the media socket BEFORE telling Asterisk where to send, so the port is
+	// already listening when the first RTP packet arrives. Binding later (once the
+	// bridge is up, several ARI round-trips away) leaves a window where Asterisk's
+	// audio hits a closed port, and every one of those packets makes the kernel
+	// emit an ICMP port-unreachable back at Asterisk -- enough, across a routed
+	// path with stateful firewalling, to kill the UDP flow for the whole call.
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: port})
+	if err != nil {
+		slog.Error("failed to bind media socket", "call_id", id, "port", port, "error", err)
+
+		m.ports.Free(port)
+		metrics.MediaPortsInUse.Set(float64(m.ports.InUse()))
+		_ = channel.Hangup()
+
+		return
+	}
+
 	externalID := rid.New(rid.Channel)
 	info := session.Info{
 		CallerNumber: callerNumber(e.Channel),
@@ -129,10 +154,11 @@ func (m *Manager) startCall(ctx context.Context, e *ari.StasisStart) {
 		// vary per deployment's trunk conventions.
 		Direction: "inbound",
 	}
-	c := &call{Call: session.New(id, externalID, port, info, ctx)}
+	c := &call{Call: session.New(id, externalID, port, info, ctx), conn: conn}
 
 	m.mu.Lock()
 	m.pending[externalID] = c
+	m.pending[id] = c // so a hangup during setup can still find and clean up this call
 	m.mu.Unlock()
 
 	c.SetState(session.StateStaged)
@@ -150,8 +176,10 @@ func (m *Manager) startCall(ctx context.Context, e *ari.StasisStart) {
 
 		m.mu.Lock()
 		delete(m.pending, externalID)
+		delete(m.pending, id)
 		m.mu.Unlock()
 
+		_ = conn.Close()
 		m.ports.Free(port)
 		metrics.MediaPortsInUse.Set(float64(m.ports.InUse()))
 		_ = channel.Hangup()
@@ -159,7 +187,7 @@ func (m *Manager) startCall(ctx context.Context, e *ari.StasisStart) {
 		return
 	}
 
-	slog.Info("call answered, externalMedia staged",
+	slog.Info("call answered, media socket listening, externalMedia staged",
 		"call_id", id, "external_id", externalID, "port", port,
 		"caller_number", info.CallerNumber, "called_number", info.CalledNumber, "direction", info.Direction)
 }
@@ -196,15 +224,6 @@ func (m *Manager) completeBridge(c *call) {
 
 	c.SetState(session.StateBridged)
 
-	conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: c.Port})
-	if err != nil {
-		slog.Error("failed to bind media socket", "call_id", c.ID, "port", c.Port, "error", err)
-		_ = bh.Delete()
-		m.abort(c)
-
-		return
-	}
-
 	fromWire, err := media.ParseEndianness(m.cfg.AudioL16Endianness)
 	if err != nil {
 		// Already validated at config.Load() time; unreachable in practice.
@@ -219,7 +238,7 @@ func (m *Manager) completeBridge(c *call) {
 	}
 
 	c.bridge = bh
-	c.cm = media.NewCallMedia(c.ID, conn, metrics.Sink{}, media.Config{
+	c.cm = media.NewCallMedia(c.ID, c.conn, metrics.Sink{}, media.Config{
 		JitterBufferPackets: m.cfg.JitterBufferPackets,
 		FromWire:            fromWire,
 		RecordDir:           m.cfg.RecordDir,
@@ -247,9 +266,14 @@ func (m *Manager) completeBridge(c *call) {
 func (m *Manager) abort(c *call) {
 	m.mu.Lock()
 	delete(m.pending, c.ExternalID)
+	delete(m.pending, c.ID)
 	m.mu.Unlock()
 
 	c.Teardown(func() {
+		if c.conn != nil {
+			_ = c.conn.Close() // the media plane never started; nothing else will close it
+		}
+
 		m.ports.Free(c.Port)
 		metrics.MediaPortsInUse.Set(float64(m.ports.InUse()))
 
@@ -269,13 +293,24 @@ func (m *Manager) onStasisEnd(e *ari.StasisEnd) {
 	}
 	m.mu.Unlock()
 
-	if !ok {
-		// Caller (or its externalMedia peer) hung up before the bridge completed;
-		// nothing to tear down beyond what abort() already did.
+	if ok {
+		m.teardown(c)
 		return
 	}
 
-	m.teardown(c)
+	// Not bridged: the call may still be staged (externalMedia requested but its
+	// StasisStart never arrived, or the caller hung up mid-setup). abort() runs
+	// the same once-guarded cleanup, which matters because the media port and its
+	// socket are already allocated by this point -- both would otherwise leak for
+	// the life of the process.
+	m.mu.Lock()
+	pc, staged := m.pending[id]
+	m.mu.Unlock()
+
+	if staged {
+		slog.Info("call ended before bridging completed", "call_id", pc.ID, "external_id", pc.ExternalID, "port", pc.Port)
+		m.abort(pc)
+	}
 }
 
 // teardown performs the full call cleanup -- media plane, bridge, remaining
@@ -287,6 +322,13 @@ func (m *Manager) teardown(c *call) {
 	c.Teardown(func() {
 		if c.cm != nil && !c.cm.RemoteLocked() {
 			slog.Warn("rtp remote never locked; no audio ever received", "call_id", c.ID, "external_id", c.ExternalID)
+		}
+
+		if c.conn != nil {
+			// Idempotent: the media plane closes this too once its context is
+			// cancelled, but a call torn down before the media plane started has
+			// nothing else that would.
+			_ = c.conn.Close()
 		}
 
 		if c.bridge != nil {
