@@ -111,8 +111,19 @@ Set `MEDIA_ENCAPSULATION=audiosocket` to use Asterisk's res_audiosocket protocol
 ```
 POST /ari/channels/externalMedia
 { "app": "vaani", "external_host": "<ip>:<port>",
-  "encapsulation": "audiosocket", "transport": "tcp", "format": "slin16" }
+  "encapsulation": "audiosocket", "transport": "tcp", "format": "slin16",
+  "data": "<uuid>" }
 ```
+
+**`data` is mandatory for this encapsulation** -- confirmed live via `asterisk -rx
+"ari set debug vaani on"`: without it, Asterisk's chan_audiosocket returns `400
+Bad Request: data can not be empty`. It's the UUID Asterisk echoes back as the
+connection's first AudioSocket frame (kind `0x01`). The vendored ARI library
+(`github.com/CyCoreSystems/ari/v5`)'s `ExternalMediaOptions` struct has no field
+for it at all -- not a bug in our usage, a real gap in the library -- so
+`internal/ari/externalmedia.go` makes this one raw REST call itself (generating
+the UUID, building the JSON body, POSTing with Basic Auth) instead of going
+through `Channel().ExternalMedia()`, which the RTP path still uses unchanged.
 
 Wire format (`internal/media/audiosocket.go`), one length-prefixed frame at a time
 on a single TCP stream:

@@ -199,14 +199,29 @@ func (m *Manager) startCall(ctx context.Context, e *ari.StasisStart) {
 
 	c.SetState(session.StateStaged)
 
-	_, err = m.cl.Channel().ExternalMedia(e.Key(ari.ChannelKey, externalID), ari.ExternalMediaOptions{
-		ChannelID:     externalID,
-		App:           m.cfg.AriApp,
-		ExternalHost:  fmt.Sprintf("%s:%d", m.cfg.MediaIP, port),
-		Encapsulation: encap,
-		Transport:     transport,
-		Format:        "slin16",
-	})
+	externalHost := fmt.Sprintf("%s:%d", m.cfg.MediaIP, port)
+
+	if encap == "audiosocket" {
+		// The vendored ARI library's ExternalMediaOptions has no "data" field,
+		// but Asterisk's chan_audiosocket rejects the request without one -- so
+		// this one case makes the raw REST call itself. See externalmedia.go.
+		var uuid string
+
+		uuid, err = newUUIDv4()
+		if err == nil {
+			err = createAudioSocketExternalMedia(m.cfg, externalID, m.cfg.AriApp, externalHost, uuid)
+		}
+	} else {
+		_, err = m.cl.Channel().ExternalMedia(e.Key(ari.ChannelKey, externalID), ari.ExternalMediaOptions{
+			ChannelID:     externalID,
+			App:           m.cfg.AriApp,
+			ExternalHost:  externalHost,
+			Encapsulation: encap,
+			Transport:     transport,
+			Format:        "slin16",
+		})
+	}
+
 	if err != nil {
 		slog.Error("failed to create externalMedia channel", "call_id", id, "error", err)
 
