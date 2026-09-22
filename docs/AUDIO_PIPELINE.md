@@ -1,11 +1,14 @@
 # Media Pipeline
 
 Audio path: Asterisk PJSIP endpoint (ulaw) -> Asterisk transcodes -> externalMedia
-RTP/UDP leg to the Go service, slin16 (16kHz 16-bit mono PCM) end-to-end on that leg.
-See `internal/media/` for the RTP endpoint, pacer, buffer pool, jitter buffer, and
-Handler pipeline, and `CLAUDE.md` for the invariants they implement.
+leg to the Go service, slin16 (16kHz 16-bit mono PCM) end-to-end on that leg. The
+externalMedia transport is selectable via `MEDIA_ENCAPSULATION`: **RTP over UDP**
+(default) or **AudioSocket over TCP** (Asterisk's res_audiosocket protocol) -- see
+"AudioSocket Transport" below. See `internal/media/` for both transports' readers,
+the shared pacer/pool/Handler pipeline, and `CLAUDE.md` for the invariants they
+implement.
 
-## Pipeline (Phase 2)
+## Pipeline (RTP)
 
 ```
 UDP reader -> jitter buffer -> (20ms release tick) -> byte-order normalize
@@ -100,6 +103,64 @@ implementation: return the input frame unchanged. When Phase 3 arrives, STT
 feeding, LLM streaming, and TTS playout become one `ProcessFrame` implementation
 plus per-call state -- no transport code changes.
 
+## AudioSocket Transport
+
+Set `MEDIA_ENCAPSULATION=audiosocket` to use Asterisk's res_audiosocket protocol
+(TCP) instead of RTP/UDP for the externalMedia leg:
+
+```
+POST /ari/channels/externalMedia
+{ "app": "vaani", "external_host": "<ip>:<port>",
+  "encapsulation": "audiosocket", "transport": "tcp", "format": "slin16" }
+```
+
+Wire format (`internal/media/audiosocket.go`), one length-prefixed frame at a time
+on a single TCP stream:
+
+```
++------------------+-----------------------+--------------------------+
+| Type (1 Byte)    | Payload Length (2B)   | Payload (Variable Length)|
++------------------+-----------------------+--------------------------+
+| 0x12 for slin16  | big-endian uint16     | Raw PCM16 (Little-Endian)|
++------------------+-----------------------+--------------------------+
+```
+
+Vaani binds a TCP listener the same "before Asterisk knows the address" way it
+binds the UDP socket for RTP (see the invariant in `CLAUDE.md`); once the call is
+bridged, it accepts Asterisk's one incoming connection (10s timeout) and hands it
+to `internal/media.AudioSocketCallMedia`.
+
+That pipeline (`reader -> inbound queue -> release tick -> Handler.ProcessFrame ->
+outbound queue -> write tick -> writer`) deliberately mirrors the RTP pipeline's
+shape -- independent release/write tickers, the same "never starve the outbound
+stream" silence-fallback guarantee, WAV recording, watchdog -- because the
+`Handler` contract must not care which transport it's running over. It's simpler
+in exactly the ways AudioSocket itself is simpler than RTP:
+
+- **No jitter buffer.** TCP already guarantees in-order, lossless delivery --
+  there's nothing to reorder, no duplicates, no loss to conceal. `JITTER_BUFFER_PACKETS`
+  is ignored.
+- **No byte-order question.** The protocol's audio payload is little-endian by
+  definition, not a per-deployment fact to verify. `AUDIO_L16_ENDIANNESS` is
+  ignored.
+- **No "remote locked" ambiguity.** A UDP socket accepts packets from anywhere
+  until an address is learned from the first one; a TCP `Accept()` only succeeds
+  once Asterisk has actually connected, so there's no equivalent state to track.
+
+Metrics are transport-specific where the concept is (`vaani_audiosocket_frames_in_total`,
+`_frames_out_total`, `_silence_sent_total`, `_send_errors_total`, `_malformed_total`
+-- reusing `vaani_rtp_*` names would be misleading for a transport that carries no
+RTP at all) and shared where it's transport-neutral (`vaani_audio_rms`,
+`vaani_pacer_drift_ms`, `vaani_media_watchdog_timeouts_total`).
+
+**Why this might matter for your network:** RTP is a UDP flow with no persistent
+connection state; a stateful firewall or asymmetric route on a multi-site link can
+silently drop it (this happened in production -- see the port-binding invariant in
+`CLAUDE.md`). AudioSocket's single TCP connection tends to traverse routed/
+firewalled paths more reliably, at the cost of TCP's own head-of-line blocking
+under real packet loss (irrelevant on a healthy LAN, worth knowing about on a lossy
+WAN link).
+
 ## Endianness Verification
 
 RTP L16 payloads are nominally big-endian per RFC 3551, but that's a generic
@@ -123,13 +184,23 @@ Run `cmd/endianness-check` against a live `make up` stack:
 go run ./cmd/endianness-check
 ```
 
-It originates a dialplan `Echo()` leg (`deploy/asterisk/extensions.conf`, context
-`vaani-tools`, extension `9001`), bridges it with a second externalMedia channel,
-sends a 2s 440Hz tone as little-endian PCM16, and scores what echoes back under
+It creates two externalMedia channels -- one in slin16 (where it sends a 2s 440Hz
+tone and captures the result) and one in ulaw (a different codec, forcing Asterisk
+to genuinely transcode when it bridges the two, exactly as it does for a real SIP
+call) -- bridges them, blindly relays whatever bytes arrive on the ulaw channel
+straight back out (no need to understand ulaw: Asterisk does the actual decode/
+re-encode on both sides), and scores what comes back on the slin16 channel under
 both byte-order interpretations by mean absolute sample-to-sample delta -- a real
 waveform has small deltas, and byte-swapping a smooth waveform scrambles it into
 large ones, so the lower-scoring interpretation is the correct one. On success it
 prints its verdict, an `AUDIO_L16_ENDIANNESS=le`/`be` line ready to paste into the
 service's environment, and appends the verdict below.
+
+(An earlier version bridged a single externalMedia channel with a dialplan
+`Echo()` leg. That doesn't work: ARI's bridge API only accepts channels under
+Stasis application control, and a channel running `Echo()` in the dialplan isn't
+-- `AddChannel` fails with `400 Bad Request`. Being in Stasis and running a
+dialplan app are mutually exclusive for the same channel, so the two-externalMedia
+design isn't an optimization, it's the only way this works at all.)
 
 <!-- cmd/endianness-check appends its result below this line; do not hand-edit -->

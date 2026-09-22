@@ -5,13 +5,25 @@
 // actually emits on the externalMedia UDP transport -- so this is checked against
 // a live server rather than assumed.
 //
-// It originates a dialplan Echo() leg (deploy/asterisk/extensions.conf, context
-// vaani-tools, extension 9001), bridges it with a second externalMedia channel,
-// sends a 2s 440Hz tone as little-endian PCM16, captures what echoes back, and
-// reports which byte order makes the captured samples look like a smooth sine wave
-// rather than scrambled noise -- byte-swapping a smooth waveform doesn't produce
-// another smooth waveform, so the two interpretations are not ambiguous in
-// practice. The result is appended to docs/AUDIO_PIPELINE.md.
+// It creates two externalMedia channels -- A in slin16 (where we send the test
+// tone and capture the result) and B in ulaw (a different codec, forcing Asterisk
+// to genuinely transcode when it bridges the two, exactly as it does for a real
+// SIP call's audio) -- bridges them, sends a 2s 440Hz tone as little-endian PCM16
+// into A, blindly relays whatever bytes arrive on B straight back out on B
+// (no need to understand ulaw: Asterisk does the actual decode/re-encode on both
+// sides of the bridge), and reports which byte order makes A's captured samples
+// look like a smooth sine wave rather than scrambled noise -- byte-swapping a
+// smooth waveform doesn't produce another smooth waveform, so the two
+// interpretations are not ambiguous in practice. The result is appended to
+// docs/AUDIO_PIPELINE.md.
+//
+// An earlier version of this tool used a dialplan Echo() leg instead of channel
+// B, bridged directly with channel A. That doesn't work: ARI's bridge API only
+// accepts channels under Stasis application control, and a channel running
+// Echo() in the dialplan (not App: cfg.AriApp) is by definition not -- addChannel
+// fails with 400 Bad Request. Being in Stasis and running a dialplan app are
+// mutually exclusive for the same channel, so there's no way to patch that
+// version; the two-externalMedia-channel design sidesteps the conflict entirely.
 package main
 
 import (
@@ -38,8 +50,6 @@ import (
 )
 
 const (
-	echoContext  = "vaani-tools"
-	echoExten    = "9001"
 	toneFreqHz   = 440.0
 	toneDuration = 2 * time.Second
 	captureGrace = 500 * time.Millisecond // linger after the tone stops, for tail packets
@@ -76,49 +86,54 @@ func run() error {
 
 	ports := media.NewPortAllocator(cfg.MediaPortBase, cfg.MediaPortCount)
 
-	port, err := ports.Alloc()
+	portA, err := ports.Alloc() // slin16: tone source / capture
 	if err != nil {
-		return fmt.Errorf("allocate media port: %w", err)
+		return fmt.Errorf("allocate media port for channel A: %w", err)
 	}
-	defer ports.Free(port)
+	defer ports.Free(portA)
+
+	portB, err := ports.Alloc() // ulaw: forces real transcoding, blindly relayed
+	if err != nil {
+		return fmt.Errorf("allocate media port for channel B: %w", err)
+	}
+	defer ports.Free(portB)
 
 	sub := cl.Bus().Subscribe(nil, "StasisStart")
 	defer sub.Cancel()
 
-	echoID := rid.New(rid.Channel)
+	idA := rid.New(rid.Channel)
+	idB := rid.New(rid.Channel)
 
-	slog.Info("originating echo leg", "channel_id", echoID)
+	slog.Info("creating externalMedia channel A (slin16, tone source)", "channel_id", idA, "port", portA)
 
-	if _, err := cl.Channel().Originate(nil, ari.OriginateRequest{
-		Endpoint:  fmt.Sprintf("Local/%s@%s", echoExten, echoContext),
-		Context:   echoContext,
-		Extension: echoExten,
-		Priority:  1,
-		ChannelID: echoID,
-		Timeout:   10,
-	}); err != nil {
-		return fmt.Errorf("originate echo leg: %w", err)
-	}
-	defer func() { _ = cl.Channel().Hangup(ari.NewKey(ari.ChannelKey, echoID), "") }()
-
-	externalID := rid.New(rid.Channel)
-
-	slog.Info("creating externalMedia channel", "channel_id", externalID, "port", port)
-
-	if _, err := cl.Channel().ExternalMedia(ari.NewKey(ari.ChannelKey, externalID), ari.ExternalMediaOptions{
-		ChannelID:     externalID,
+	if _, err := cl.Channel().ExternalMedia(ari.NewKey(ari.ChannelKey, idA), ari.ExternalMediaOptions{
+		ChannelID:     idA,
 		App:           cfg.AriApp,
-		ExternalHost:  fmt.Sprintf("%s:%d", cfg.MediaIP, port),
+		ExternalHost:  fmt.Sprintf("%s:%d", cfg.MediaIP, portA),
 		Encapsulation: "rtp",
 		Transport:     "udp",
 		Format:        "slin16",
 	}); err != nil {
-		return fmt.Errorf("create externalMedia channel: %w", err)
+		return fmt.Errorf("create externalMedia channel A: %w", err)
 	}
-	defer func() { _ = cl.Channel().Hangup(ari.NewKey(ari.ChannelKey, externalID), "") }()
+	defer func() { _ = cl.Channel().Hangup(ari.NewKey(ari.ChannelKey, idA), "") }()
 
-	if err := waitForStasisStart(ctx, sub, externalID, 10*time.Second); err != nil {
-		return fmt.Errorf("waiting for externalMedia channel: %w", err)
+	slog.Info("creating externalMedia channel B (ulaw, forces transcoding)", "channel_id", idB, "port", portB)
+
+	if _, err := cl.Channel().ExternalMedia(ari.NewKey(ari.ChannelKey, idB), ari.ExternalMediaOptions{
+		ChannelID:     idB,
+		App:           cfg.AriApp,
+		ExternalHost:  fmt.Sprintf("%s:%d", cfg.MediaIP, portB),
+		Encapsulation: "rtp",
+		Transport:     "udp",
+		Format:        "ulaw",
+	}); err != nil {
+		return fmt.Errorf("create externalMedia channel B: %w", err)
+	}
+	defer func() { _ = cl.Channel().Hangup(ari.NewKey(ari.ChannelKey, idB), "") }()
+
+	if err := waitForStasisStarts(ctx, sub, []string{idA, idB}, 10*time.Second); err != nil {
+		return fmt.Errorf("waiting for externalMedia channels: %w", err)
 	}
 
 	bridgeKey := ari.NewKey(ari.BridgeKey, rid.New(rid.Bridge))
@@ -129,20 +144,32 @@ func run() error {
 	}
 	defer func() { _ = bh.Delete() }()
 
-	// Give Echo() a moment to finish answering before bridging.
-	time.Sleep(300 * time.Millisecond)
-
-	if err := bh.AddChannel(echoID); err != nil {
-		return fmt.Errorf("add echo channel to bridge: %w", err)
+	if err := bh.AddChannel(idA); err != nil {
+		return fmt.Errorf("add channel A to bridge: %w", err)
 	}
 
-	if err := bh.AddChannel(externalID); err != nil {
-		return fmt.Errorf("add externalMedia channel to bridge: %w", err)
+	if err := bh.AddChannel(idB); err != nil {
+		return fmt.Errorf("add channel B to bridge: %w", err)
 	}
 
-	slog.Info("bridged, running tone probe", "port", port, "duration", toneDuration)
+	slog.Info("bridged, running tone probe", "port_a", portA, "port_b", portB, "duration", toneDuration)
 
-	captured, err := probe(port)
+	relayStop := make(chan struct{})
+	relayDone := make(chan struct{})
+
+	go func() {
+		defer close(relayDone)
+
+		if err := relayRaw(portB, relayStop); err != nil {
+			slog.Error("channel B relay error", "error", err)
+		}
+	}()
+
+	captured, err := probe(portA)
+
+	close(relayStop)
+	<-relayDone
+
 	if err != nil {
 		return fmt.Errorf("probe: %w", err)
 	}
@@ -156,24 +183,72 @@ func run() error {
 	return appendToDocs(verdict)
 }
 
-func waitForStasisStart(ctx context.Context, sub ari.Subscription, channelID string, timeout time.Duration) error {
+// waitForStasisStarts waits for a StasisStart event for every channel in ids,
+// in any order, from a single shared subscription. This must handle all of them
+// in one loop rather than one call per ID: draining the subscription once per ID
+// would discard any event for a not-yet-awaited ID encountered along the way,
+// since a plain Subscription has no way to put an event back.
+func waitForStasisStarts(ctx context.Context, sub ari.Subscription, ids []string, timeout time.Duration) error {
+	remaining := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		remaining[id] = true
+	}
+
 	deadline := time.After(timeout)
 
-	for {
+	for len(remaining) > 0 {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-deadline:
-			return fmt.Errorf("timed out waiting for channel %s to enter Stasis", channelID)
-		case evt, ok := <-sub.Events():
-			if !ok {
-				return fmt.Errorf("event bus closed while waiting for channel %s", channelID)
+			pending := make([]string, 0, len(remaining))
+			for id := range remaining {
+				pending = append(pending, id)
 			}
 
-			if start, ok := evt.(*ari.StasisStart); ok && start.Channel.ID == channelID {
-				return nil
+			return fmt.Errorf("timed out waiting for channels to enter Stasis: %v", pending)
+		case evt, ok := <-sub.Events():
+			if !ok {
+				return fmt.Errorf("event bus closed while waiting for channels to enter Stasis")
+			}
+
+			if start, ok := evt.(*ari.StasisStart); ok {
+				delete(remaining, start.Channel.ID)
 			}
 		}
+	}
+
+	return nil
+}
+
+// relayRaw blindly bounces every UDP datagram received on port straight back to
+// whichever address it arrived from, unmodified. Used for channel B: since
+// Asterisk does the ulaw<->slin16 transcoding on both sides of the bridge, this
+// relay never needs to understand the bytes it's reflecting.
+func relayRaw(port int, stop <-chan struct{}) error {
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: port})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close() }()
+
+	buf := make([]byte, 1500)
+
+	for {
+		select {
+		case <-stop:
+			return nil
+		default:
+		}
+
+		_ = conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+
+		n, addr, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			continue // read timeout; loop back around to check stop
+		}
+
+		_, _ = conn.WriteToUDP(buf[:n], addr)
 	}
 }
 

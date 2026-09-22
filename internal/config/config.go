@@ -57,6 +57,15 @@ type Config struct {
 	// deterministically exercising the write tick's silence-fallback path. Never
 	// set this in production; it means calls carry no audio at all.
 	TestSilentHandler bool
+
+	// MediaEncapsulation selects the externalMedia transport: "rtp" (default,
+	// UDP) or "audiosocket" (TCP, Asterisk's res_audiosocket protocol -- see
+	// internal/media/audiosocket.go). AudioSocket carries no RTP sequencing/SSRC
+	// at all (TCP already guarantees in-order, lossless delivery), and its audio
+	// payload is little-endian by protocol definition, not a per-deployment
+	// question -- AUDIO_L16_ENDIANNESS and JITTER_BUFFER_PACKETS are meaningless
+	// for it and are ignored when this is "audiosocket".
+	MediaEncapsulation string
 }
 
 // Load reads configuration from the environment, applying local-dev defaults that
@@ -80,6 +89,7 @@ func Load() (Config, error) {
 		RecordDir:           getEnv("RECORD_DIR", ""),
 		AppMode:             getEnv("APP_MODE", "loopback"),
 		TestSilentHandler:   getEnv("TEST_SILENT_HANDLER", "") == "1",
+		MediaEncapsulation:  getEnv("MEDIA_ENCAPSULATION", "rtp"),
 	}
 
 	var err error
@@ -110,6 +120,10 @@ func Load() (Config, error) {
 
 	if cfg.AppMode != "loopback" && cfg.AppMode != "agent" {
 		return Config{}, fmt.Errorf("config: APP_MODE must be \"loopback\" or \"agent\", got %q", cfg.AppMode)
+	}
+
+	if cfg.MediaEncapsulation != "rtp" && cfg.MediaEncapsulation != "audiosocket" {
+		return Config{}, fmt.Errorf("config: MEDIA_ENCAPSULATION must be \"rtp\" or \"audiosocket\", got %q", cfg.MediaEncapsulation)
 	}
 
 	return cfg, nil

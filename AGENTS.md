@@ -11,15 +11,19 @@ Real-time voice agent: Asterisk ARI (telephony) + Go media plane + Sarvam STT/TT
 ## Package Layout
 - `cmd/server/` — single entry point (monolith, NOT microservices)
 - `internal/ari/` — ARI WebSocket client, Stasis handlers
-- `internal/media/` — RTP over UDP, port allocator, 20ms pacer, jitter buffer, sync.Pool
+- `internal/media/` — RTP over UDP and AudioSocket over TCP (both via ARI
+  externalMedia), port allocator, 20ms pacer, jitter buffer (RTP only), sync.Pool
 - `internal/ai/stt|llm|tts/` — provider clients
 - `internal/session/` — per-call state machine, barge-in orchestration
 
 ## Critical Invariants (NEVER violate these)
 1. **20ms pacer**: use `time.NewTicker`, re-clamp deadline to `time.Now()` on every tick.
    Never `time.Sleep(20 * time.Millisecond)` — it drifts and bursts after stalls.
-2. **Media path: ARI externalMedia**, `transport=udp`, `encapsulation=rtp`, `format=slin16`.
-   AudioSocket is permanently out of scope for this project.
+2. **Media path: ARI externalMedia**, selectable via `MEDIA_ENCAPSULATION`: `rtp`
+   (default, `transport=udp`, `format=slin16`) or `audiosocket` (`transport=tcp`,
+   Asterisk's res_audiosocket framed protocol — see `internal/media/audiosocket.go`).
+   This reverses an earlier "AudioSocket is permanently out of scope" decision from
+   Phase 1 — that's no longer true; both transports are supported and tested.
 3. **sync.Pool for frames**: 640-byte buffers (16kHz × 2 bytes × 20ms). No `make([]byte)` in hot path.
 4. **No goroutine per frame**: one reader goroutine + one writer goroutine per call,
    connected by buffered `chan []byte` (capacity ~5).
@@ -29,11 +33,17 @@ Real-time voice agent: Asterisk ARI (telephony) + Go media plane + Sarvam STT/TT
 7. **Barge-in is 5 cuts**: pacer stop, STT cancel, LLM cancel, TTS stream close, queue flush.
    Missing any one causes leaked audio or billing waste.
 8. **Audio format**: slin16 (16kHz 16-bit mono PCM) end-to-end. Asterisk handles μ-law transcoding.
-9. **One UDP socket per call**, bound to a port from the managed pool (never shared across
-   calls); lock the remote RTP address to the source of the first valid inbound packet.
-10. **RTP framing**: sequence +1 and timestamp +320 per 20ms packet @ 16kHz; validate version 2
-    on inbound. Payload endianness (s16le vs s16be) is verified empirically in Phase 1 —
-    see `docs/AUDIO_PIPELINE.md` before assuming either.
+9. **One media socket per call**, bound to a port from the managed pool (never shared
+   across calls), and bound/listening *before* the externalMedia channel is created —
+   telling Asterisk an address before something is listening on it caused a real
+   production incident (RTP hitting a closed UDP port triggers an ICMP
+   port-unreachable that can kill the flow across a routed/firewalled path). For RTP,
+   also lock the remote address to the source of the first valid inbound packet.
+10. **RTP framing** (RTP only): sequence +1 and timestamp +320 per 20ms packet @
+    16kHz; validate version 2 on inbound. Payload endianness (s16le vs s16be) is
+    verified empirically via `cmd/endianness-check` — see `docs/AUDIO_PIPELINE.md`
+    before assuming either. AudioSocket has neither concern: TCP guarantees order,
+    and its audio payload is little-endian by protocol definition.
 
 ## Conventions
 - Errors: wrap with `fmt.Errorf("...: %w", err)`, never panic in request path.

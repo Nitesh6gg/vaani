@@ -17,22 +17,41 @@ import (
 	"github.com/nitesh/vaani/internal/session"
 )
 
+// audioSocketAcceptTimeout bounds how long completeBridge waits for Asterisk to
+// actually open the AudioSocket TCP connection after the channel is bridged.
+const audioSocketAcceptTimeout = 10 * time.Second
+
 // call tracks the ARI/media-specific state of one bridged caller<->externalMedia
 // pair; *session.Call carries the lifecycle state and the once-guaranteed
 // teardown that used to be prone to double- or zero-firing in Phase 1.
 type call struct {
 	*session.Call
 
-	// conn is bound before Asterisk is ever told the address, so no RTP can
-	// arrive at a closed port -- see startCall.
-	conn   *net.UDPConn
+	// Exactly one of these is set, depending on Manager.cfg.MediaEncapsulation,
+	// bound/listening before Asterisk is ever told the address -- see startCall.
+	udpConn  *net.UDPConn
+	listener net.Listener
+
 	bridge *ari.BridgeHandle
-	cm     *media.CallMedia
+	cm     *media.CallMedia            // set once the RTP media plane starts
+	asm    *media.AudioSocketCallMedia // set once the AudioSocket media plane starts
+}
+
+// closeMediaSocket closes whichever of the call's media sockets is set. Safe to
+// call more than once and regardless of which encapsulation was used.
+func closeMediaSocket(c *call) {
+	if c.udpConn != nil {
+		_ = c.udpConn.Close()
+	}
+
+	if c.listener != nil {
+		_ = c.listener.Close()
+	}
 }
 
 // Manager owns the Stasis event loop: it answers incoming calls, wires each one to
-// an externalMedia RTP channel and a bridge, runs the loop-back media plane for its
-// duration, and tears everything down on hangup.
+// an externalMedia channel and a bridge, runs the media plane for its duration,
+// and tears everything down on hangup.
 type Manager struct {
 	cl    ari.Client
 	cfg   config.Config
@@ -127,15 +146,32 @@ func (m *Manager) startCall(ctx context.Context, e *ari.StasisStart) {
 
 	metrics.MediaPortsInUse.Set(float64(m.ports.InUse()))
 
-	// Bind the media socket BEFORE telling Asterisk where to send, so the port is
-	// already listening when the first RTP packet arrives. Binding later (once the
-	// bridge is up, several ARI round-trips away) leaves a window where Asterisk's
-	// audio hits a closed port, and every one of those packets makes the kernel
-	// emit an ICMP port-unreachable back at Asterisk -- enough, across a routed
-	// path with stateful firewalling, to kill the UDP flow for the whole call.
-	conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: port})
+	// Bind/listen on the media socket BEFORE telling Asterisk where to send, so
+	// it's already ready the instant Asterisk's first packet or connection
+	// attempt can possibly arrive. Binding later (once the bridge is up, several
+	// ARI round-trips away) leaves a window where audio hits nothing listening:
+	// for UDP/RTP that triggers an ICMP port-unreachable which can kill the flow
+	// entirely across a routed/firewalled path (a real production incident --
+	// see docs/AUDIO_PIPELINE.md); for TCP/AudioSocket, Asterisk's connection
+	// attempt would simply be refused outright.
+	var (
+		udpConn   *net.UDPConn
+		listener  net.Listener
+		encap     string
+		transport string
+	)
+
+	switch m.cfg.MediaEncapsulation {
+	case "audiosocket":
+		encap, transport = "audiosocket", "tcp"
+		listener, err = net.Listen("tcp", fmt.Sprintf(":%d", port))
+	default:
+		encap, transport = "rtp", "udp"
+		udpConn, err = net.ListenUDP("udp", &net.UDPAddr{Port: port})
+	}
+
 	if err != nil {
-		slog.Error("failed to bind media socket", "call_id", id, "port", port, "error", err)
+		slog.Error("failed to bind media socket", "call_id", id, "port", port, "encapsulation", encap, "error", err)
 
 		m.ports.Free(port)
 		metrics.MediaPortsInUse.Set(float64(m.ports.InUse()))
@@ -154,7 +190,7 @@ func (m *Manager) startCall(ctx context.Context, e *ari.StasisStart) {
 		// vary per deployment's trunk conventions.
 		Direction: "inbound",
 	}
-	c := &call{Call: session.New(id, externalID, port, info, ctx), conn: conn}
+	c := &call{Call: session.New(id, externalID, port, info, ctx), udpConn: udpConn, listener: listener}
 
 	m.mu.Lock()
 	m.pending[externalID] = c
@@ -167,8 +203,8 @@ func (m *Manager) startCall(ctx context.Context, e *ari.StasisStart) {
 		ChannelID:     externalID,
 		App:           m.cfg.AriApp,
 		ExternalHost:  fmt.Sprintf("%s:%d", m.cfg.MediaIP, port),
-		Encapsulation: "rtp",
-		Transport:     "udp",
+		Encapsulation: encap,
+		Transport:     transport,
 		Format:        "slin16",
 	})
 	if err != nil {
@@ -179,7 +215,7 @@ func (m *Manager) startCall(ctx context.Context, e *ari.StasisStart) {
 		delete(m.pending, id)
 		m.mu.Unlock()
 
-		_ = conn.Close()
+		closeMediaSocket(c)
 		m.ports.Free(port)
 		metrics.MediaPortsInUse.Set(float64(m.ports.InUse()))
 		_ = channel.Hangup()
@@ -188,13 +224,13 @@ func (m *Manager) startCall(ctx context.Context, e *ari.StasisStart) {
 	}
 
 	slog.Info("call answered, media socket listening, externalMedia staged",
-		"call_id", id, "external_id", externalID, "port", port,
+		"call_id", id, "external_id", externalID, "port", port, "encapsulation", encap,
 		"caller_number", info.CallerNumber, "called_number", info.CalledNumber, "direction", info.Direction)
 }
 
 // completeBridge runs once the externalMedia channel itself enters Stasis: it
-// creates the bridge, adds both channels, binds the call's UDP socket, and starts
-// the media plane.
+// creates the bridge, adds both channels, and starts the media plane appropriate
+// to the configured encapsulation.
 func (m *Manager) completeBridge(c *call) {
 	bridgeKey := ari.NewKey(ari.BridgeKey, rid.New(rid.Bridge))
 
@@ -222,41 +258,107 @@ func (m *Manager) completeBridge(c *call) {
 		return
 	}
 
+	c.bridge = bh
 	c.SetState(session.StateBridged)
 
+	// Added to active (and CallsActive incremented) here, before the media plane
+	// itself has necessarily started -- AudioSocket's Accept() below can take a
+	// moment, and a hangup during that window must still be found by
+	// onStasisEnd and cleanly torn down (which is also why CallsActive.Dec()
+	// always lives in teardown(), paired with this Inc(), rather than with
+	// "media actually running").
+	m.mu.Lock()
+	m.active[c.ID] = c
+	m.active[c.ExternalID] = c
+	m.mu.Unlock()
+
+	metrics.CallsActive.Inc()
+	slog.Info("call bridged",
+		"call_id", c.ID, "external_id", c.ExternalID, "port", c.Port,
+		"caller_number", c.Info.CallerNumber, "called_number", c.Info.CalledNumber, "direction", c.Info.Direction)
+
+	if m.cfg.MediaEncapsulation == "audiosocket" {
+		go m.startAudioSocketMedia(c)
+		return
+	}
+
+	m.startRTPMedia(c)
+}
+
+// mediaHandler builds the Handler for a new call from config: SilentHandler if
+// TEST_SILENT_HANDLER=1 (a debug hook -- never set in production, since it means
+// the call carries no audio at all), otherwise nil (CallMedia/AudioSocketCallMedia
+// both default that to LoopbackHandler).
+func (m *Manager) mediaHandler(callID string) media.Handler {
+	if !m.cfg.TestSilentHandler {
+		return nil
+	}
+
+	slog.Warn("TEST_SILENT_HANDLER=1: this call will carry no audio", "call_id", callID)
+
+	return media.SilentHandler{}
+}
+
+// startRTPMedia constructs and runs the RTP media plane for an already-bridged
+// call. Called synchronously from completeBridge -- unlike AudioSocket, there's
+// no blocking accept step, so this doesn't need its own goroutine.
+func (m *Manager) startRTPMedia(c *call) {
 	fromWire, err := media.ParseEndianness(m.cfg.AudioL16Endianness)
 	if err != nil {
 		// Already validated at config.Load() time; unreachable in practice.
 		slog.Error("invalid AUDIO_L16_ENDIANNESS", "call_id", c.ID, "error", err)
 	}
 
-	var handler media.Handler
-	if m.cfg.TestSilentHandler {
-		slog.Warn("TEST_SILENT_HANDLER=1: this call will carry no audio", "call_id", c.ID)
-
-		handler = media.SilentHandler{}
-	}
-
-	c.bridge = bh
-	c.cm = media.NewCallMedia(c.ID, c.conn, metrics.Sink{}, media.Config{
+	c.cm = media.NewCallMedia(c.ID, c.udpConn, metrics.Sink{}, media.Config{
 		JitterBufferPackets: m.cfg.JitterBufferPackets,
 		FromWire:            fromWire,
 		RecordDir:           m.cfg.RecordDir,
-		Handler:             handler,
+		Handler:             m.mediaHandler(c.ID),
 	})
 
-	m.mu.Lock()
-	m.active[c.ID] = c
-	m.active[c.ExternalID] = c
-	m.mu.Unlock()
-
 	c.SetState(session.StateMediaActive)
-	metrics.CallsActive.Inc()
-	slog.Info("call bridged",
-		"call_id", c.ID, "external_id", c.ExternalID, "port", c.Port,
-		"caller_number", c.Info.CallerNumber, "called_number", c.Info.CalledNumber, "direction", c.Info.Direction)
+	slog.Info("rtp media plane running", "call_id", c.ID, "port", c.Port)
 
 	go c.cm.Run(c.Ctx)
+}
+
+// startAudioSocketMedia waits for Asterisk to open the AudioSocket TCP
+// connection, then constructs and runs the media plane. Always called in its
+// own goroutine (from completeBridge): Accept blocks, and blocking the shared
+// Stasis event loop would stall every other call.
+func (m *Manager) startAudioSocketMedia(c *call) {
+	ln, ok := c.listener.(*net.TCPListener)
+	if !ok {
+		slog.Error("audiosocket listener has unexpected type", "call_id", c.ID)
+		m.teardown(c)
+
+		return
+	}
+
+	_ = ln.SetDeadline(time.Now().Add(audioSocketAcceptTimeout))
+
+	conn, err := ln.Accept()
+	if err != nil {
+		// Either genuinely timed out, or the listener was closed by a concurrent
+		// teardown (e.g. the caller hung up before Asterisk connected) -- either
+		// way, Teardown's once-guard makes calling it here safe and idempotent.
+		slog.Warn("audiosocket connection never arrived", "call_id", c.ID, "error", err)
+		m.teardown(c)
+
+		return
+	}
+
+	_ = ln.Close() // one connection is all a call needs; free the OS listener now
+
+	c.asm = media.NewAudioSocketCallMedia(c.ID, conn, metrics.AudioSocketSink{}, media.AudioSocketConfig{
+		RecordDir: m.cfg.RecordDir,
+		Handler:   m.mediaHandler(c.ID),
+	})
+
+	c.SetState(session.StateMediaActive)
+	slog.Info("audiosocket connected, media plane running", "call_id", c.ID, "port", c.Port)
+
+	c.asm.Run(c.Ctx) // blocking is fine: already running in its own goroutine
 }
 
 // abort releases a call's port when bridging fails before the media plane starts.
@@ -270,9 +372,7 @@ func (m *Manager) abort(c *call) {
 	m.mu.Unlock()
 
 	c.Teardown(func() {
-		if c.conn != nil {
-			_ = c.conn.Close() // the media plane never started; nothing else will close it
-		}
+		closeMediaSocket(c) // the media plane never started; nothing else will close this
 
 		m.ports.Free(c.Port)
 		metrics.MediaPortsInUse.Set(float64(m.ports.InUse()))
@@ -314,22 +414,23 @@ func (m *Manager) onStasisEnd(e *ari.StasisEnd) {
 }
 
 // teardown performs the full call cleanup -- media plane, bridge, remaining
-// channel, UDP port, and the duration metric -- exactly once, via session.Call's
-// once-guard. Both the caller's and the externalMedia channel's StasisEnd route
-// here (via the m.active lookup keyed by both IDs), so without that guard this is
-// exactly the kind of path that used to be able to double-fire.
+// channel, media socket, and the duration/active-count metrics -- exactly once,
+// via session.Call's once-guard. Both the caller's and the externalMedia
+// channel's StasisEnd route here (via the m.active lookup keyed by both IDs), so
+// without that guard this is exactly the kind of path that used to be able to
+// double-fire. It also runs for a call whose media plane never actually started
+// (e.g. AudioSocket's Accept timed out), since completeBridge adds a call to
+// active -- and increments CallsActive -- before that's guaranteed to happen.
 func (m *Manager) teardown(c *call) {
 	c.Teardown(func() {
-		if c.cm != nil && !c.cm.RemoteLocked() {
+		switch {
+		case c.cm != nil && !c.cm.RemoteLocked():
 			slog.Warn("rtp remote never locked; no audio ever received", "call_id", c.ID, "external_id", c.ExternalID)
+		case c.cm == nil && c.asm == nil:
+			slog.Warn("media plane never started; no audio ever received", "call_id", c.ID, "external_id", c.ExternalID)
 		}
 
-		if c.conn != nil {
-			// Idempotent: the media plane closes this too once its context is
-			// cancelled, but a call torn down before the media plane started has
-			// nothing else that would.
-			_ = c.conn.Close()
-		}
+		closeMediaSocket(c)
 
 		if c.bridge != nil {
 			_ = c.bridge.Delete()

@@ -112,6 +112,36 @@ var (
 		Name: "vaani_audio_rms",
 		Help: "RMS level of the last released inbound audio frame (not VAD; proves audio is flowing).",
 	})
+
+	AudioSocketFramesIn = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "vaani_audiosocket_frames_in_total",
+		Help: "Total valid inbound AudioSocket audio frames received.",
+	})
+
+	AudioSocketFramesOut = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "vaani_audiosocket_frames_out_total",
+		Help: "Total outbound AudioSocket audio frames sent.",
+	})
+
+	AudioSocketBytesIn = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "vaani_audiosocket_bytes_in_total",
+		Help: "Total inbound AudioSocket audio payload bytes received.",
+	})
+
+	AudioSocketSilenceSent = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "vaani_audiosocket_silence_sent_total",
+		Help: "Total outbound AudioSocket frames that were zeroed silence because the handler's outbound queue was empty on that tick.",
+	})
+
+	AudioSocketSendErrors = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "vaani_audiosocket_send_errors_total",
+		Help: "Total outbound AudioSocket writes that failed.",
+	})
+
+	AudioSocketMalformed = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "vaani_audiosocket_malformed_total",
+		Help: "Total inbound AudioSocket audio frames with an unexpected size.",
+	})
 )
 
 // Sink adapts the package-level RTP counters to the media.Sink interface, keeping
@@ -136,6 +166,26 @@ func (Sink) SilenceSent()           { RTPSilenceSent.Inc() }
 func (Sink) WatchdogTimeout()       { MediaWatchdogTimeouts.Inc() }
 func (Sink) PacerDrift(ms float64)  { PacerDriftMs.Observe(ms) }
 func (Sink) AudioLevel(rms float64) { AudioRMS.Set(rms) }
+
+// AudioSocketSink adapts the package-level AudioSocket counters to
+// media.AudioSocketSink. Distinct counters from Sink's RTP ones -- AudioSocket
+// carries no RTP packets at all, so vaani_rtp_* would be misleading here -- but
+// it shares the transport-neutral watchdog/drift/RMS series with Sink, since
+// those describe "is audio flowing on schedule," not anything RTP-specific.
+type AudioSocketSink struct{}
+
+func (AudioSocketSink) PacketIn(bytes int) {
+	AudioSocketFramesIn.Inc()
+	AudioSocketBytesIn.Add(float64(bytes))
+}
+
+func (AudioSocketSink) PacketOut()             { AudioSocketFramesOut.Inc() }
+func (AudioSocketSink) SilenceSent()           { AudioSocketSilenceSent.Inc() }
+func (AudioSocketSink) SendError()             { AudioSocketSendErrors.Inc() }
+func (AudioSocketSink) Malformed()             { AudioSocketMalformed.Inc() }
+func (AudioSocketSink) WatchdogTimeout()       { MediaWatchdogTimeouts.Inc() }
+func (AudioSocketSink) PacerDrift(ms float64)  { PacerDriftMs.Observe(ms) }
+func (AudioSocketSink) AudioLevel(rms float64) { AudioRMS.Set(rms) }
 
 // Serve runs the /metrics HTTP server on addr until ctx is cancelled, then shuts it
 // down gracefully.
