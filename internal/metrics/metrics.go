@@ -13,6 +13,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"github.com/nitesh/vaani/internal/media"
 )
 
 var (
@@ -187,9 +189,60 @@ func (AudioSocketSink) WatchdogTimeout()       { MediaWatchdogTimeouts.Inc() }
 func (AudioSocketSink) PacerDrift(ms float64)  { PacerDriftMs.Observe(ms) }
 func (AudioSocketSink) AudioLevel(rms float64) { AudioRMS.Set(rms) }
 
+// debugAudioHandler streams a live call's inbound audio (raw s16le PCM,
+// post-normalization -- the same bytes written to the WAV recorder) to an HTTP
+// client in real time, e.g.:
+//
+//	curl -sN http://host:9091/debug/audio/<callID> | aplay -f S16_LE -r 16000 -c1 -
+//
+// Only reachable at all when DEBUG_AUDIO=1 (see Serve). 404s if callID has no
+// active media plane; blocks, flushing each frame as it's published, until the
+// call ends or the client disconnects.
+func debugAudioHandler(w http.ResponseWriter, r *http.Request) {
+	callID := r.PathValue("callID")
+
+	tap := media.LookupAudioTap(callID)
+	if tap == nil {
+		http.Error(w, "no active call with that ID", http.StatusNotFound)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	frames, unsubscribe := tap.Subscribe()
+	defer unsubscribe()
+
+	w.Header().Set("Content-Type", "audio/l16;rate=16000;channels=1")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case frame, open := <-frames:
+			if !open {
+				return // call ended; tap was unregistered and closed the channel
+			}
+
+			if _, err := w.Write(frame); err != nil {
+				return
+			}
+
+			flusher.Flush()
+		}
+	}
+}
+
 // Serve runs the /metrics HTTP server on addr until ctx is cancelled, then shuts it
-// down gracefully.
-func Serve(ctx context.Context, addr string) error {
+// down gracefully. debugAudio mirrors config.Config.DebugAudio: only when true is
+// the /debug/audio/{callID} live tap mounted at all, so it 404s outright rather
+// than just being undocumented when the operator hasn't opted in.
+func Serve(ctx context.Context, addr string, debugAudio bool) error {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/debug/pprof/", pprof.Index)
@@ -197,6 +250,10 @@ func Serve(ctx context.Context, addr string) error {
 	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
 	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
 	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+
+	if debugAudio {
+		mux.HandleFunc("/debug/audio/{callID}", debugAudioHandler)
+	}
 
 	srv := &http.Server{
 		Addr:              addr,

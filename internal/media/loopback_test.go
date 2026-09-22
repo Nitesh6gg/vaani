@@ -113,6 +113,100 @@ func TestCallMedia_EndToEndLoopback(t *testing.T) {
 	}
 }
 
+// TestCallMedia_DebugAudioPublishesToTap proves the DEBUG_AUDIO wiring end to
+// end: with Config.DebugAudio set, a live tap is registered under the call ID,
+// real inbound audio is published to it as the call runs, and it's unregistered
+// on teardown so a stale tap can't outlive its call.
+func TestCallMedia_DebugAudioPublishesToTap(t *testing.T) {
+	const callID = "debug-audio-call"
+
+	serverConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+
+	clientConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	defer func() { _ = clientConn.Close() }()
+
+	cm := NewCallMedia(callID, serverConn, &fakeCallSink{}, Config{
+		JitterBufferPackets: 3,
+		FromWire:            LittleEndian,
+		DebugAudio:          true,
+	})
+
+	tap := LookupAudioTap(callID)
+	require.NotNil(t, tap, "DebugAudio:true must register a tap under the call ID")
+
+	tapCh, unsubscribe := tap.Subscribe()
+	defer unsubscribe()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+
+	go func() {
+		cm.Run(ctx)
+		close(runDone)
+	}()
+
+	serverAddr := serverConn.LocalAddr().(*net.UDPAddr)
+	sender := NewSender()
+
+	payload := make([]byte, FrameSize)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+
+	for seq := 0; seq < 6; seq++ {
+		pkt := sender.Build(payload)
+
+		out, err := pkt.Marshal()
+		require.NoError(t, err)
+
+		_, err = clientConn.WriteToUDP(out, serverAddr)
+		require.NoError(t, err)
+
+		time.Sleep(FrameInterval)
+	}
+
+	select {
+	case frame := <-tapCh:
+		assert.Equal(t, FrameSize, len(frame))
+	case <-time.After(2 * time.Second):
+		t.Fatal("tap subscriber never received a published frame")
+	}
+
+	cancel()
+
+	select {
+	case <-runDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("CallMedia.Run did not return promptly after context cancellation")
+	}
+
+	assert.Nil(t, LookupAudioTap(callID), "tap must be unregistered once the call's media plane stops")
+}
+
+func TestCallMedia_NearSilent_TooFewTicksReturnsFalse(t *testing.T) {
+	cm := &CallMedia{rmsTicks: nearSilenceMinTicks - 1}
+
+	_, ok := cm.NearSilent()
+	assert.False(t, ok, "too short a call to judge, regardless of level")
+}
+
+func TestCallMedia_NearSilent_BelowThresholdReturnsTrue(t *testing.T) {
+	cm := &CallMedia{rmsTicks: nearSilenceMinTicks, rmsSum: 10 * float64(nearSilenceMinTicks)}
+
+	avg, ok := cm.NearSilent()
+	assert.True(t, ok)
+	assert.InDelta(t, 10.0, avg, 0.001)
+}
+
+func TestCallMedia_NearSilent_AboveThresholdReturnsFalse(t *testing.T) {
+	cm := &CallMedia{rmsTicks: nearSilenceMinTicks, rmsSum: 5000 * float64(nearSilenceMinTicks)}
+
+	_, ok := cm.NearSilent()
+	assert.False(t, ok)
+}
+
 // TestCallMedia_SilentHandlerAlwaysTransmitsSilence exercises TEST_SILENT_HANDLER:
 // with a Handler that returns zero frames on every tick, RTP must never starve on
 // an active call -- the write tick still transmits a zeroed silence packet every

@@ -1,60 +1,72 @@
 package main
 
 import (
-	"encoding/binary"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/nitesh/vaani/internal/media"
 )
 
-// TestAnalyze_DetectsLittleEndian feeds analyze() a tone actually encoded as
-// little-endian PCM16 and checks it's recognized as such -- this is the same
-// heuristic the live probe uses, just without a real Asterisk round-trip.
-func TestAnalyze_DetectsLittleEndian(t *testing.T) {
-	raw := encodeTone(t, binary.LittleEndian)
+// swapBytes returns a copy of b with every adjacent byte pair swapped --
+// simulating what a little-endian-encoded waveform looks like on the wire when
+// the true encoding was actually the other byte order, or vice versa.
+func swapBytes(b []byte) []byte {
+	out := make([]byte, len(b))
+	copy(out, b)
 
-	v := analyze(raw)
-
-	assert.True(t, v.LittleEndian(), "expected %s to be detected as little-endian", v)
-	assert.Less(t, v.LittleEndianScore, v.BigEndianScore)
-}
-
-// TestAnalyze_DetectsBigEndian is the mirror case: a tone actually encoded
-// big-endian must be detected as such, not assumed away.
-func TestAnalyze_DetectsBigEndian(t *testing.T) {
-	raw := encodeTone(t, binary.BigEndian)
-
-	v := analyze(raw)
-
-	assert.False(t, v.LittleEndian(), "expected %s to be detected as big-endian", v)
-	assert.Less(t, v.BigEndianScore, v.LittleEndianScore)
-}
-
-// TestVerdict_EnvValue confirms EnvValue's output is ready to paste as-is into
-// AUDIO_L16_ENDIANNESS -- it must agree with LittleEndian() in both directions.
-func TestVerdict_EnvValue(t *testing.T) {
-	le := analyze(encodeTone(t, binary.LittleEndian))
-	assert.Equal(t, "le", le.EnvValue())
-
-	be := analyze(encodeTone(t, binary.BigEndian))
-	assert.Equal(t, "be", be.EnvValue())
-}
-
-func encodeTone(t *testing.T, order binary.ByteOrder) []byte {
-	t.Helper()
-
-	le := generateTone(toneFreqHz, toneDuration, 16000) // always generated as LE by this helper
-
-	if order == binary.LittleEndian {
-		return le
-	}
-
-	// Re-encode the same samples in the opposite byte order.
-	out := make([]byte, len(le))
-	for i := 0; i+1 < len(le); i += 2 {
-		sample := binary.LittleEndian.Uint16(le[i:])
-		order.PutUint16(out[i:], sample)
+	for i := 0; i+1 < len(out); i += 2 {
+		out[i], out[i+1] = out[i+1], out[i]
 	}
 
 	return out
+}
+
+func TestAnalyze_LittleEndianTone_ScoresLittleEndianSmoother(t *testing.T) {
+	tone := generateTone(toneFreqHz, 200*time.Millisecond, media.SampleRate)
+
+	verdict := analyze(tone)
+
+	assert.True(t, verdict.LittleEndian(), "a genuinely little-endian-encoded tone must score as little-endian")
+	assert.Less(t, verdict.LittleEndianScore, verdict.BigEndianScore)
+	assert.Equal(t, "le", verdict.EnvValue())
+}
+
+func TestAnalyze_BigEndianTone_ScoresBigEndianSmoother(t *testing.T) {
+	// generateTone always produces LE bytes; byte-swapping a smooth waveform's LE
+	// encoding produces exactly what that same waveform looks like on the wire if
+	// it had actually been encoded big-endian.
+	tone := swapBytes(generateTone(toneFreqHz, 200*time.Millisecond, media.SampleRate))
+
+	verdict := analyze(tone)
+
+	assert.False(t, verdict.LittleEndian(), "a genuinely big-endian-encoded tone must score as big-endian")
+	assert.Less(t, verdict.BigEndianScore, verdict.LittleEndianScore)
+	assert.Equal(t, "be", verdict.EnvValue())
+}
+
+func TestRequireCaptured_ZeroPackets_HardError(t *testing.T) {
+	err := requireCaptured(nil, probeStats{rawDatagrams: 12, rtcpFiltered: 12})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no RTP captured")
+	assert.Contains(t, err.Error(), "raw_datagrams=12")
+	assert.Contains(t, err.Error(), "rtcp_filtered=12")
+}
+
+func TestRequireCaptured_ZeroRawDatagrams_HardErrorMentionsIt(t *testing.T) {
+	// The other diagnosable failure mode: nothing reached the socket at all, not
+	// even RTCP -- distinct from "datagrams arrived but were filtered out".
+	err := requireCaptured(nil, probeStats{})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "raw_datagrams=0")
+}
+
+func TestRequireCaptured_NonZeroCapture_NoError(t *testing.T) {
+	err := requireCaptured([]byte{1, 2, 3, 4}, probeStats{captured: 1})
+
+	assert.NoError(t, err)
 }

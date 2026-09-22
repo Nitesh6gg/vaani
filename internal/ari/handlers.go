@@ -329,6 +329,7 @@ func (m *Manager) startRTPMedia(c *call) {
 		FromWire:            fromWire,
 		RecordDir:           m.cfg.RecordDir,
 		Handler:             m.mediaHandler(c.ID),
+		DebugAudio:          m.cfg.DebugAudio,
 	})
 
 	c.SetState(session.StateMediaActive)
@@ -366,8 +367,9 @@ func (m *Manager) startAudioSocketMedia(c *call) {
 	_ = ln.Close() // one connection is all a call needs; free the OS listener now
 
 	c.asm = media.NewAudioSocketCallMedia(c.ID, conn, metrics.AudioSocketSink{}, media.AudioSocketConfig{
-		RecordDir: m.cfg.RecordDir,
-		Handler:   m.mediaHandler(c.ID),
+		RecordDir:  m.cfg.RecordDir,
+		Handler:    m.mediaHandler(c.ID),
+		DebugAudio: m.cfg.DebugAudio,
 	})
 
 	c.SetState(session.StateMediaActive)
@@ -445,6 +447,16 @@ func (m *Manager) teardown(c *call) {
 			slog.Warn("media plane never started; no audio ever received", "call_id", c.ID, "external_id", c.ExternalID)
 		}
 
+		// Independent of the checks above: a call can have transport-healthy audio
+		// (remote locked, packets flowing) and still carry near-silent audio the
+		// whole way through -- exactly the signature of the jitter-buffer
+		// production incident (see docs/AUDIO_PIPELINE.md), which neither check
+		// above catches since Asterisk really was sending packets.
+		if avgRMS, ok := nearSilentRMS(c); ok {
+			slog.Warn("call carried near-silent audio throughout; audio pipeline may be misconfigured",
+				"call_id", c.ID, "external_id", c.ExternalID, "avg_rms", avgRMS)
+		}
+
 		closeMediaSocket(c)
 
 		if c.bridge != nil {
@@ -463,6 +475,19 @@ func (m *Manager) teardown(c *call) {
 			"call_id", c.ID, "external_id", c.ExternalID, "port", c.Port,
 			"caller_number", c.Info.CallerNumber, "called_number", c.Info.CalledNumber, "direction", c.Info.Direction)
 	})
+}
+
+// nearSilentRMS reports whichever media plane the call actually ran's
+// NearSilent() verdict, or (0, false) if neither started.
+func nearSilentRMS(c *call) (avgRMS float64, ok bool) {
+	switch {
+	case c.cm != nil:
+		return c.cm.NearSilent()
+	case c.asm != nil:
+		return c.asm.NearSilent()
+	default:
+		return 0, false
+	}
 }
 
 // shutdown tears down every active call, used on process shutdown.

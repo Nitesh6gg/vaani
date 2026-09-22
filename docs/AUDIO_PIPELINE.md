@@ -83,6 +83,51 @@ since audio is now held for possible reordering before release. Set
 `JITTER_BUFFER_PACKETS=1` for latency-sensitive manual testing; the load test
 should use the default, since loss concealment is exactly what it validates.
 
+## Near-Silence Warning at Teardown
+
+`internal/ari/handlers.go`'s `teardown` already warns when a call's RTP remote
+was never locked (no audio at all). That check can't catch a subtler failure:
+transport-healthy audio -- remote locked, packets arriving on schedule -- that
+still comes out near-silent end to end. That's exactly what happened in the
+jitter-buffer production incident above: Asterisk really was sending RTP, so
+`RemoteLocked()` was true, but the buffer's permanent desync meant almost every
+release was concealment silence instead of real audio.
+
+`CallMedia`/`AudioSocketCallMedia` now track the mean RMS (`internal/media.rms`,
+already computed per tick for `vaani_audio_rms`) across every release tick of a
+call's lifetime. At teardown, if at least `nearSilenceMinTicks` (50, ~1s) ticks
+were observed and the average stays below `nearSilenceRMSThreshold` (50, out of
+a max-amplitude PCM16 sample of 32767), `teardown` logs `call carried
+near-silent audio throughout; audio pipeline may be misconfigured` with the
+call ID and average RMS -- independently of, and in addition to, the
+remote-locked check. A short call (fewer than 50 ticks) is never judged, to
+avoid false positives on calls that hang up almost immediately.
+
+## Live Audio Tap (`DEBUG_AUDIO=1`)
+
+Set `DEBUG_AUDIO=1` to mount `/debug/audio/{callID}` on `METRICS_ADDR`: while a
+call is active, `GET` that path streams its inbound audio (raw s16le PCM,
+post-jitter-buffer, post-normalization -- the same bytes written to the WAV
+recorder and handed to the Handler) in real time, for listening without waiting
+for `RECORD_DIR`'s WAV file to close:
+
+```bash
+curl -sN http://localhost:9091/debug/audio/<callID> | aplay -f S16_LE -r 16000 -c1 -
+```
+
+`internal/media/audiotap.go`'s `AudioTap` fans a call's release-tick PCM out to
+however many concurrent listeners are subscribed (zero-cost when none are);
+`RegisterAudioTap`/`UnregisterAudioTap` key a process-wide registry by call ID so
+the HTTP handler (`internal/metrics`) doesn't need a reference to the specific
+`CallMedia`/`AudioSocketCallMedia` instance. `UnregisterAudioTap` closes the tap,
+which closes every subscriber's channel -- without that, a streaming client would
+block past the call's actual lifetime instead of seeing its stream end. A slow
+subscriber drops frames rather than stalling the call's release tick (same
+non-blocking-send philosophy as the outbound queues in "Pipeline" above).
+
+Never set `DEBUG_AUDIO=1` in production: anyone who can reach `METRICS_ADDR` can
+listen to any active call's audio.
+
 ## The Handler Contract
 
 `internal/media/handler.go` defines the seam Phase 3 plugs into:
@@ -177,17 +222,59 @@ WAN link).
 RTP L16 payloads are nominally big-endian per RFC 3551, but that's a generic
 profile default, not a guarantee about a specific Asterisk build's externalMedia
 implementation -- so it's checked empirically rather than assumed, since Phase 3
-(STT) needs to know which byte order it's receiving.
+(STT) needs to know which byte order it's receiving. **It has also been observed
+to differ by Asterisk build** (see "Confirmed finding" below), so a verdict from
+one deployment must never be copied to another without re-running the check.
 
 The result feeds `AUDIO_L16_ENDIANNESS` (`le` or `be`, see `.env.example`), which
 `internal/media.NormalizeToLE` uses to convert inbound payloads to little-endian
 before they ever reach the jitter buffer's release or a Handler -- see "The
-Handler Contract" below. **Status: defaults to `le` pending an actual probe run
-against a live stack; the probe below has not yet been executed and appended.**
-Run it and set `AUDIO_L16_ENDIANNESS` accordingly before trusting Phase 3 audio.
-Until it's explicitly set (real environment or `.env`), `cmd/server` logs a
-startup warning (`internal/media.WarnIfUnset`) so an unverified assumption never
-passes silently.
+Handler Contract" below. Until it's explicitly set (real environment or `.env`),
+`cmd/server` logs a startup warning (`internal/media.WarnIfUnset`) so an
+unverified assumption never passes silently. **Running `cmd/endianness-check` (or
+equivalent live confirmation) is mandatory before trusting any Phase 3 (STT)
+audio on a given deployment** -- a wrong value doesn't fail loudly on its own; it
+silently hands STT a scrambled signal that still looks like "audio arrived."
+
+### Confirmed finding (this deployment, 2026-09-22)
+
+Live call testing (not the tool below, which was broken at the time -- see "Tool
+bug fixed" next) confirmed `AUDIO_L16_ENDIANNESS=le` decodes to noise and
+`AUDIO_L16_ENDIANNESS=be` decodes to real speech on this deployment's Asterisk
+build. This deployment's `.env` is set to `be` accordingly. This does **not**
+change `.env.example`'s default: the value is a per-deployment fact, not a
+universal one -- treat any other deployment's correct value as unknown until it
+runs its own check.
+
+### Tool bug fixed: was printing a verdict from zero captured packets
+
+The first live run of `cmd/endianness-check` captured **zero** RTP packets
+(`n=0`) and still printed a confident-looking verdict, because `analyze()` scored
+two empty sample slices as equally "smooth" (`0.0 <= 0.0`, which
+`Verdict.LittleEndian()` resolves to `le`) with nothing to distinguish them.
+Root cause was a real deadlock in `probe()`: the tone-sending goroutine calls
+`Endpoint.WriteTo`, which (correctly, for the production `CallMedia` path -- see
+the port-binding invariant in `CLAUDE.md`) refuses to send until `LockRemote` has
+fired from an inbound packet -- but the reader goroutine only called
+`LockRemote` after successfully parsing non-RTCP RTP audio. If Asterisk's first
+traffic on that leg is RTCP-only (or nothing, until it has real content to mix),
+that gate can never open: our tone can't reach Asterisk without a lock that only
+an already-flowing stream would produce. Fixed two ways:
+
+- `probe()` now locks the remote address from **any** inbound datagram on that
+  leg's muxed RTP/RTCP socket, not only a successfully-parsed RTP payload --
+  since RTP and RTCP share one port here, an RTCP packet's source address is
+  already the right one to send the tone to.
+- The tool now fails loudly instead of guessing: `requireCaptured` returns `no
+  RTP captured — probe did not flow` if zero bytes were captured, and every run
+  logs per-stage packet counts (`raw_datagrams`, `rtcp_filtered`, `parse_failed`,
+  `rtp_packets_captured`) so a future zero-capture run points at exactly where
+  the flow stopped instead of failing mysteriously.
+
+Covered by `TestAnalyze_LittleEndianTone_ScoresLittleEndianSmoother`,
+`TestAnalyze_BigEndianTone_ScoresBigEndianSmoother` (synthetic tones, both byte
+orders), and `TestRequireCaptured_*` (zero-capture hard error) in
+`cmd/endianness-check/main_test.go`.
 
 Run `cmd/endianness-check` against a live `make up` stack:
 

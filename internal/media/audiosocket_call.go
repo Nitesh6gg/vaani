@@ -27,6 +27,9 @@ type AudioSocketSink interface {
 type AudioSocketConfig struct {
 	Handler   Handler
 	RecordDir string
+	// DebugAudio, when true, registers this call with the /debug/audio/{callID}
+	// tap registry (see audiotap.go). Same contract as Config.DebugAudio.
+	DebugAudio bool
 }
 
 // AudioSocketCallMedia runs the media pipeline for one AudioSocket call:
@@ -51,6 +54,7 @@ type AudioSocketCallMedia struct {
 	handler  Handler
 	recorder *WavRecorder
 	watchdog *Watchdog
+	tap      *AudioTap
 
 	releasePacer *Pacer
 	writePacer   *Pacer
@@ -58,6 +62,8 @@ type AudioSocketCallMedia struct {
 	outbound     chan *[]byte
 
 	prevRelease time.Time
+	rmsSum      float64
+	rmsTicks    int64
 }
 
 // NewAudioSocketCallMedia wraps conn -- already accepted from Asterisk's TCP
@@ -68,6 +74,11 @@ func NewAudioSocketCallMedia(callID string, conn net.Conn, sink AudioSocketSink,
 		handler = LoopbackHandler{}
 	}
 
+	var tap *AudioTap
+	if cfg.DebugAudio {
+		tap = RegisterAudioTap(callID)
+	}
+
 	return &AudioSocketCallMedia{
 		callID:       callID,
 		conn:         conn,
@@ -75,6 +86,7 @@ func NewAudioSocketCallMedia(callID string, conn net.Conn, sink AudioSocketSink,
 		handler:      handler,
 		recorder:     NewWavRecorder(cfg.RecordDir, callID),
 		watchdog:     NewWatchdog(callID, WatchdogTimeout, sink),
+		tap:          tap,
 		releasePacer: NewPacer(FrameInterval),
 		writePacer:   NewPacer(FrameInterval),
 		inbound:      make(chan *[]byte, 5),
@@ -98,6 +110,10 @@ func (c *AudioSocketCallMedia) Run(ctx context.Context) {
 	_ = c.conn.Close()
 	<-readDone
 	c.recorder.Close()
+
+	if c.tap != nil {
+		UnregisterAudioTap(c.callID)
+	}
 }
 
 // Close tears down the call's media plane; equivalent to cancelling the context
@@ -107,6 +123,23 @@ func (c *AudioSocketCallMedia) Close() {
 	c.writePacer.Stop()
 	_ = c.conn.Close()
 	c.recorder.Close()
+
+	if c.tap != nil {
+		UnregisterAudioTap(c.callID)
+	}
+}
+
+// NearSilent reports whether this call's average inbound audio level, across its
+// whole lifetime, stayed suspiciously low. Same contract and thresholds as
+// CallMedia.NearSilent -- see the const block in loopback.go.
+func (c *AudioSocketCallMedia) NearSilent() (avgRMS float64, ok bool) {
+	if c.rmsTicks < nearSilenceMinTicks {
+		return 0, false
+	}
+
+	avg := c.rmsSum / float64(c.rmsTicks)
+
+	return avg, avg < nearSilenceRMSThreshold
 }
 
 func (c *AudioSocketCallMedia) readLoop(ctx context.Context, done chan<- struct{}) {
@@ -176,7 +209,15 @@ func (c *AudioSocketCallMedia) releaseLoop(ctx context.Context) {
 		pcm := *raw
 
 		c.recorder.WriteIn(pcm)
-		c.sink.AudioLevel(rms(pcm))
+
+		level := rms(pcm)
+		c.sink.AudioLevel(level)
+		c.rmsSum += level
+		c.rmsTicks++
+
+		if c.tap != nil {
+			c.tap.Publish(pcm)
+		}
 
 		for _, frame := range c.handler.ProcessFrame(ctx, c.callID, pcm) {
 			out := GetFrame()

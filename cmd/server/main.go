@@ -38,7 +38,7 @@ func run() error {
 	defer stop()
 
 	go func() {
-		if err := metrics.Serve(ctx, cfg.MetricsAddr); err != nil {
+		if err := metrics.Serve(ctx, cfg.MetricsAddr, cfg.DebugAudio); err != nil {
 			slog.Error("metrics server error", "error", err)
 		}
 	}()

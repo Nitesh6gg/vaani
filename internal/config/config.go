@@ -66,6 +66,13 @@ type Config struct {
 	// question -- AUDIO_L16_ENDIANNESS and JITTER_BUFFER_PACKETS are meaningless
 	// for it and are ignored when this is "audiosocket".
 	MediaEncapsulation string
+
+	// DebugAudio, when true (DEBUG_AUDIO=1), enables the live /debug/audio/{callID}
+	// tap on MetricsAddr for real-time listening to a call's inbound audio
+	// (post-normalization) without waiting for RecordDir's WAV file to close.
+	// Never set this in production -- it lets anyone who can reach METRICS_ADDR
+	// listen to live call audio. Leave unset/0 normally.
+	DebugAudio bool
 }
 
 // Load reads configuration from the environment, applying local-dev defaults that
@@ -90,6 +97,7 @@ func Load() (Config, error) {
 		AppMode:             getEnv("APP_MODE", "loopback"),
 		TestSilentHandler:   getEnv("TEST_SILENT_HANDLER", "") == "1",
 		MediaEncapsulation:  getEnv("MEDIA_ENCAPSULATION", "rtp"),
+		DebugAudio:          getEnv("DEBUG_AUDIO", "") == "1",
 	}
 
 	var err error

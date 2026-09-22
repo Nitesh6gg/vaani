@@ -165,13 +165,24 @@ func run() error {
 		}
 	}()
 
-	captured, err := probe(portA)
+	captured, stats, err := probe(portA)
 
 	close(relayStop)
 	<-relayDone
 
 	if err != nil {
 		return fmt.Errorf("probe: %w", err)
+	}
+
+	slog.Info("probe capture stats",
+		"raw_datagrams", stats.rawDatagrams,
+		"rtcp_filtered", stats.rtcpFiltered,
+		"parse_failed", stats.parseFailed,
+		"rtp_packets_captured", stats.captured,
+		"bytes_captured", len(captured))
+
+	if err := requireCaptured(captured, stats); err != nil {
+		return err
 	}
 
 	verdict := analyze(captured)
@@ -252,13 +263,25 @@ func relayRaw(port int, stop <-chan struct{}) error {
 	}
 }
 
+// probeStats counts what happened at each stage of probe's reader loop, so a
+// zero-capture run can be diagnosed instead of just failing mysteriously: how
+// many raw UDP datagrams arrived at all, how many of those were RTCP (no audio
+// content), how many failed RTP parsing, and how many were captured as real
+// audio payload.
+type probeStats struct {
+	rawDatagrams int
+	rtcpFiltered int
+	parseFailed  int
+	captured     int
+}
+
 // probe sends a 2s 440Hz little-endian PCM16 tone over RTP on port, one 20ms frame
 // at a time, and returns every inbound RTP payload received during that window
 // (plus a short grace period) concatenated in arrival order.
-func probe(port int) ([]byte, error) {
+func probe(port int) ([]byte, probeStats, error) {
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: port})
 	if err != nil {
-		return nil, err
+		return nil, probeStats{}, err
 	}
 	defer func() { _ = conn.Close() }()
 
@@ -267,6 +290,8 @@ func probe(port int) ([]byte, error) {
 
 	captured := &bytes.Buffer{}
 	captureDone := make(chan struct{})
+
+	var stats probeStats
 
 	readCtx, cancelRead := context.WithCancel(context.Background())
 	defer cancelRead()
@@ -288,16 +313,34 @@ func probe(port int) ([]byte, error) {
 				continue // read timeout; keep polling until readCtx is cancelled
 			}
 
+			stats.rawDatagrams++
+
+			// Lock as soon as ANY datagram arrives on this leg's muxed RTP/RTCP
+			// socket -- not gated on successfully parsing real RTP audio. This
+			// fixes a real deadlock: Asterisk won't send audio back on this leg
+			// until it can already reach our tone-sender's Endpoint.WriteTo, which
+			// itself refuses to send until LockRemote has fired. Gating the lock on
+			// "valid RTP audio arrived" makes that impossible to ever satisfy if
+			// Asterisk starts this leg with RTCP-only traffic (or nothing) before
+			// it has real content to mix -- our sender can never produce the "valid
+			// RTP audio" the old gate was waiting for without the lock it's itself
+			// blocking. See docs/AUDIO_PIPELINE.md.
+			if ep.LockRemote(addr) {
+				slog.Info("probe remote locked", "addr", addr)
+			}
+
 			if media.IsRTCP(buf[:n]) {
+				stats.rtcpFiltered++
 				continue
 			}
 
 			pkt, err := media.ParseRTP(buf[:n])
 			if err != nil {
+				stats.parseFailed++
 				continue
 			}
 
-			ep.LockRemote(addr)
+			stats.captured++
 			captured.Write(pkt.Payload)
 		}
 	}()
@@ -338,7 +381,24 @@ func probe(port int) ([]byte, error) {
 	cancelRead()
 	<-captureDone
 
-	return captured.Bytes(), nil
+	return captured.Bytes(), stats, nil
+}
+
+// requireCaptured fails loudly instead of letting a zero-sample capture flow
+// into analyze(), which would otherwise score two empty slices as equally
+// "smooth" (0.0 <= 0.0) and print a confident-looking but meaningless verdict.
+// stats' per-stage counts are included so a real zero-capture run points
+// straight at where the flow stopped (e.g. rawDatagrams==0 means nothing ever
+// reached this socket at all; rawDatagrams>0 but captured==0 means datagrams
+// arrived but were all RTCP or failed RTP parsing).
+func requireCaptured(captured []byte, stats probeStats) error {
+	if len(captured) == 0 {
+		return fmt.Errorf(
+			"no RTP captured — probe did not flow (raw_datagrams=%d rtcp_filtered=%d parse_failed=%d)",
+			stats.rawDatagrams, stats.rtcpFiltered, stats.parseFailed)
+	}
+
+	return nil
 }
 
 // generateTone renders a pure sine wave as little-endian PCM16 at sampleRate,

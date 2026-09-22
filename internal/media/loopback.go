@@ -36,7 +36,24 @@ type Config struct {
 	FromWire            Endianness
 	Handler             Handler
 	RecordDir           string
+	// DebugAudio, when true, registers this call with the /debug/audio/{callID}
+	// tap registry (see audiotap.go) so a live listener can stream its inbound
+	// audio. Costs one map entry and a per-tick no-subscriber check when false
+	// listeners are attached; skipped entirely when false.
+	DebugAudio bool
 }
+
+// nearSilenceRMSThreshold and nearSilenceMinTicks bound the teardown-time
+// near-silence warning: a call whose average inbound RMS never rose above this
+// threshold, across at least this many release ticks (~1s), gets flagged as
+// suspicious. This is exactly the signature of the jitter-buffer production
+// incident documented in docs/AUDIO_PIPELINE.md (transport-healthy RTP, but
+// concealment silence released instead of real audio) -- RemoteLocked() alone
+// doesn't catch it, since Asterisk was in fact sending real packets.
+const (
+	nearSilenceRMSThreshold = 50.0
+	nearSilenceMinTicks     = 50
+)
 
 // CallMedia runs the media pipeline for exactly one call:
 //
@@ -57,6 +74,7 @@ type CallMedia struct {
 	recorder *WavRecorder
 	watchdog *Watchdog
 	seq      SeqTracker
+	tap      *AudioTap
 
 	releasePacer *Pacer
 	writePacer   *Pacer
@@ -64,6 +82,8 @@ type CallMedia struct {
 	outbound     chan *[]byte
 
 	prevRelease time.Time
+	rmsSum      float64
+	rmsTicks    int64
 }
 
 // NewCallMedia wraps conn (already bound to the call's allocated port) into a
@@ -72,6 +92,11 @@ func NewCallMedia(callID string, conn *net.UDPConn, sink Sink, cfg Config) *Call
 	handler := cfg.Handler
 	if handler == nil {
 		handler = LoopbackHandler{}
+	}
+
+	var tap *AudioTap
+	if cfg.DebugAudio {
+		tap = RegisterAudioTap(callID)
 	}
 
 	return &CallMedia{
@@ -83,6 +108,7 @@ func NewCallMedia(callID string, conn *net.UDPConn, sink Sink, cfg Config) *Call
 		fromWire:     cfg.FromWire,
 		recorder:     NewWavRecorder(cfg.RecordDir, callID),
 		watchdog:     NewWatchdog(callID, WatchdogTimeout, sink),
+		tap:          tap,
 		releasePacer: NewPacer(FrameInterval),
 		writePacer:   NewPacer(FrameInterval),
 		sender:       NewSender(),
@@ -106,6 +132,10 @@ func (c *CallMedia) Run(ctx context.Context) {
 	_ = c.ep.Close()
 	<-readDone
 	c.recorder.Close()
+
+	if c.tap != nil {
+		UnregisterAudioTap(c.callID)
+	}
 }
 
 // Close tears down the call's media plane; equivalent to cancelling the context
@@ -115,6 +145,10 @@ func (c *CallMedia) Close() {
 	c.writePacer.Stop()
 	_ = c.ep.Close()
 	c.recorder.Close()
+
+	if c.tap != nil {
+		UnregisterAudioTap(c.callID)
+	}
 }
 
 // RemoteLocked reports whether a valid inbound packet has ever locked the outbound
@@ -122,6 +156,21 @@ func (c *CallMedia) Close() {
 // false -- it means no audio was ever received from Asterisk for the whole call.
 func (c *CallMedia) RemoteLocked() bool {
 	return c.ep.Remote() != nil
+}
+
+// NearSilent reports whether this call's average inbound audio level, across its
+// whole lifetime, stayed suspiciously low (avgRMS, with ok=true meaning "yes,
+// warn about it"). ok is always false if fewer than nearSilenceMinTicks release
+// ticks were observed -- too short a call to judge. See the const block above
+// for why this check exists.
+func (c *CallMedia) NearSilent() (avgRMS float64, ok bool) {
+	if c.rmsTicks < nearSilenceMinTicks {
+		return 0, false
+	}
+
+	avg := c.rmsSum / float64(c.rmsTicks)
+
+	return avg, avg < nearSilenceRMSThreshold
 }
 
 func (c *CallMedia) readLoop(ctx context.Context, done chan<- struct{}) {
@@ -188,7 +237,15 @@ func (c *CallMedia) releaseLoop(ctx context.Context) {
 
 		NormalizeToLE(pcm, c.fromWire)
 		c.recorder.WriteIn(pcm)
-		c.sink.AudioLevel(rms(pcm))
+
+		level := rms(pcm)
+		c.sink.AudioLevel(level)
+		c.rmsSum += level
+		c.rmsTicks++
+
+		if c.tap != nil {
+			c.tap.Publish(pcm)
+		}
 
 		for _, frame := range c.handler.ProcessFrame(ctx, c.callID, pcm) {
 			out := GetFrame()

@@ -29,6 +29,83 @@ func (f *fakeAudioSocketSink) WatchdogTimeout()   {}
 func (f *fakeAudioSocketSink) PacerDrift(float64) {}
 func (f *fakeAudioSocketSink) AudioLevel(float64) {}
 
+func TestAudioSocketCallMedia_NearSilent_TooFewTicksReturnsFalse(t *testing.T) {
+	cm := &AudioSocketCallMedia{rmsTicks: nearSilenceMinTicks - 1}
+
+	_, ok := cm.NearSilent()
+	assert.False(t, ok)
+}
+
+func TestAudioSocketCallMedia_NearSilent_BelowThresholdReturnsTrue(t *testing.T) {
+	cm := &AudioSocketCallMedia{rmsTicks: nearSilenceMinTicks, rmsSum: 10 * float64(nearSilenceMinTicks)}
+
+	avg, ok := cm.NearSilent()
+	assert.True(t, ok)
+	assert.InDelta(t, 10.0, avg, 0.001)
+}
+
+func TestAudioSocketCallMedia_NearSilent_AboveThresholdReturnsFalse(t *testing.T) {
+	cm := &AudioSocketCallMedia{rmsTicks: nearSilenceMinTicks, rmsSum: 5000 * float64(nearSilenceMinTicks)}
+
+	_, ok := cm.NearSilent()
+	assert.False(t, ok)
+}
+
+// TestAudioSocketCallMedia_DebugAudioPublishesToTap mirrors
+// TestCallMedia_DebugAudioPublishesToTap for the AudioSocket transport: same
+// registry, same contract, different wire.
+func TestAudioSocketCallMedia_DebugAudioPublishesToTap(t *testing.T) {
+	const callID = "debug-audio-audiosocket-call"
+
+	asteriskSide, vaaniSide := net.Pipe()
+	defer func() { _ = asteriskSide.Close() }()
+
+	cm := NewAudioSocketCallMedia(callID, vaaniSide, &fakeAudioSocketSink{}, AudioSocketConfig{DebugAudio: true})
+
+	tap := LookupAudioTap(callID)
+	require.NotNil(t, tap, "DebugAudio:true must register a tap under the call ID")
+
+	tapCh, unsubscribe := tap.Subscribe()
+	defer unsubscribe()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+
+	go func() {
+		cm.Run(ctx)
+		close(runDone)
+	}()
+
+	payload := make([]byte, FrameSize)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+
+	writeErrs := make(chan error, 1)
+
+	go func() {
+		writeErrs <- WriteAudioSocketFrame(asteriskSide, AudioSocketKindSlin16, payload)
+	}()
+	require.NoError(t, <-writeErrs)
+
+	select {
+	case frame := <-tapCh:
+		assert.Equal(t, FrameSize, len(frame))
+	case <-time.After(2 * time.Second):
+		t.Fatal("tap subscriber never received a published frame")
+	}
+
+	cancel()
+
+	select {
+	case <-runDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("AudioSocketCallMedia.Run did not return promptly after context cancellation")
+	}
+
+	assert.Nil(t, LookupAudioTap(callID), "tap must be unregistered once the call's media plane stops")
+}
+
 // TestAudioSocketCallMedia_EndToEndLoopback proves the full AudioSocket pipeline
 // -- reader -> inbound queue -> release -> LoopbackHandler -> writer -- actually
 // echoes real audio over the wire protocol, using net.Pipe as a stand-in for the
