@@ -33,10 +33,12 @@ sensitive manual ear-testing, set `JITTER_BUFFER_PACKETS=1` (20ms window); leave
 it at the default for load testing, since loss concealment is what that
 validates.
 
-## Metrics
+## Metrics and health
 
 `http://localhost:9091/metrics` (Prometheus format) -- see `internal/metrics` for
-the full list of series.
+the full list of series. `http://localhost:9091/healthz` returns 200 JSON while
+the ARI WebSocket is connected, 503 otherwise. Neither endpoint requires
+authentication -- see "Operability endpoints" in `docs/ARCHITECTURE.md`.
 
 ## Port ranges
 

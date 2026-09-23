@@ -17,8 +17,11 @@ Real-time voice agent: Asterisk ARI (telephony) + Go media plane + Sarvam STT/TT
 - `internal/session/` — per-call state machine, barge-in orchestration
 
 ## Critical Invariants (NEVER violate these)
-1. **20ms pacer**: use `time.NewTicker`, re-clamp deadline to `time.Now()` on every tick.
-   Never `time.Sleep(20 * time.Millisecond)` — it drifts and bursts after stalls.
+1. **20ms pacer**: use `time.NewTicker` (`internal/media/pacer.go`) and pass each
+   tick's own fire time to the callback — never a computed "next deadline"
+   variable. Never `time.Sleep(20 * time.Millisecond)`: unlike a ticker, it has no
+   built-in coalescing, so after any stall it delivers a burst of catch-up sleeps
+   instead of just costing the missed ticks.
 2. **Media path: ARI externalMedia**, selectable via `MEDIA_ENCAPSULATION`: `rtp`
    (default, `transport=udp`, `format=slin16`) or `audiosocket` (`transport=tcp`,
    Asterisk's res_audiosocket framed protocol — see `internal/media/audiosocket.go`).
@@ -31,7 +34,13 @@ Real-time voice agent: Asterisk ARI (telephony) + Go media plane + Sarvam STT/TT
    `ForceAttemptHTTP2=true`. Never create per-request clients.
 6. **One ARI WebSocket** for the whole process — never per-call.
 7. **Barge-in is 5 cuts**: pacer stop, STT cancel, LLM cancel, TTS stream close, queue flush.
-   Missing any one causes leaked audio or billing waste.
+   Missing any one causes leaked audio or billing waste. **Unresolved tension for
+   Phase 4**: invariant #9's "RTP must never starve" means the write tick has to
+   keep firing (silence fallback) for as long as the call is active — so "pacer
+   stop" here almost certainly has to mean *stop feeding the outbound queue*, not
+   literally call `Pacer.Stop()` on the write loop's ticker. Resolve this
+   explicitly when barge-in is implemented; don't let it default to whichever
+   reading compiles first.
 8. **Audio format**: slin16 (16kHz 16-bit mono PCM) end-to-end. Asterisk handles μ-law transcoding.
 9. **One media socket per call**, bound to a port from the managed pool (never shared
    across calls), and bound/listening *before* the externalMedia channel is created —
