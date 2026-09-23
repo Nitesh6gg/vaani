@@ -18,6 +18,9 @@ type AudioSocketSink interface {
 	SilenceSent()
 	SendError()
 	Malformed()
+	// QueueDropped fires when handler output is dropped because the outbound
+	// queue was full (the writer isn't keeping up). Same contract as Sink's.
+	QueueDropped()
 	WatchdogTimeout()
 	PacerDrift(ms float64)
 	AudioLevel(rms float64)
@@ -137,19 +140,6 @@ func (c *AudioSocketCallMedia) Run(ctx context.Context) {
 	}
 }
 
-// Close tears down the call's media plane; equivalent to cancelling the context
-// passed to Run, provided for callers that don't otherwise hold that cancel func.
-func (c *AudioSocketCallMedia) Close() {
-	c.releasePacer.Stop()
-	c.writePacer.Stop()
-	_ = c.conn.Close()
-	c.recorder.Close()
-
-	if c.tap != nil {
-		UnregisterAudioTap(c.callID)
-	}
-}
-
 // NearSilent reports whether this call's average inbound audio level, across its
 // whole lifetime, stayed suspiciously low. Same contract and thresholds as
 // CallMedia.NearSilent -- see the const block in loopback.go.
@@ -253,6 +243,7 @@ func (c *AudioSocketCallMedia) releaseLoop(ctx context.Context) {
 			select {
 			case c.outbound <- out:
 			default:
+				c.sink.QueueDropped()
 				PutFrame(out)
 			}
 		}
@@ -264,9 +255,18 @@ func (c *AudioSocketCallMedia) releaseLoop(ctx context.Context) {
 // writeLoop drains the outbound queue on its own tick and sends each frame as a
 // paced AudioSocket audio frame. If nothing is queued yet (handler underrun, or
 // startup), it still sends a silence frame on schedule, per the pacer invariant.
+//
+// A failed write is fatal to this call's media, not just a dropped frame:
+// WriteAudioSocketFrame writes header and payload as separate writes, so a
+// payload failure leaves the framed stream misaligned -- every subsequent frame
+// would be parsed at the wrong boundary, corrupting audio rather than degrading
+// it. On the first write error the loop stops writing and closes the connection
+// (which also unblocks the reader); call teardown follows via StasisEnd.
 func (c *AudioSocketCallMedia) writeLoop(ctx context.Context) {
+	dead := false
+
 	c.writePacer.Run(func(_ time.Time) {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || dead {
 			return
 		}
 
@@ -290,7 +290,10 @@ func (c *AudioSocketCallMedia) writeLoop(ctx context.Context) {
 
 		if err != nil {
 			c.sink.SendError()
-			slog.Warn("audiosocket write error", "call_id", c.callID, "error", err)
+			dead = true
+			slog.Error("audiosocket write error; stopping writes and closing connection (framed stream can no longer be trusted)",
+				"call_id", c.callID, "error", err)
+			_ = c.conn.Close()
 
 			return
 		}

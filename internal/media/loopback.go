@@ -17,6 +17,13 @@ type Sink interface {
 	PacketOut()
 	SeqGap()
 	Malformed()
+	// PayloadSizeMismatch fires for an inbound RTP packet whose payload isn't
+	// the expected FrameSize (640 bytes = 20ms of slin16): the frame is dropped
+	// rather than fed downstream misaligned.
+	PayloadSizeMismatch()
+	// QueueDropped fires when handler output is dropped because the outbound
+	// queue was full (the writer isn't keeping up).
+	QueueDropped()
 	SendError()
 	Late()
 	Duplicate()
@@ -56,6 +63,11 @@ const (
 	nearSilenceRMSThreshold = 50.0
 	nearSilenceMinTicks     = 50
 )
+
+// sendErrorWarnInterval rate-limits the writeLoop's send-failure warnings: a
+// dead remote otherwise produces one warn line per 20ms tick (50/s per call).
+// Every failure is still counted via Sink.SendError.
+const sendErrorWarnInterval = 5 * time.Second
 
 // CallMedia runs the media pipeline for exactly one call:
 //
@@ -159,19 +171,6 @@ func (c *CallMedia) Run(ctx context.Context) {
 	}
 }
 
-// Close tears down the call's media plane; equivalent to cancelling the context
-// passed to Run, provided for callers that don't otherwise hold that cancel func.
-func (c *CallMedia) Close() {
-	c.releasePacer.Stop()
-	c.writePacer.Stop()
-	_ = c.ep.Close()
-	c.recorder.Close()
-
-	if c.tap != nil {
-		UnregisterAudioTap(c.callID)
-	}
-}
-
 // RemoteLocked reports whether a valid inbound packet has ever locked the outbound
 // RTP destination for this call. Callers should WARN at teardown if this is still
 // false -- it means no audio was ever received from Asterisk for the whole call.
@@ -222,6 +221,19 @@ func (c *CallMedia) readLoop(ctx context.Context, done chan<- struct{}) {
 		if err != nil {
 			c.sink.Malformed()
 			slog.Debug("malformed rtp packet", "call_id", c.callID, "error", err)
+
+			continue
+		}
+
+		// The whole pipeline is built around exactly one 20ms slin16 frame per
+		// packet; a different payload size means Asterisk's packetization
+		// doesn't match (e.g. 160-sample frames), and feeding such a payload
+		// downstream would corrupt timing for the rest of the call. Drop and
+		// count it instead.
+		if len(pkt.Payload) != FrameSize {
+			c.sink.PayloadSizeMismatch()
+			slog.Debug("rtp payload size mismatch; dropping", "call_id", c.callID,
+				"size", len(pkt.Payload), "want", FrameSize)
 
 			continue
 		}
@@ -282,6 +294,7 @@ func (c *CallMedia) releaseLoop(ctx context.Context) {
 			case c.outbound <- out:
 			default:
 				// Writer isn't keeping up; drop rather than block release/handler.
+				c.sink.QueueDropped()
 				PutFrame(out)
 			}
 		}
@@ -297,6 +310,8 @@ func (c *CallMedia) releaseLoop(ctx context.Context) {
 // pacer invariant that exactly one packet goes out every tick once a remote is
 // locked.
 func (c *CallMedia) writeLoop(ctx context.Context) {
+	var lastSendWarn time.Time
+
 	c.writePacer.Run(func(_ time.Time) {
 		if ctx.Err() != nil {
 			return
@@ -330,7 +345,12 @@ func (c *CallMedia) writeLoop(ctx context.Context) {
 		sent, err := c.ep.WriteTo(out)
 		if err != nil {
 			c.sink.SendError()
-			slog.Warn("rtp write error", "call_id", c.callID, "error", err)
+
+			if time.Since(lastSendWarn) >= sendErrorWarnInterval {
+				slog.Warn("rtp write error (warning at most every 5s; every failure is counted)",
+					"call_id", c.callID, "error", err)
+				lastSendWarn = time.Now()
+			}
 
 			return
 		}

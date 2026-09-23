@@ -25,7 +25,7 @@ var (
 
 	CallDurationSeconds = promauto.NewHistogram(prometheus.HistogramOpts{
 		Name:    "vaani_call_duration_seconds",
-		Help:    "Duration of completed calls, from bridge to teardown.",
+		Help:    "Duration of completed calls, from channel staging (answer) to teardown.",
 		Buckets: prometheus.ExponentialBuckets(1, 2, 12), // 1s .. ~68m
 	})
 
@@ -52,6 +52,16 @@ var (
 	RTPMalformed = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "vaani_rtp_malformed_total",
 		Help: "Total inbound packets that failed RTP validation.",
+	})
+
+	RTPPayloadSizeMismatch = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "vaani_rtp_payload_size_mismatch_total",
+		Help: "Total inbound RTP packets whose payload was not the expected 640-byte (20ms) slin16 frame; sustained growth means Asterisk's packetization does not match this pipeline.",
+	})
+
+	MediaQueueDropped = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "vaani_media_queue_dropped_total",
+		Help: "Total handler output frames dropped because the outbound queue was full (writer not keeping up).",
 	})
 
 	MediaPortsInUse = promauto.NewGauge(prometheus.GaugeOpts{
@@ -163,6 +173,8 @@ func (Sink) PacketIn(bytes int) {
 func (Sink) PacketOut()             { RTPPacketsOut.Inc() }
 func (Sink) SeqGap()                { RTPSeqGaps.Inc() }
 func (Sink) Malformed()             { RTPMalformed.Inc() }
+func (Sink) PayloadSizeMismatch()   { RTPPayloadSizeMismatch.Inc() }
+func (Sink) QueueDropped()          { MediaQueueDropped.Inc() }
 func (Sink) SendError()             { RTPSendErrors.Inc() }
 func (Sink) Late()                  { RTPLate.Inc() }
 func (Sink) Duplicate()             { RTPDuplicates.Inc() }
@@ -191,6 +203,7 @@ func (AudioSocketSink) PacketOut()             { AudioSocketFramesOut.Inc() }
 func (AudioSocketSink) SilenceSent()           { AudioSocketSilenceSent.Inc() }
 func (AudioSocketSink) SendError()             { AudioSocketSendErrors.Inc() }
 func (AudioSocketSink) Malformed()             { AudioSocketMalformed.Inc() }
+func (AudioSocketSink) QueueDropped()          { MediaQueueDropped.Inc() }
 func (AudioSocketSink) WatchdogTimeout()       { MediaWatchdogTimeouts.Inc() }
 func (AudioSocketSink) PacerDrift(ms float64)  { PacerDriftMs.Observe(ms) }
 func (AudioSocketSink) AudioLevel(rms float64) { AudioRMS.Set(rms) }

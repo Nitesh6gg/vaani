@@ -25,6 +25,7 @@ func (f *fakeAudioSocketSink) PacketOut()         { f.packetOut.Add(1) }
 func (f *fakeAudioSocketSink) SilenceSent()       { f.silenceSent.Add(1) }
 func (f *fakeAudioSocketSink) SendError()         {}
 func (f *fakeAudioSocketSink) Malformed()         { f.malformed.Add(1) }
+func (f *fakeAudioSocketSink) QueueDropped()      {}
 func (f *fakeAudioSocketSink) WatchdogTimeout()   {}
 func (f *fakeAudioSocketSink) PacerDrift(float64) {}
 func (f *fakeAudioSocketSink) AudioLevel(float64) {}

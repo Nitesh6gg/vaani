@@ -19,21 +19,23 @@ type fakeCallSink struct {
 	sendError   atomic.Int64
 }
 
-func (f *fakeCallSink) PacketIn(int)       {}
-func (f *fakeCallSink) PacketOut()         { f.packetOut.Add(1) }
-func (f *fakeCallSink) SeqGap()            {}
-func (f *fakeCallSink) Malformed()         {}
-func (f *fakeCallSink) SendError()         { f.sendError.Add(1) }
-func (f *fakeCallSink) Late()              {}
-func (f *fakeCallSink) Duplicate()         {}
-func (f *fakeCallSink) SilenceInserted()   {}
-func (f *fakeCallSink) SSRCChange()        {}
-func (f *fakeCallSink) Reanchor()          {}
-func (f *fakeCallSink) OutOfWindow()       {}
-func (f *fakeCallSink) SilenceSent()       { f.silenceSent.Add(1) }
-func (f *fakeCallSink) WatchdogTimeout()   {}
-func (f *fakeCallSink) PacerDrift(float64) {}
-func (f *fakeCallSink) AudioLevel(float64) {}
+func (f *fakeCallSink) PacketIn(int)         {}
+func (f *fakeCallSink) PacketOut()           { f.packetOut.Add(1) }
+func (f *fakeCallSink) SeqGap()              {}
+func (f *fakeCallSink) Malformed()           {}
+func (f *fakeCallSink) PayloadSizeMismatch() {}
+func (f *fakeCallSink) QueueDropped()        {}
+func (f *fakeCallSink) SendError()           { f.sendError.Add(1) }
+func (f *fakeCallSink) Late()                {}
+func (f *fakeCallSink) Duplicate()           {}
+func (f *fakeCallSink) SilenceInserted()     {}
+func (f *fakeCallSink) SSRCChange()          {}
+func (f *fakeCallSink) Reanchor()            {}
+func (f *fakeCallSink) OutOfWindow()         {}
+func (f *fakeCallSink) SilenceSent()         { f.silenceSent.Add(1) }
+func (f *fakeCallSink) WatchdogTimeout()     {}
+func (f *fakeCallSink) PacerDrift(float64)   {}
+func (f *fakeCallSink) AudioLevel(float64)   {}
 
 // TestCallMedia_EndToEndLoopback proves the full pipeline -- reader -> jitter
 // buffer -> release/normalize -> LoopbackHandler -> writer -> UDP -- actually

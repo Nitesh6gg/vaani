@@ -44,6 +44,10 @@ func run() error {
 		return err
 	}
 
+	if *rampPerSec <= 0 {
+		return fmt.Errorf("-ramp must be positive (calls per second), got %v", *rampPerSec)
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
