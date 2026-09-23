@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"math"
 	"net"
+	"sync"
 	"time"
 )
 
@@ -83,8 +84,14 @@ type CallMedia struct {
 	outbound     chan *[]byte
 
 	prevRelease time.Time
-	rmsSum      float64
-	rmsTicks    int64
+
+	// rmsSum/rmsTicks accumulate under rmsMu: releaseLoop writes them on every
+	// tick, while NearSilent can be read from the ARI teardown goroutine the
+	// instant the call context is cancelled -- i.e. while a final tick may
+	// still be in flight (pacer stop doesn't wait for it).
+	rmsMu    sync.Mutex
+	rmsSum   float64
+	rmsTicks int64
 }
 
 // NewCallMedia wraps conn (already bound to the call's allocated port) into a
@@ -122,9 +129,18 @@ func NewCallMedia(callID string, conn *net.UDPConn, sink Sink, cfg Config) *Call
 func (c *CallMedia) Run(ctx context.Context) {
 	readDone := make(chan struct{})
 
+	var pacedLoops sync.WaitGroup
+	pacedLoops.Add(2)
+
+	go func() {
+		defer pacedLoops.Done()
+		c.releaseLoop(ctx)
+	}()
+	go func() {
+		defer pacedLoops.Done()
+		c.writeLoop(ctx)
+	}()
 	go c.watchdog.Run(ctx)
-	go c.releaseLoop(ctx)
-	go c.writeLoop(ctx)
 	go c.readLoop(ctx, readDone)
 
 	<-ctx.Done()
@@ -132,6 +148,10 @@ func (c *CallMedia) Run(ctx context.Context) {
 	c.writePacer.Stop()
 	_ = c.ep.Close()
 	<-readDone
+	// Pacer stop ends the release/write loops, but a tick already in flight
+	// must finish before the recorder (and anything reading per-call state)
+	// is touched -- Pacer.Stop does not wait for fn to return.
+	pacedLoops.Wait()
 	c.recorder.Close()
 
 	if c.tap != nil {
@@ -165,6 +185,9 @@ func (c *CallMedia) RemoteLocked() bool {
 // ticks were observed -- too short a call to judge. See the const block above
 // for why this check exists.
 func (c *CallMedia) NearSilent() (avgRMS float64, ok bool) {
+	c.rmsMu.Lock()
+	defer c.rmsMu.Unlock()
+
 	if c.rmsTicks < nearSilenceMinTicks {
 		return 0, false
 	}
@@ -241,8 +264,10 @@ func (c *CallMedia) releaseLoop(ctx context.Context) {
 
 		level := rms(pcm)
 		c.sink.AudioLevel(level)
+		c.rmsMu.Lock()
 		c.rmsSum += level
 		c.rmsTicks++
+		c.rmsMu.Unlock()
 
 		if c.tap != nil {
 			c.tap.Publish(pcm)

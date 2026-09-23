@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"math"
 	"net"
+	"sync"
 	"time"
 )
 
@@ -62,8 +63,15 @@ type AudioSocketCallMedia struct {
 	outbound     chan *[]byte
 
 	prevRelease time.Time
-	rmsSum      float64
-	rmsTicks    int64
+
+	// rmsSum/rmsTicks accumulate under rmsMu: releaseLoop writes them on every
+	// tick, while NearSilent can be read from the ARI teardown goroutine the
+	// instant the call context is cancelled -- i.e. while a final tick may
+	// still be in flight (pacer stop doesn't wait for it). Same contract as
+	// CallMedia's fields.
+	rmsMu    sync.Mutex
+	rmsSum   float64
+	rmsTicks int64
 }
 
 // NewAudioSocketCallMedia wraps conn -- already accepted from Asterisk's TCP
@@ -99,9 +107,18 @@ func NewAudioSocketCallMedia(callID string, conn net.Conn, sink AudioSocketSink,
 func (c *AudioSocketCallMedia) Run(ctx context.Context) {
 	readDone := make(chan struct{})
 
+	var pacedLoops sync.WaitGroup
+	pacedLoops.Add(2)
+
+	go func() {
+		defer pacedLoops.Done()
+		c.releaseLoop(ctx)
+	}()
+	go func() {
+		defer pacedLoops.Done()
+		c.writeLoop(ctx)
+	}()
 	go c.watchdog.Run(ctx)
-	go c.releaseLoop(ctx)
-	go c.writeLoop(ctx)
 	go c.readLoop(ctx, readDone)
 
 	<-ctx.Done()
@@ -109,6 +126,10 @@ func (c *AudioSocketCallMedia) Run(ctx context.Context) {
 	c.writePacer.Stop()
 	_ = c.conn.Close()
 	<-readDone
+	// Pacer stop ends the release/write loops, but a tick already in flight
+	// must finish before the recorder (and anything reading per-call state)
+	// is touched -- Pacer.Stop does not wait for fn to return.
+	pacedLoops.Wait()
 	c.recorder.Close()
 
 	if c.tap != nil {
@@ -133,6 +154,9 @@ func (c *AudioSocketCallMedia) Close() {
 // whole lifetime, stayed suspiciously low. Same contract and thresholds as
 // CallMedia.NearSilent -- see the const block in loopback.go.
 func (c *AudioSocketCallMedia) NearSilent() (avgRMS float64, ok bool) {
+	c.rmsMu.Lock()
+	defer c.rmsMu.Unlock()
+
 	if c.rmsTicks < nearSilenceMinTicks {
 		return 0, false
 	}
@@ -212,8 +236,10 @@ func (c *AudioSocketCallMedia) releaseLoop(ctx context.Context) {
 
 		level := rms(pcm)
 		c.sink.AudioLevel(level)
+		c.rmsMu.Lock()
 		c.rmsSum += level
 		c.rmsTicks++
+		c.rmsMu.Unlock()
 
 		if c.tap != nil {
 			c.tap.Publish(pcm)

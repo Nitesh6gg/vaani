@@ -35,6 +35,12 @@ type call struct {
 	bridge *ari.BridgeHandle
 	cm     *media.CallMedia            // set once the RTP media plane starts
 	asm    *media.AudioSocketCallMedia // set once the AudioSocket media plane starts
+
+	// Synchronization: cm and bridge are written on the Stasis event loop
+	// before any other goroutine can discover this call. asm is written by the
+	// AudioSocket accept goroutine, so both it and any reader (teardown, which
+	// can run on the event loop, at shutdown, or on that goroutine itself) must
+	// go through Manager.mu.
 }
 
 // closeMediaSocket closes whichever of the call's media sockets is set. Safe to
@@ -366,11 +372,16 @@ func (m *Manager) startAudioSocketMedia(c *call) {
 
 	_ = ln.Close() // one connection is all a call needs; free the OS listener now
 
+	// Assigned under m.mu: this runs on its own goroutine while the Stasis event
+	// loop can concurrently run teardown, which reads c.asm. Without the lock
+	// that's a data race per the Go memory model, not just a lost update.
+	m.mu.Lock()
 	c.asm = media.NewAudioSocketCallMedia(c.ID, conn, metrics.AudioSocketSink{}, media.AudioSocketConfig{
 		RecordDir:  m.cfg.RecordDir,
 		Handler:    m.mediaHandler(c.ID),
 		DebugAudio: m.cfg.DebugAudio,
 	})
+	m.mu.Unlock()
 
 	c.SetState(session.StateMediaActive)
 	slog.Info("audiosocket connected, media plane running", "call_id", c.ID, "port", c.Port)
@@ -440,10 +451,17 @@ func (m *Manager) onStasisEnd(e *ari.StasisEnd) {
 // active -- and increments CallsActive -- before that's guaranteed to happen.
 func (m *Manager) teardown(c *call) {
 	c.Teardown(func() {
+		// Snapshot the media-plane fields under m.mu: c.asm in particular is
+		// written by the AudioSocket accept goroutine (see startAudioSocketMedia),
+		// which can race this closure running on the event loop or at shutdown.
+		m.mu.Lock()
+		cm, asm := c.cm, c.asm
+		m.mu.Unlock()
+
 		switch {
-		case c.cm != nil && !c.cm.RemoteLocked():
+		case cm != nil && !cm.RemoteLocked():
 			slog.Warn("rtp remote never locked; no audio ever received", "call_id", c.ID, "external_id", c.ExternalID)
-		case c.cm == nil && c.asm == nil:
+		case cm == nil && asm == nil:
 			slog.Warn("media plane never started; no audio ever received", "call_id", c.ID, "external_id", c.ExternalID)
 		}
 
@@ -452,7 +470,7 @@ func (m *Manager) teardown(c *call) {
 		// whole way through -- exactly the signature of the jitter-buffer
 		// production incident (see docs/AUDIO_PIPELINE.md), which neither check
 		// above catches since Asterisk really was sending packets.
-		if avgRMS, ok := nearSilentRMS(c); ok {
+		if avgRMS, ok := nearSilentRMS(cm, asm); ok {
 			slog.Warn("call carried near-silent audio throughout; audio pipeline may be misconfigured",
 				"call_id", c.ID, "external_id", c.ExternalID, "avg_rms", avgRMS)
 		}
@@ -478,13 +496,15 @@ func (m *Manager) teardown(c *call) {
 }
 
 // nearSilentRMS reports whichever media plane the call actually ran's
-// NearSilent() verdict, or (0, false) if neither started.
-func nearSilentRMS(c *call) (avgRMS float64, ok bool) {
+// NearSilent() verdict, or (0, false) if neither started. Takes the already
+// snapshotted fields so the read stays synchronized with the AudioSocket
+// accept goroutine's assignment (see teardown).
+func nearSilentRMS(cm *media.CallMedia, asm *media.AudioSocketCallMedia) (avgRMS float64, ok bool) {
 	switch {
-	case c.cm != nil:
-		return c.cm.NearSilent()
-	case c.asm != nil:
-		return c.asm.NearSilent()
+	case cm != nil:
+		return cm.NearSilent()
+	case asm != nil:
+		return asm.NearSilent()
 	default:
 		return 0, false
 	}
