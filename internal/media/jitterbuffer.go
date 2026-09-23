@@ -10,6 +10,13 @@ import "sync"
 // priming alone only prevents at call start.
 const starveFreezeThreshold = 3
 
+// maxPrimingTicksFactor bounds the priming wait relative to the window size:
+// priming normally completes within `size` arrivals (~size release ticks at
+// Asterisk's 20ms pacing), so waiting 2×size ticks before force-activating
+// gives comfortable reorder slack while still guaranteeing the buffer never
+// waits on a full window indefinitely.
+const maxPrimingTicksFactor = 2
+
 // JitterSink receives jitter buffer observability events. Implemented by the
 // metrics package at the call site, same pattern as Sink.
 type JitterSink interface {
@@ -18,6 +25,7 @@ type JitterSink interface {
 	SilenceInserted()
 	SSRCChange()
 	Reanchor()
+	OutOfWindow()
 }
 
 // jbState tracks where the buffer is relative to the release clock.
@@ -45,6 +53,18 @@ const (
 // unsynchronized 20ms clocks (Vaani's release ticker and Asterisk's RTP pacing)
 // can permanently desync, misclassifying every subsequent packet as late.
 //
+// Two mechanisms guarantee priming can never wedge into permanent silence:
+//
+//   - While waiting, a packet landing outside the window re-anchors the buffer
+//     on it. Since `expected` never advances while priming, a packet genuinely
+//     lost inside the priming window can otherwise never be recovered -- every
+//     newer packet stays out-of-window forever, silencing the call for life
+//     (and re-arming in every re-prime window). Nothing real has been released
+//     yet at that point, so dropping the partial window costs only silence.
+//   - The priming wait itself is bounded (~2×window release ticks); beyond it
+//     the buffer activates with a partial window and the miss/freeze machinery
+//     owns recovery.
+//
 // It owns pooled frame buffers end-to-end: Push transfers ownership in (discarded
 // frames are returned to the pool immediately), Release transfers ownership out
 // (the caller must PutFrame the result). Safe for concurrent Push (reader
@@ -56,22 +76,25 @@ type JitterBuffer struct {
 	slots []*[]byte
 	have  []bool
 
-	started  bool
-	state    jbState
-	misses   int
-	expected uint16
-	ssrc     uint32
-	sink     JitterSink
+	started         bool
+	state           jbState
+	misses          int
+	primingTicks    int
+	maxPrimingTicks int
+	expected        uint16
+	ssrc            uint32
+	sink            JitterSink
 }
 
 // NewJitterBuffer creates a JitterBuffer with a window of size packets (1-10, i.e.
 // 20-200ms at 20ms/packet). size also sets the priming depth.
 func NewJitterBuffer(size int, sink JitterSink) *JitterBuffer {
 	return &JitterBuffer{
-		size:  size,
-		slots: make([]*[]byte, size),
-		have:  make([]bool, size),
-		sink:  sink,
+		size:            size,
+		slots:           make([]*[]byte, size),
+		have:            make([]bool, size),
+		maxPrimingTicks: maxPrimingTicksFactor * size,
+		sink:            sink,
 	}
 }
 
@@ -104,6 +127,14 @@ func (j *JitterBuffer) Push(seq uint16, ssrc uint32, frame *[]byte) {
 
 		j.reanchorLocked(seq)
 		j.sink.Reanchor()
+	case j.state == jbWaiting && int16(seq-j.expected) >= int16(j.size):
+		// Priming deadlock escape (see the type comment): `expected` never
+		// advances while priming, so a packet genuinely lost inside the priming
+		// window makes every newer packet land here forever. Re-anchor on the
+		// newest arrival instead -- jbWaiting has released no real audio yet,
+		// so clearing the partial window costs nothing but silence ticks.
+		j.sink.OutOfWindow()
+		j.reanchorLocked(seq)
 	}
 
 	// Signed circular distance from expected (RFC 1982 serial number arithmetic):
@@ -115,8 +146,11 @@ func (j *JitterBuffer) Push(seq uint16, ssrc uint32, frame *[]byte) {
 		j.sink.Late()
 		PutFrame(frame)
 	case diff >= int16(j.size):
-		// Too far ahead of the current window to place without corrupting ring
-		// state; drop rather than force-advance mid-buffer.
+		// Too far ahead of the window to place (only reachable while active:
+		// waiting re-anchors above and frozen re-anchors on anything at/after
+		// the frozen position). The miss/freeze machinery owns recovery -- the
+		// window advances over the gap and freezes if it stays empty.
+		j.sink.OutOfWindow()
 		PutFrame(frame)
 	default:
 		slot := int(seq) % j.size
@@ -135,7 +169,9 @@ func (j *JitterBuffer) Push(seq uint16, ssrc uint32, frame *[]byte) {
 // Release pops the frame for the next expected sequence number, advancing the
 // window by one packet, and returns it. Before priming completes (buffer depth
 // hasn't yet reached size), it returns silence without touching any state or
-// metric -- the playout clock hasn't started. Once active, a missing packet is
+// metric -- the playout clock hasn't started -- but only up to maxPrimingTicks
+// ticks, after which it activates with whatever depth it has so `expected`
+// starts advancing past unrecoverable holes. Once active, a missing packet is
 // concealed with silence and the window still advances, up to
 // starveFreezeThreshold consecutive misses; beyond that the window freezes
 // (stops advancing) until Push re-anchors it. The caller owns the returned frame
@@ -150,7 +186,15 @@ func (j *JitterBuffer) Release() *[]byte {
 
 	if j.state == jbWaiting {
 		if j.depthLocked() < j.size {
-			return silentFrame()
+			j.primingTicks++
+			if j.primingTicks < j.maxPrimingTicks {
+				return silentFrame()
+			}
+
+			// Priming never completed within the bound: the stream stalled
+			// mid-priming or loss is too heavy to ever assemble a full window.
+			// Activate anyway -- the miss/freeze machinery below owns recovery
+			// from here.
 		}
 
 		j.state = jbActive
@@ -218,6 +262,7 @@ func (j *JitterBuffer) resetLocked(seq uint16, ssrc uint32) {
 	j.ssrc = ssrc
 	j.state = jbWaiting
 	j.misses = 0
+	j.primingTicks = 0
 }
 
 // reanchorLocked drops every buffered frame and re-anchors the window on seq
@@ -227,6 +272,7 @@ func (j *JitterBuffer) reanchorLocked(seq uint16) {
 	j.expected = seq
 	j.state = jbWaiting
 	j.misses = 0
+	j.primingTicks = 0
 }
 
 // silentFrame returns a pooled, zeroed FrameSize buffer.

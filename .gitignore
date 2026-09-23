@@ -3,3 +3,5 @@
 *.pcap
 *.prof
 .env
+
+.zcode/

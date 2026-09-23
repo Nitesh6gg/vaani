@@ -94,6 +94,11 @@ var (
 		Help: "Total times the jitter buffer froze after sustained misses and re-anchored on a later packet.",
 	})
 
+	RTPOutOfWindow = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "vaani_rtp_out_of_window_total",
+		Help: "Total inbound RTP packets dropped for landing outside the jitter buffer's window; sustained growth means packet loss the window could not absorb.",
+	})
+
 	RTPSilenceSent = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "vaani_rtp_silence_sent_total",
 		Help: "Total outbound RTP packets that were zeroed silence because the handler's outbound queue was empty on that tick.",
@@ -164,6 +169,7 @@ func (Sink) Duplicate()             { RTPDuplicates.Inc() }
 func (Sink) SilenceInserted()       { RTPSilenceInserted.Inc() }
 func (Sink) SSRCChange()            { RTPSSRCChanges.Inc() }
 func (Sink) Reanchor()              { JitterBufferReanchors.Inc() }
+func (Sink) OutOfWindow()           { RTPOutOfWindow.Inc() }
 func (Sink) SilenceSent()           { RTPSilenceSent.Inc() }
 func (Sink) WatchdogTimeout()       { MediaWatchdogTimeouts.Inc() }
 func (Sink) PacerDrift(ms float64)  { PacerDriftMs.Observe(ms) }

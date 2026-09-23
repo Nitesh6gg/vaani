@@ -9,7 +9,7 @@ import (
 
 // fakeJitterSink counts each event so tests can assert exact call counts.
 type fakeJitterSink struct {
-	late, duplicate, silence, ssrcChange, reanchor int
+	late, duplicate, silence, ssrcChange, reanchor, outOfWindow int
 }
 
 func (f *fakeJitterSink) Late()            { f.late++ }
@@ -17,6 +17,7 @@ func (f *fakeJitterSink) Duplicate()       { f.duplicate++ }
 func (f *fakeJitterSink) SilenceInserted() { f.silence++ }
 func (f *fakeJitterSink) SSRCChange()      { f.ssrcChange++ }
 func (f *fakeJitterSink) Reanchor()        { f.reanchor++ }
+func (f *fakeJitterSink) OutOfWindow()     { f.outOfWindow++ }
 
 // markedFrame returns a pooled frame whose first byte is `marker`, so a released
 // frame's origin can be identified in assertions.
@@ -181,6 +182,129 @@ func TestJitterBuffer_PrimingWithholdsUntilDepthReached(t *testing.T) {
 	out = jb.Release()
 	assert.Equal(t, byte(1), (*out)[0], "priming complete: must release the first real buffered packet, in order")
 	PutFrame(out)
+}
+
+// TestJitterBuffer_LossDuringPrimingRecovers is the regression test for the
+// priming wedge: before the fix, one packet genuinely lost inside the priming
+// window (102 below) could never be recovered -- `expected` doesn't advance
+// while priming, so 103+ landed out-of-window forever and the buffer released
+// nothing but silence for the rest of the call.
+func TestJitterBuffer_LossDuringPrimingRecovers(t *testing.T) {
+	sink := &fakeJitterSink{}
+	jb := NewJitterBuffer(3, sink)
+
+	jb.Push(100, 1, markedFrame(1))
+	jb.Push(101, 1, markedFrame(2))
+	// 102 is genuinely lost and will never arrive.
+
+	out := jb.Release()
+	assert.True(t, isSilence(out), "depth 2 of 3: still priming")
+	PutFrame(out)
+
+	// 103 lands outside the stuck window [100,103): the buffer must re-anchor
+	// on it rather than drop it and wait forever.
+	jb.Push(103, 1, markedFrame(4))
+	assert.Equal(t, 1, sink.outOfWindow, "the out-of-window drop must be counted")
+
+	jb.Push(104, 1, markedFrame(5))
+	jb.Push(105, 1, markedFrame(6)) // depth 3 around the new anchor: primed
+
+	for i, want := range []byte{4, 5, 6} {
+		out := jb.Release()
+		assert.Equal(t, want, (*out)[0], "release %d: real audio must flow again, in order", i)
+		PutFrame(out)
+	}
+
+	assert.Zero(t, sink.late, "re-anchored packets are on-time, not late")
+}
+
+// TestJitterBuffer_MultipleLossesDuringPrimingConverge proves repeated holes in
+// successive priming windows still converge: each out-of-window arrival
+// re-anchors the buffer, and once any `size` consecutive packets arrive, real
+// audio flows.
+func TestJitterBuffer_MultipleLossesDuringPrimingConverge(t *testing.T) {
+	sink := &fakeJitterSink{}
+	jb := NewJitterBuffer(3, sink)
+
+	jb.Push(100, 1, markedFrame(1))
+	jb.Push(101, 1, markedFrame(2))
+	// 102 and 103 lost; 104 re-anchors.
+	jb.Push(104, 1, markedFrame(5))
+	assert.Equal(t, 1, sink.outOfWindow)
+
+	// 105 lost; 106 fits the window [104,107), keeping priming alive.
+	jb.Push(106, 1, markedFrame(7))
+	// 107 lost too; 108 re-anchors again.
+	jb.Push(108, 1, markedFrame(9))
+	assert.Equal(t, 2, sink.outOfWindow)
+
+	jb.Push(109, 1, markedFrame(10))
+	jb.Push(110, 1, markedFrame(11)) // depth 3: primed [108,109,110]
+
+	for i, want := range []byte{9, 10, 11} {
+		out := jb.Release()
+		assert.Equal(t, want, (*out)[0], "release %d", i)
+		PutFrame(out)
+	}
+}
+
+// TestJitterBuffer_PrimingWaitIsBounded proves the waiting state gives up after
+// maxPrimingTicks ticks: with the stream stalled mid-priming, the buffer must
+// activate with a partial window (releasing what it has, advancing past the
+// holes) instead of waiting forever, and normal operation must resume once
+// packets return.
+func TestJitterBuffer_PrimingWaitIsBounded(t *testing.T) {
+	sink := &fakeJitterSink{}
+	jb := NewJitterBuffer(3, sink)
+
+	jb.Push(100, 1, markedFrame(1)) // anchors the window; the stream then goes dead
+
+	// Strictly before the bound, priming still withholds silence.
+	for i := 0; i < maxPrimingTicksFactor*3-1; i++ {
+		out := jb.Release()
+		assert.True(t, isSilence(out), "release %d before the priming bound must stay silent", i)
+		PutFrame(out)
+	}
+
+	// At/after the bound, the buffered packet must come out.
+	got := false
+
+	for i := 0; i < maxPrimingTicksFactor*3+2 && !got; i++ {
+		out := jb.Release()
+		got = !isSilence(out)
+		PutFrame(out)
+	}
+
+	require.True(t, got, "priming must give up waiting and release the buffered packet")
+
+	// And once packets return, they flow normally through the active window.
+	jb.Push(101, 1, markedFrame(2))
+
+	out := jb.Release()
+	assert.Equal(t, byte(2), (*out)[0])
+	PutFrame(out)
+}
+
+// TestJitterBuffer_OutOfWindowCountedWhileActive pins the active-state behavior:
+// a packet too far ahead of an active window is still dropped (the miss/freeze
+// machinery owns recovery there), but the drop must now be counted.
+func TestJitterBuffer_OutOfWindowCountedWhileActive(t *testing.T) {
+	sink := &fakeJitterSink{}
+	jb := NewJitterBuffer(3, sink)
+
+	primeWith(jb, 100, 3)
+	for i := 0; i < 3; i++ {
+		PutFrame(jb.Release()) // expected now 103, state active
+	}
+
+	jb.Push(110, 1, markedFrame(9)) // diff 7 >= 3: out of window while active
+
+	assert.Equal(t, 1, sink.outOfWindow)
+
+	out := jb.Release()
+	assert.True(t, isSilence(out), "the dropped packet's slot must be concealed with silence")
+	PutFrame(out)
+	assert.Equal(t, uint16(104), jb.expected, "the window must still advance past the drop")
 }
 
 // TestJitterBuffer_StarveFreezeThenReanchor proves the self-healing mechanism

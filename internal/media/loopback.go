@@ -22,6 +22,7 @@ type Sink interface {
 	SilenceInserted()
 	SSRCChange()
 	Reanchor()
+	OutOfWindow()
 	SilenceSent()
 	WatchdogTimeout()
 	PacerDrift(ms float64)

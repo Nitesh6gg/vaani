@@ -29,6 +29,7 @@ func (f *fakeCallSink) Duplicate()         {}
 func (f *fakeCallSink) SilenceInserted()   {}
 func (f *fakeCallSink) SSRCChange()        {}
 func (f *fakeCallSink) Reanchor()          {}
+func (f *fakeCallSink) OutOfWindow()       {}
 func (f *fakeCallSink) SilenceSent()       { f.silenceSent.Add(1) }
 func (f *fakeCallSink) WatchdogTimeout()   {}
 func (f *fakeCallSink) PacerDrift(float64) {}
