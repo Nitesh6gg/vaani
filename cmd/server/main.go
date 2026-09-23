@@ -8,12 +8,19 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/nitesh/vaani/internal/ari"
 	"github.com/nitesh/vaani/internal/config"
 	"github.com/nitesh/vaani/internal/media"
 	"github.com/nitesh/vaani/internal/metrics"
 )
+
+// shutdownDrainDeadline bounds how long main waits for Manager.Run to finish
+// draining calls after SIGTERM. Teardown's ARI REST calls have no deadline of
+// their own (the native client's HTTP client is shared), so an Asterisk that
+// stopped answering would otherwise hang process exit indefinitely.
+const shutdownDrainDeadline = 10 * time.Second
 
 func main() {
 	if err := run(); err != nil {
@@ -57,9 +64,36 @@ func run() error {
 	mgr := ari.NewManager(cl, cfg, ports)
 
 	slog.Info("vaani running", "metrics_addr", cfg.MetricsAddr, "media_ip", cfg.MediaIP)
-	mgr.Run(ctx) // blocks until ctx is cancelled (SIGTERM/SIGINT), then drains calls
 
-	slog.Info("shutdown complete")
+	runDone := make(chan struct{})
 
-	return nil
+	go func() {
+		defer close(runDone)
+		mgr.Run(ctx) // blocks until ctx is cancelled (SIGTERM/SIGINT), then drains calls
+	}()
+
+	select {
+	case <-runDone:
+		if ctx.Err() == nil {
+			// Run gave up without a shutdown signal: the event bus closed for
+			// good (the native client reconnects the WebSocket itself, so this
+			// shouldn't happen short of client.Close()).
+			return fmt.Errorf("ari event bus closed unexpectedly")
+		}
+
+		slog.Info("shutdown complete")
+
+		return nil
+	case <-ctx.Done():
+		// SIGTERM/SIGINT: Run is now draining calls; bound that drain.
+		select {
+		case <-runDone:
+			slog.Info("shutdown complete")
+		case <-time.After(shutdownDrainDeadline):
+			slog.Warn("graceful shutdown drain exceeded deadline; exiting",
+				"deadline", shutdownDrainDeadline)
+		}
+
+		return nil
+	}
 }

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/nitesh/vaani/internal/media"
 )
@@ -73,6 +74,13 @@ type Config struct {
 	// Never set this in production -- it lets anyone who can reach METRICS_ADDR
 	// listen to live call audio. Leave unset/0 normally.
 	DebugAudio bool
+
+	// MaxCallDuration bounds how long a single call may live before Vaani hangs
+	// it up, however healthy it looks -- a backstop against a wedged call (a
+	// Handler that never yields, media that never stops) burning billable
+	// telephony time forever. 0 (default) disables the cap; set
+	// MAX_CALL_DURATION_SECONDS to enforce one.
+	MaxCallDuration time.Duration
 }
 
 // Load reads configuration from the environment, applying local-dev defaults that
@@ -121,6 +129,18 @@ func Load() (Config, error) {
 	if cfg.JitterBufferPackets < 1 || cfg.JitterBufferPackets > 10 {
 		return Config{}, fmt.Errorf("config: JITTER_BUFFER_PACKETS must be 1-10, got %d", cfg.JitterBufferPackets)
 	}
+
+	var maxCallSeconds int
+
+	if maxCallSeconds, err = getEnvInt("MAX_CALL_DURATION_SECONDS", 0); err != nil {
+		return Config{}, err
+	}
+
+	if maxCallSeconds < 0 {
+		return Config{}, fmt.Errorf("config: MAX_CALL_DURATION_SECONDS must be >= 0 (0 disables the cap), got %d", maxCallSeconds)
+	}
+
+	cfg.MaxCallDuration = time.Duration(maxCallSeconds) * time.Second
 
 	if _, err := media.ParseEndianness(cfg.AudioL16Endianness); err != nil {
 		return Config{}, err

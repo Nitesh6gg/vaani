@@ -21,6 +21,12 @@ import (
 // actually open the AudioSocket TCP connection after the channel is bridged.
 const audioSocketAcceptTimeout = 10 * time.Second
 
+// connectivityPollInterval is how often watchConnectivity samples the ARI
+// client's WebSocket state. Same 1s cadence as the client's own reconnect
+// watcher; it only needs to be fast relative to how long a zombie would
+// otherwise survive.
+const connectivityPollInterval = time.Second
+
 // call tracks the ARI/media-specific state of one bridged caller<->externalMedia
 // pair; *session.Call carries the lifecycle state and the once-guaranteed
 // teardown that used to be prone to double- or zero-firing in Phase 1.
@@ -35,6 +41,11 @@ type call struct {
 	bridge *ari.BridgeHandle
 	cm     *media.CallMedia            // set once the RTP media plane starts
 	asm    *media.AudioSocketCallMedia // set once the AudioSocket media plane starts
+
+	// maxDur, when MAX_CALL_DURATION_SECONDS is set, hangs the call up when the
+	// cap is reached however healthy it looks -- a backstop against a wedged
+	// call burning billable telephony time forever. Stopped inside teardown.
+	maxDur *time.Timer
 
 	// Synchronization: cm and bridge are written on the Stasis event loop
 	// before any other goroutine can discover this call. asm is written by the
@@ -52,6 +63,27 @@ func closeMediaSocket(c *call) {
 
 	if c.listener != nil {
 		_ = c.listener.Close()
+	}
+}
+
+// hangupChannel hangs a channel up, logging a failure instead of swallowing it.
+// A hangup error is routine when the far end beat us to it (Asterisk answers
+// with a 404 for an already-gone channel -- the normal case on teardown, since
+// the StasisEnd that triggered it usually means one channel just hung up), so
+// it's Debug-level: visible when hunting a leak of live channels, silent in
+// normal operation.
+func hangupChannel(cl ari.Client, callID, channelID string) {
+	if err := cl.Channel().Hangup(ari.NewKey(ari.ChannelKey, channelID), ""); err != nil {
+		slog.Debug("hangup failed", "call_id", callID, "channel_id", channelID, "error", err)
+	}
+}
+
+// deleteBridge deletes a mixing bridge, warning on failure: unlike a failed
+// hangup, a bridge that survives its teardown holds Asterisk-side resources
+// with no event that would ever clean it up.
+func deleteBridge(callID string, bh *ari.BridgeHandle) {
+	if err := bh.Delete(); err != nil {
+		slog.Warn("failed to delete bridge", "call_id", callID, "error", err)
 	}
 }
 
@@ -85,10 +117,12 @@ func (m *Manager) Run(ctx context.Context) {
 	sub := m.cl.Bus().Subscribe(nil, "StasisStart", "StasisEnd", "ChannelDtmfReceived")
 	defer sub.Cancel()
 
+	go m.watchConnectivity(ctx)
+
 	for {
 		select {
 		case <-ctx.Done():
-			m.shutdown()
+			m.teardownAll()
 			return
 		case evt, ok := <-sub.Events():
 			if !ok {
@@ -105,6 +139,43 @@ func (m *Manager) Run(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// watchConnectivity polls the ARI client's WebSocket state and tears down every
+// call when it reconnects after a drop. Events that fire while the WebSocket is
+// down -- StasisEnd above all -- are lost, so any call spanning the gap may
+// have ended without Vaani ever finding out: a billable Asterisk channel and a
+// permanently leaked media port. Tearing everything down on reconnect is the
+// conservative recovery (a brief blip sacrifices healthy calls too); Phase 3's
+// agent mode can revisit this with a proper re-sync if it becomes a problem.
+func (m *Manager) watchConnectivity(ctx context.Context) {
+	ticker := time.NewTicker(connectivityPollInterval)
+	defer ticker.Stop()
+
+	up := m.cl.Connected()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			now := m.cl.Connected()
+			if now && !up && m.hasCalls() {
+				slog.Warn("ari websocket reconnected after a drop; tearing down all calls (events during the gap, including StasisEnd, were lost)")
+				m.teardownAll()
+			}
+
+			up = now
+		}
+	}
+}
+
+// hasCalls reports whether any call is currently tracked (bridged or staged).
+func (m *Manager) hasCalls() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return len(m.active) > 0 || len(m.pending) > 0
 }
 
 func (m *Manager) onStasisStart(ctx context.Context, e *ari.StasisStart) {
@@ -139,6 +210,10 @@ func (m *Manager) startCall(ctx context.Context, e *ari.StasisStart) {
 
 	if err := channel.Answer(); err != nil {
 		slog.Error("failed to answer channel", "call_id", id, "error", err)
+		// A channel we failed to answer is still live in Stasis; leaving it
+		// without hanging it up would strand it in the dialplan.
+		hangupChannel(m.cl, id, id)
+
 		return
 	}
 
@@ -203,6 +278,17 @@ func (m *Manager) startCall(ctx context.Context, e *ari.StasisStart) {
 	m.pending[id] = c // so a hangup during setup can still find and clean up this call
 	m.mu.Unlock()
 
+	// Armed after the pending insert so the cap timer can never fire on a call
+	// that isn't yet discoverable for teardown. The timer survives into the
+	// active map (c is the same object); teardown stops it.
+	if m.cfg.MaxCallDuration > 0 {
+		c.maxDur = time.AfterFunc(m.cfg.MaxCallDuration, func() {
+			slog.Warn("max call duration reached; hanging up", "call_id", id,
+				"external_id", externalID, "max_seconds", int(m.cfg.MaxCallDuration.Seconds()))
+			m.teardown(c)
+		})
+	}
+
 	c.SetState(session.StateStaged)
 
 	externalHost := fmt.Sprintf("%s:%d", m.cfg.MediaIP, port)
@@ -265,7 +351,7 @@ func (m *Manager) completeBridge(c *call) {
 
 	if err := bh.AddChannel(c.ID); err != nil {
 		slog.Error("failed to add caller to bridge", "call_id", c.ID, "error", err)
-		_ = bh.Delete()
+		deleteBridge(c.ID, bh)
 		m.abort(c)
 
 		return
@@ -273,7 +359,7 @@ func (m *Manager) completeBridge(c *call) {
 
 	if err := bh.AddChannel(c.ExternalID); err != nil {
 		slog.Error("failed to add externalMedia channel to bridge", "call_id", c.ID, "error", err)
-		_ = bh.Delete()
+		deleteBridge(c.ID, bh)
 		m.abort(c)
 
 		return
@@ -405,8 +491,8 @@ func (m *Manager) abort(c *call) {
 		m.ports.Free(c.Port)
 		metrics.MediaPortsInUse.Set(float64(m.ports.InUse()))
 
-		_ = m.cl.Channel().Hangup(ari.NewKey(ari.ChannelKey, c.ID), "")
-		_ = m.cl.Channel().Hangup(ari.NewKey(ari.ChannelKey, c.ExternalID), "")
+		hangupChannel(m.cl, c.ID, c.ID)
+		hangupChannel(m.cl, c.ID, c.ExternalID)
 	})
 }
 
@@ -451,6 +537,21 @@ func (m *Manager) onStasisEnd(e *ari.StasisEnd) {
 // active -- and increments CallsActive -- before that's guaranteed to happen.
 func (m *Manager) teardown(c *call) {
 	c.Teardown(func() {
+		if c.maxDur != nil {
+			c.maxDur.Stop()
+		}
+
+		// Remove the call from both maps: teardown can be triggered from paths
+		// that never went through onStasisEnd/abort's map cleanup (the max
+		// duration cap, watchConnectivity's post-reconnect purge, and the
+		// maxDur timer firing on a still-pending call).
+		m.mu.Lock()
+		delete(m.active, c.ID)
+		delete(m.active, c.ExternalID)
+		delete(m.pending, c.ID)
+		delete(m.pending, c.ExternalID)
+		m.mu.Unlock()
+
 		// Snapshot the media-plane fields under m.mu: c.asm in particular is
 		// written by the AudioSocket accept goroutine (see startAudioSocketMedia),
 		// which can race this closure running on the event loop or at shutdown.
@@ -478,11 +579,11 @@ func (m *Manager) teardown(c *call) {
 		closeMediaSocket(c)
 
 		if c.bridge != nil {
-			_ = c.bridge.Delete()
+			deleteBridge(c.ID, c.bridge)
 		}
 
-		_ = m.cl.Channel().Hangup(ari.NewKey(ari.ChannelKey, c.ID), "")
-		_ = m.cl.Channel().Hangup(ari.NewKey(ari.ChannelKey, c.ExternalID), "")
+		hangupChannel(m.cl, c.ID, c.ID)
+		hangupChannel(m.cl, c.ID, c.ExternalID)
 
 		m.ports.Free(c.Port)
 		metrics.MediaPortsInUse.Set(float64(m.ports.InUse()))
@@ -510,19 +611,29 @@ func nearSilentRMS(cm *media.CallMedia, asm *media.AudioSocketCallMedia) (avgRMS
 	}
 }
 
-// shutdown tears down every active call, used on process shutdown.
-func (m *Manager) shutdown() {
+// teardownAll tears down every tracked call -- active (bridged) and pending
+// (staged, awaiting its externalMedia StasisStart) -- and empties both maps.
+// Used on process shutdown, and by watchConnectivity after an ARI WebSocket
+// reconnect (events missed during the gap may have included StasisEnd, so any
+// surviving call is a potential zombie: a billable channel and a leaked media
+// port). Teardown's once-guard makes this safe for calls already mid-teardown.
+func (m *Manager) teardownAll() {
 	m.mu.Lock()
-	seen := make(map[string]*call)
+	seen := make(map[*call]struct{})
 
 	for _, c := range m.active {
-		seen[c.ID] = c
+		seen[c] = struct{}{}
+	}
+
+	for _, c := range m.pending {
+		seen[c] = struct{}{}
 	}
 
 	m.active = make(map[string]*call)
+	m.pending = make(map[string]*call)
 	m.mu.Unlock()
 
-	for _, c := range seen {
+	for c := range seen {
 		m.teardown(c)
 	}
 }
