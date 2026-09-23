@@ -39,14 +39,13 @@ file or `uac_pcap.xml` needs to change either way.
   into your app (see the ARI app collision notes in project history if you're
   pointing this at a server that also runs other ARI apps).
 
-## Running 25 concurrent calls, 60s each
+## Running 25 concurrent calls, 30s each
 
 ```bash
 sipp <asterisk_host>:5060 \
-  -sn uac_pcap -sf deploy/sipp/uac_pcap.xml \
+  -sf deploy/sipp/uac_pcap.xml \
   -mi <sipp_media_ip> \
   -s <extension_that_reaches_stasis_vaani> \
-  -d 60000 \
   -l 25 -r 1 -rp 1000 \
   -rtp_echo
 ```
@@ -55,11 +54,18 @@ sipp <asterisk_host>:5060 \
   reachable from the Asterisk box, same constraint as Vaani's own `MEDIA_IP`
   (see `internal/config/config.go`).
 - `-s <extension>`: the number to dial (must land in `Stasis(vaani)`).
-- `-d 60000`: hold each call 60s (fills the `[decimal]` pause in the scenario).
 - `-l 25`: cap 25 concurrent calls.
 - `-r 1 -rp 1000`: ramp at 1 call/second.
 - `-rtp_echo`: SIPp echoes inbound RTP back out, closing the audio loop for the
   full call duration instead of just playing the pcap once and going silent.
+
+**Hold duration is fixed in `uac_pcap.xml` (30s), not a command-line flag.**
+There's no `-d <ms>` here -- SIPp has no scenario-file substitution keyword like
+that; passing one would just be silently ignored (or error, if the scenario used
+one, which is why an earlier version of this file broke). To change the hold
+time, edit `<pause milliseconds="30000"/>` in `uac_pcap.xml` directly and use
+`-sn` with a label of your choosing if you want to distinguish runs, e.g.
+`-sn uac_pcap_30s`.
 
 ## Reading the results
 
@@ -89,7 +95,7 @@ so there's no late/duplicate/out-of-window/reanchor equivalent to check. Instead
 - `vaani_audiosocket_send_errors_total` -- should stay 0; a nonzero count means
   the TCP connection is failing writes (fatal to that call's media -- see the
   partial-write-desync fix in `internal/media/audiosocket.go`).
-- `vaani_audiosocket_frames_in_total` / expected frame count (60s ÷ 20ms × calls)
+- `vaani_audiosocket_frames_in_total` / expected frame count (30s ÷ 20ms × calls)
   ≈ how much inbound audio actually arrived.
 
 ### Shared, either transport

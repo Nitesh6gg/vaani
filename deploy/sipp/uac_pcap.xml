@@ -66,9 +66,13 @@
     </action>
   </nop>
 
-  <!-- Held for the call's duration; overridden from the command line with -d
-       (see README.md), which fills in the [decimal] keyword below. -->
-  <pause milliseconds="[decimal]"/>
+  <!-- Held for the call's duration. This is a plain literal, not
+       command-line-configurable (an earlier version of this file claimed `-d`
+       on the command line filled in a `[decimal]` placeholder here -- that
+       isn't real SIPp behavior; SIPp has no such substitution and just fails
+       to parse the literal string as a number). Edit this value directly if
+       you want a different hold time; see README.md. -->
+  <pause milliseconds="30000"/>
 
   <send retrans="500">
     <![CDATA[

@@ -7,14 +7,17 @@ actual run against a live Asterisk stack (see `deploy/sipp/README.md` and
 this section once a run has been done, and note the date, hardware, and
 Asterisk/Vaani versions involved.
 
-## Media load test (SIPp, 25 concurrent calls x 60s)
+## Media load test (SIPp, 25 concurrent calls x 30s)
 
 Command used (identical for both transports -- SIPp only ever speaks SIP/RTP to
 *Asterisk*, so it's transparent to which `MEDIA_ENCAPSULATION` Vaani's
-externalMedia leg uses; see `deploy/sipp/README.md`):
+externalMedia leg uses; see `deploy/sipp/README.md`). Hold duration (30s) is a
+fixed literal in `uac_pcap.xml`, not a command-line flag -- there's no SIPp
+substitution keyword for that, despite an earlier version of this doc claiming
+otherwise:
 ```
-sipp <asterisk_host>:5060 -sn uac_pcap -sf deploy/sipp/uac_pcap.xml \
-  -mi <sipp_media_ip> -s <extension> -d 60000 -l 25 -r 1 -rp 1000 -rtp_echo
+sipp <asterisk_host>:5060 -sf deploy/sipp/uac_pcap.xml \
+  -mi <sipp_media_ip> -s <extension> -l 25 -r 1 -rp 1000 -rtp_echo
 ```
 
 ### Transport: RTP (`MEDIA_ENCAPSULATION=rtp`, default)
@@ -49,7 +52,7 @@ in `docs/AUDIO_PIPELINE.md`.
 | Crashes | 0 | |
 | Malformed frames (`vaani_audiosocket_malformed_total`) | 0 | |
 | Send errors (`vaani_audiosocket_send_errors_total`) | 0 | |
-| Frames in vs. expected (60s ÷ 20ms × 25 calls) | ~100% | |
+| Frames in vs. expected (30s ÷ 20ms × 25 calls) | ~100% | |
 | Pacer drift p50 (`vaani_pacer_drift_ms`) | -- | |
 | Pacer drift p99 | ≤ 2ms | |
 | Sockets/listeners leaked after teardown | 0 | |
