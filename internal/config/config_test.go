@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -43,6 +44,51 @@ func TestLoad_RealEnvWinsOverDotenv(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, "http://from-real-env:8088/ari", cfg.AriURL)
+}
+
+func TestLoad_MediaDeadTimeout_DefaultsTo30Seconds(t *testing.T) {
+	restoreWD := chdir(t, t.TempDir())
+	defer restoreWD()
+
+	cfg, err := Load()
+	require.NoError(t, err)
+
+	assert.Equal(t, 30*time.Second, cfg.MediaDeadTimeout)
+}
+
+func TestLoad_MediaDeadTimeout_ReadsFromEnv(t *testing.T) {
+	restoreWD := chdir(t, t.TempDir())
+	defer restoreWD()
+
+	t.Setenv("MEDIA_DEAD_TIMEOUT_SECONDS", "45")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+
+	assert.Equal(t, 45*time.Second, cfg.MediaDeadTimeout)
+}
+
+func TestLoad_MediaDeadTimeout_ZeroDisablesIt(t *testing.T) {
+	restoreWD := chdir(t, t.TempDir())
+	defer restoreWD()
+
+	t.Setenv("MEDIA_DEAD_TIMEOUT_SECONDS", "0")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+
+	assert.Zero(t, cfg.MediaDeadTimeout)
+}
+
+func TestLoad_MediaDeadTimeout_RejectsNegative(t *testing.T) {
+	restoreWD := chdir(t, t.TempDir())
+	defer restoreWD()
+
+	t.Setenv("MEDIA_DEAD_TIMEOUT_SECONDS", "-5")
+
+	_, err := Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "MEDIA_DEAD_TIMEOUT_SECONDS")
 }
 
 func chdir(t *testing.T, dir string) (restore func()) {

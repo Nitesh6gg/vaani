@@ -50,6 +50,10 @@ type Config struct {
 	// audio. Costs one map entry and a per-tick no-subscriber check when false
 	// listeners are attached; skipped entirely when false.
 	DebugAudio bool
+	// MediaDeadTimeout, if > 0, is how long inbound media may stay completely
+	// silent before Dead()'s channel closes, signaling internal/ari.Manager to
+	// proactively hang the call up. 0 disables this (Watchdog only ever warns).
+	MediaDeadTimeout time.Duration
 }
 
 // nearSilenceRMSThreshold and nearSilenceMinTicks bound the teardown-time
@@ -127,7 +131,7 @@ func NewCallMedia(callID string, conn *net.UDPConn, sink Sink, cfg Config) *Call
 		handler:      handler,
 		fromWire:     cfg.FromWire,
 		recorder:     NewWavRecorder(cfg.RecordDir, callID),
-		watchdog:     NewWatchdog(callID, WatchdogTimeout, sink),
+		watchdog:     NewWatchdog(callID, WatchdogTimeout, cfg.MediaDeadTimeout, sink),
 		tap:          tap,
 		releasePacer: NewPacer(FrameInterval),
 		writePacer:   NewPacer(FrameInterval),
@@ -176,6 +180,14 @@ func (c *CallMedia) Run(ctx context.Context) {
 // false -- it means no audio was ever received from Asterisk for the whole call.
 func (c *CallMedia) RemoteLocked() bool {
 	return c.ep.Remote() != nil
+}
+
+// Dead returns a channel that's closed once inbound media has been silent for
+// Config.MediaDeadTimeout (never closes if that was 0). internal/ari.Manager
+// selects on this alongside its own context to proactively hang the call up
+// instead of leaving a media-dead call running indefinitely.
+func (c *CallMedia) Dead() <-chan struct{} {
+	return c.watchdog.Dead()
 }
 
 // NearSilent reports whether this call's average inbound audio level, across its

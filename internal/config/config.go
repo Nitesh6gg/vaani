@@ -82,6 +82,18 @@ type Config struct {
 	// telephony time forever. 0 (default) disables the cap; set
 	// MAX_CALL_DURATION_SECONDS to enforce one.
 	MaxCallDuration time.Duration
+
+	// MediaDeadTimeout bounds how long a call's inbound media may stay
+	// completely silent before Vaani proactively hangs it up -- a second layer
+	// alongside Asterisk's own rtptimeout (deploy/asterisk/rtp.conf), which only
+	// watches the caller's SIP-side RTP and can't catch a call whose audio never
+	// reaches this externalMedia leg due to an Asterisk-internal bridging
+	// problem. On by default at 30s, since zero inbound audio for that long has
+	// no legitimate case worth preserving (unlike MaxCallDuration, which could
+	// cut off a real long conversation); set MEDIA_DEAD_TIMEOUT_SECONDS=0 to
+	// disable. Checked on media.WatchdogTimeout's 5s ticks, so values below that
+	// just round up to one tick.
+	MediaDeadTimeout time.Duration
 }
 
 // Load reads configuration from the environment, applying local-dev defaults that
@@ -153,6 +165,17 @@ func Load() (Config, error) {
 	}
 
 	cfg.MaxCallDuration = time.Duration(maxCallSeconds) * time.Second
+
+	mediaDeadSeconds, err := getEnvInt("MEDIA_DEAD_TIMEOUT_SECONDS", 30)
+	if err != nil {
+		return Config{}, err
+	}
+
+	if mediaDeadSeconds < 0 {
+		return Config{}, fmt.Errorf("config: MEDIA_DEAD_TIMEOUT_SECONDS must be >= 0 (0 disables it), got %d", mediaDeadSeconds)
+	}
+
+	cfg.MediaDeadTimeout = time.Duration(mediaDeadSeconds) * time.Second
 
 	if _, err := media.ParseEndianness(cfg.AudioL16Endianness); err != nil {
 		return Config{}, err

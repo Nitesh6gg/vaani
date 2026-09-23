@@ -34,6 +34,9 @@ type AudioSocketConfig struct {
 	// DebugAudio, when true, registers this call with the /debug/audio/{callID}
 	// tap registry (see audiotap.go). Same contract as Config.DebugAudio.
 	DebugAudio bool
+	// MediaDeadTimeout, if > 0, is how long inbound media may stay completely
+	// silent before Dead()'s channel closes. Same contract as Config's.
+	MediaDeadTimeout time.Duration
 }
 
 // AudioSocketCallMedia runs the media pipeline for one AudioSocket call:
@@ -96,7 +99,7 @@ func NewAudioSocketCallMedia(callID string, conn net.Conn, sink AudioSocketSink,
 		sink:         sink,
 		handler:      handler,
 		recorder:     NewWavRecorder(cfg.RecordDir, callID),
-		watchdog:     NewWatchdog(callID, WatchdogTimeout, sink),
+		watchdog:     NewWatchdog(callID, WatchdogTimeout, cfg.MediaDeadTimeout, sink),
 		tap:          tap,
 		releasePacer: NewPacer(FrameInterval),
 		writePacer:   NewPacer(FrameInterval),
@@ -138,6 +141,13 @@ func (c *AudioSocketCallMedia) Run(ctx context.Context) {
 	if c.tap != nil {
 		UnregisterAudioTap(c.callID)
 	}
+}
+
+// Dead returns a channel that's closed once inbound media has been silent for
+// AudioSocketConfig.MediaDeadTimeout (never closes if that was 0). Same
+// contract as CallMedia.Dead.
+func (c *AudioSocketCallMedia) Dead() <-chan struct{} {
+	return c.watchdog.Dead()
 }
 
 // NearSilent reports whether this call's average inbound audio level, across its

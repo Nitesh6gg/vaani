@@ -47,6 +47,24 @@ authentication -- see "Operability endpoints" in `docs/ARCHITECTURE.md`.
 
 These must never overlap.
 
+## Orphaned-call cleanup (`rtptimeout` + `MEDIA_DEAD_TIMEOUT_SECONDS`)
+
+Two independent layers catch a call whose media has gone dead, for two
+different reasons -- see "Dead-Call Auto-Hangup" in `docs/AUDIO_PIPELINE.md`
+for the full explanation:
+
+- `deploy/asterisk/rtp.conf` sets `rtptimeout=60`/`rtpholdtimeout=300`:
+  Asterisk hangs up a channel that goes that long with no RTP activity on the
+  *caller's* SIP-side leg (network drop, crashed client, a killed load-test
+  tool -- no SIP BYE ever sent).
+- Vaani's own `MEDIA_DEAD_TIMEOUT_SECONDS` (default 30, `.env.example`) hangs
+  the call up if *its own* externalMedia leg goes fully silent, independent of
+  whether the caller's leg looks fine to Asterisk -- catches an
+  Asterisk-internal bridging/mixing failure that `rtptimeout` can't see.
+
+Without either, an orphaned call's externalMedia leg would stay open
+indefinitely (no `StasisEnd` ever fires) instead of tearing down normally.
+
 ## Endianness check
 
 See `docs/AUDIO_PIPELINE.md` -- run `go run ./cmd/endianness-check` against a live

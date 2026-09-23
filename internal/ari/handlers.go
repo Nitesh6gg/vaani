@@ -422,12 +422,30 @@ func (m *Manager) startRTPMedia(c *call) {
 		RecordDir:           m.cfg.RecordDir,
 		Handler:             m.mediaHandler(c.ID),
 		DebugAudio:          m.cfg.DebugAudio,
+		MediaDeadTimeout:    m.cfg.MediaDeadTimeout,
 	})
 
 	c.SetState(session.StateMediaActive)
 	slog.Info("rtp media plane running", "call_id", c.ID, "port", c.Port)
 
+	go m.watchMediaDead(c, c.cm.Dead())
 	go c.cm.Run(c.Ctx)
+}
+
+// watchMediaDead hangs a call up as soon as its media plane declares itself
+// dead (media.CallMedia.Dead / AudioSocketCallMedia.Dead -- sustained zero
+// inbound audio past MEDIA_DEAD_TIMEOUT_SECONDS), instead of leaving it running
+// until Asterisk's own rtptimeout eventually notices or the process exits.
+// Exits without doing anything if the call ends normally first (dead never
+// closes in that case). Teardown's once-guard makes calling it here always
+// safe, whichever path gets there first.
+func (m *Manager) watchMediaDead(c *call, dead <-chan struct{}) {
+	select {
+	case <-dead:
+		slog.Warn("hanging up call: media dead, no inbound audio past MEDIA_DEAD_TIMEOUT_SECONDS", "call_id", c.ID)
+		m.teardown(c)
+	case <-c.Ctx.Done():
+	}
 }
 
 // startAudioSocketMedia waits for Asterisk to open the AudioSocket TCP
@@ -463,15 +481,17 @@ func (m *Manager) startAudioSocketMedia(c *call) {
 	// that's a data race per the Go memory model, not just a lost update.
 	m.mu.Lock()
 	c.asm = media.NewAudioSocketCallMedia(c.ID, conn, metrics.AudioSocketSink{}, media.AudioSocketConfig{
-		RecordDir:  m.cfg.RecordDir,
-		Handler:    m.mediaHandler(c.ID),
-		DebugAudio: m.cfg.DebugAudio,
+		RecordDir:        m.cfg.RecordDir,
+		Handler:          m.mediaHandler(c.ID),
+		DebugAudio:       m.cfg.DebugAudio,
+		MediaDeadTimeout: m.cfg.MediaDeadTimeout,
 	})
 	m.mu.Unlock()
 
 	c.SetState(session.StateMediaActive)
 	slog.Info("audiosocket connected, media plane running", "call_id", c.ID, "port", c.Port)
 
+	go m.watchMediaDead(c, c.asm.Dead())
 	c.asm.Run(c.Ctx) // blocking is fine: already running in its own goroutine
 }
 

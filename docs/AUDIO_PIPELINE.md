@@ -103,6 +103,33 @@ call ID and average RMS -- independently of, and in addition to, the
 remote-locked check. A short call (fewer than 50 ticks) is never judged, to
 avoid false positives on calls that hang up almost immediately.
 
+## Dead-Call Auto-Hangup (`MEDIA_DEAD_TIMEOUT_SECONDS`)
+
+`internal/media.Watchdog` (`watchdog.go`) only ever warns and counts by
+design -- a quiet call keeps running. That's deliberately not the whole
+story: sustained *complete* silence (not "no packets logged," but zero
+inbound audio at all) for `MEDIA_DEAD_TIMEOUT_SECONDS` (default 30, checked
+on the same 5s ticks as the warning; `0` disables it) closes the channel
+`CallMedia.Dead()`/`AudioSocketCallMedia.Dead()` returns.
+`internal/ari.Manager.watchMediaDead` selects on that channel alongside the
+call's own context and, if it fires, proactively hangs the call up via the
+normal `teardown` path -- the same one `StasisEnd` triggers, guarded by the
+same once-guard, so racing against a call that ends normally for any other
+reason is always safe.
+
+This is deliberately a second, independent layer from Asterisk's own
+`rtptimeout`/`rtpholdtimeout` (`deploy/asterisk/rtp.conf`), not a duplicate of
+it: `rtptimeout` only watches the *caller's* SIP-side RTP, so it catches a
+dead/dropped caller (network loss, crashed phone) but can't catch a call
+whose caller-side RTP is perfectly healthy while Asterisk's own
+bridging/mixing simply stops forwarding audio into this externalMedia leg --
+structurally the same failure class as the jitter-buffer production incident
+above (transport healthy elsewhere, this leg dead). Only watching this leg
+directly, as `Watchdog` does, can catch that case. On by default (unlike
+`MAX_CALL_DURATION_SECONDS`, which stays opt-in): zero inbound audio for a
+full 30 seconds has no legitimate case worth preserving, whereas an absolute
+duration cap could cut off a real, long, healthy conversation.
+
 ## Live Audio Tap (`DEBUG_AUDIO=1`)
 
 Set `DEBUG_AUDIO=1` to mount `/debug/audio/{callID}` on `METRICS_ADDR`: while a
