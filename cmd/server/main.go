@@ -7,10 +7,12 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 
-	"github.com/nitesh/vaani/internal/ari"
+	"github.com/CyCoreSystems/ari/v5"
+	vaaniari "github.com/nitesh/vaani/internal/ari"
 	"github.com/nitesh/vaani/internal/config"
 	"github.com/nitesh/vaani/internal/media"
 	"github.com/nitesh/vaani/internal/metrics"
@@ -44,24 +46,37 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// clPtr is nil until ari.Connect below succeeds, and Serve's /healthz route
+	// needs to report "not connected" honestly during that startup/retry window
+	// rather than either blocking or panicking -- hence a pointer, checked for
+	// nil, instead of just capturing cl (which doesn't exist yet) in the closure.
+	var clPtr atomic.Pointer[ari.Client]
+
+	ariConnected := func() bool {
+		p := clPtr.Load()
+		return p != nil && (*p).Connected()
+	}
+
 	go func() {
-		if err := metrics.Serve(ctx, cfg.MetricsAddr, cfg.DebugAudio); err != nil {
+		if err := metrics.Serve(ctx, cfg.MetricsAddr, cfg.DebugAudio, ariConnected); err != nil {
 			slog.Error("metrics server error", "error", err)
 		}
 	}()
 
 	slog.Info("connecting to ARI", "url", cfg.AriURL, "app", cfg.AriApp)
 
-	cl, err := ari.Connect(ctx, cfg)
+	cl, err := vaaniari.Connect(ctx, cfg)
 	if err != nil {
 		return err
 	}
 	defer cl.Close()
 
+	clPtr.Store(&cl)
+
 	slog.Info("connected to ARI")
 
 	ports := media.NewPortAllocator(cfg.MediaPortBase, cfg.MediaPortCount)
-	mgr := ari.NewManager(cl, cfg, ports)
+	mgr := vaaniari.NewManager(cl, cfg, ports)
 
 	slog.Info("vaani running", "metrics_addr", cfg.MetricsAddr, "media_ip", cfg.MediaIP)
 

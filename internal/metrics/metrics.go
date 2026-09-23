@@ -4,6 +4,7 @@ package metrics
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	dto "github.com/prometheus/client_model/go"
 
 	"github.com/nitesh/vaani/internal/media"
 )
@@ -257,11 +259,62 @@ func debugAudioHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// healthResponse is /healthz's JSON body.
+type healthResponse struct {
+	Status        string  `json:"status"`
+	AriConnected  bool    `json:"ari_connected"`
+	ActiveCalls   int     `json:"active_calls"`
+	UptimeSeconds float64 `json:"uptime_seconds"`
+}
+
+// activeCalls reads CallsActive's current value directly, rather than adding a
+// second, separately-maintained counter -- the gauge is already authoritative
+// (incremented/decremented right alongside every completeBridge/teardown).
+func activeCalls() int {
+	var m dto.Metric
+
+	if err := CallsActive.Write(&m); err != nil {
+		return 0
+	}
+
+	return int(m.GetGauge().GetValue())
+}
+
+// healthHandler reports process health at /healthz: 200 when Asterisk's ARI
+// WebSocket is connected, 503 otherwise -- e.g. for a container orchestrator's
+// readiness probe. ariConnected is a func, not a bool, because the ARI client
+// doesn't exist yet when Serve starts (see Serve's doc comment) and because
+// Connected() itself already reflects live reconnect state -- no separate flag
+// to keep in sync.
+func healthHandler(ariConnected func() bool, startedAt time.Time) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		connected := ariConnected()
+
+		resp := healthResponse{
+			Status:        "ok",
+			AriConnected:  connected,
+			ActiveCalls:   activeCalls(),
+			UptimeSeconds: time.Since(startedAt).Seconds(),
+		}
+
+		status := http.StatusOK
+		if !connected {
+			status = http.StatusServiceUnavailable
+			resp.Status = "ari disconnected"
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(resp)
+	}
+}
+
 // Serve runs the /metrics HTTP server on addr until ctx is cancelled, then shuts it
 // down gracefully. debugAudio mirrors config.Config.DebugAudio: only when true is
 // the /debug/audio/{callID} live tap mounted at all, so it 404s outright rather
-// than just being undocumented when the operator hasn't opted in.
-func Serve(ctx context.Context, addr string, debugAudio bool) error {
+// than just being undocumented when the operator hasn't opted in. ariConnected
+// backs /healthz -- see healthHandler.
+func Serve(ctx context.Context, addr string, debugAudio bool, ariConnected func() bool) error {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/debug/pprof/", pprof.Index)
@@ -269,6 +322,7 @@ func Serve(ctx context.Context, addr string, debugAudio bool) error {
 	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
 	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
 	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	mux.HandleFunc("/healthz", healthHandler(ariConnected, time.Now()))
 
 	if debugAudio {
 		mux.HandleFunc("/debug/audio/{callID}", debugAudioHandler)

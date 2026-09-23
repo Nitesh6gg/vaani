@@ -3,6 +3,7 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -122,6 +123,17 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("config: MEDIA_PORT_COUNT must be positive, got %d", cfg.MediaPortCount)
 	}
 
+	// Catch an impossible port range at startup instead of as per-call bind
+	// failures mid-operation.
+	if cfg.MediaPortBase < 1024 {
+		return Config{}, fmt.Errorf("config: MEDIA_PORT_BASE must be >= 1024, got %d", cfg.MediaPortBase)
+	}
+
+	if cfg.MediaPortBase+cfg.MediaPortCount > 65535 {
+		return Config{}, fmt.Errorf("config: MEDIA_PORT_BASE + MEDIA_PORT_COUNT must be <= 65535, got %d + %d",
+			cfg.MediaPortBase, cfg.MediaPortCount)
+	}
+
 	if cfg.JitterBufferPackets, err = getEnvInt("JITTER_BUFFER_PACKETS", cfg.JitterBufferPackets); err != nil {
 		return Config{}, err
 	}
@@ -152,6 +164,17 @@ func Load() (Config, error) {
 
 	if cfg.MediaEncapsulation != "rtp" && cfg.MediaEncapsulation != "audiosocket" {
 		return Config{}, fmt.Errorf("config: MEDIA_ENCAPSULATION must be \"rtp\" or \"audiosocket\", got %q", cfg.MediaEncapsulation)
+	}
+
+	// getEnv treats an explicitly-empty env var as unset, so these dev defaults
+	// silently apply when ARI_PASS/MEDIA_IP are missing. That's fine for local
+	// dev but exactly wrong for production, so say so loudly at startup.
+	if _, ok := os.LookupEnv("ARI_PASS"); !ok {
+		slog.Warn("ARI_PASS not set; using dev default credentials -- set ARI_PASS for anything beyond local dev")
+	}
+
+	if _, ok := os.LookupEnv("MEDIA_IP"); !ok {
+		slog.Warn("MEDIA_IP not set; defaulting to 127.0.0.1 -- only works when Asterisk and Vaani share a host/network namespace")
 	}
 
 	return cfg, nil
