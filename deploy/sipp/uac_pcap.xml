@@ -8,6 +8,19 @@
   whatever RTP it receives), this becomes a self-sustaining closed audio loop for
   the whole call: SIPp -> Asterisk -> Vaani (echo) -> Asterisk -> SIPp -> echoed
   back out -> ... See README.md in this directory for the full invocation.
+
+  a=ptime:20 (below) is a live-diagnosed fix, not decoration: a 10-call PCMA
+  run of this scenario without it produced AudioSocket frames Asterisk itself
+  declared as 960 bytes (30ms of slin16, not the 640-byte/20ms frame the whole
+  pipeline assumes) on every call, discarded as malformed by
+  internal/media/audiosocket_call.go, leaving every call totally silent until
+  MEDIA_DEAD_TIMEOUT_SECONDS hung it up. A real softphone (MicroSIP) placed the
+  same call cleanly with no malformed frames -- the one SDP difference was that
+  it declares ptime=20 by default and this scenario never had (Asterisk's own
+  `core show channel` confirmed 16kHz was correctly negotiated either way, so
+  it's specifically the packetization interval, not the sample rate, that
+  was going unstated). Confirm this line actually fixes it before trusting a
+  PCMA test run again -- see docs/AUDIO_PIPELINE.md for the write-up once done.
 -->
 <scenario name="Vaani media load test (UAC with pcap RTP)">
   <send retrans="500">
@@ -33,6 +46,7 @@
       m=audio [media_port] RTP/AVP 8 0
       a=rtpmap:8 PCMA/8000
       a=rtpmap:0 PCMU/8000
+      a=ptime:20
       a=sendrecv
 
     ]]>
