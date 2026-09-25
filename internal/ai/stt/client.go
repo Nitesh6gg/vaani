@@ -1,19 +1,11 @@
 // Package stt streams inbound call audio to a speech-to-text provider.
 //
-// NewSarvamClient is deliberately unimplemented: Sarvam's saaras realtime WS
-// message shapes, endpointing behavior, idle timeout, and billing model are
-// Phase 0b probes (docs/AI_PROVIDERS.md) that have not been run against a live
-// account yet. Implementing the wire protocol from assumption would risk
-// shipping a client that silently talks past the real API -- this project's
-// standing rule is verify live, never fabricate. Wire it up once those probe
-// results are recorded.
+// NewSarvamClient's wire protocol (sarvam.go) is ported from a sibling
+// project's live-verified Sarvam client (D:\go-agent-worker's internal/stt),
+// not written from assumption -- see sarvam.go's doc comment for the specific
+// findings (message shapes, the no-keepalive rule, which field errors land in)
+// and where each was confirmed against the real API.
 package stt
-
-import "errors"
-
-// ErrNotImplemented is returned by NewSarvamClient until Phase 0b's live
-// probes confirm the actual message shapes to implement against.
-var ErrNotImplemented = errors.New("stt: Sarvam client not implemented -- Phase 0b probes required first, see docs/AI_PROVIDERS.md")
 
 // Result is one transcript event from the stream.
 type Result struct {
@@ -38,13 +30,11 @@ type Client interface {
 // Config bundles Sarvam STT connection parameters (internal/config.Config's
 // SARVAM_* fields).
 type Config struct {
-	WSURL  string
+	WSURL  string // defaults to Sarvam's production endpoint if empty
 	APIKey string
-	Model  string
-}
+	Model  string // e.g. "saaras:v3"
 
-// NewSarvamClient will connect to Sarvam's saaras realtime STT WebSocket.
-// Unimplemented pending Phase 0b -- see package doc comment.
-func NewSarvamClient(_ Config) (Client, error) {
-	return nil, ErrNotImplemented
+	// Language is Sarvam's language-code query param, e.g. "hi-IN". "unknown"
+	// (Sarvam's auto-detect) is used if empty.
+	Language string
 }

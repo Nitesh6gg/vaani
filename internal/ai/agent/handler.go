@@ -446,10 +446,26 @@ func (h *Handler) handleLLMDone(err error) {
 		h.cfg.Sink.Error("llm")
 	}
 
-	if h.tts == nil && State(h.state.Load()) == StateThinking {
-		// No TTS was ever opened this turn (LLM produced nothing, or failed
-		// before any chunk was sent) -- nothing to wait for.
-		h.state.Store(int32(StateListening))
+	if h.tts == nil {
+		if State(h.state.Load()) == StateThinking {
+			// No TTS was ever opened this turn (LLM produced nothing, or
+			// failed before any chunk was sent) -- nothing to wait for.
+			h.state.Store(int32(StateListening))
+		}
+
+		return
+	}
+
+	// The turn's text is fully generated, so no further Speak calls are
+	// coming on this connection -- request a graceful close. tts.Client.Close
+	// waits for any already-issued Speak calls' audio to finish arriving
+	// before actually closing, so this does not cut off the tail of the
+	// reply; Audio() closing afterward is what fires handleTTSDone and moves
+	// the state back to Listening once playback has genuinely finished.
+	// Without this call nothing ever closes the connection on a normal,
+	// uninterrupted turn, and the handler would stay stuck past SPEAKING.
+	if err := h.tts.Close(); err != nil {
+		h.cfg.Sink.Error("tts_close")
 	}
 }
 

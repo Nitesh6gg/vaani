@@ -80,24 +80,30 @@ func (f *fakeTTS) Speak(text string) error {
 
 func (f *fakeTTS) Audio() <-chan []byte { return f.audio }
 
+// Cancel matches the real client's immediate-close semantics (barge-in cut
+// #2): it closes Audio() right away, discarding anything in flight.
 func (f *fakeTTS) Cancel() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	f.cancelled = true
 
-	return nil
-}
-
-func (f *fakeTTS) Close() error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
 	if !f.closed {
 		close(f.audio)
 		f.closed = true
 	}
 
+	return nil
+}
+
+// Close is a graceful-shutdown request, matching the real client: it must not
+// cut off audio a test is still expecting to arrive over Audio(). Real
+// sarvamClient waits for outstanding Speak calls' "final" events before
+// actually closing; this fake has no such bookkeeping; tests that need
+// Audio() to close (to observe Handler's transition back to Listening) do so
+// explicitly with their own close(fTTS.audio) once they're done pushing
+// frames, so Close intentionally does nothing to the channel here.
+func (f *fakeTTS) Close() error {
 	return nil
 }
 
