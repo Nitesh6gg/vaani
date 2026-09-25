@@ -1,0 +1,270 @@
+package agent
+
+import (
+	"context"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/nitesh/vaani/internal/ai/llm"
+	"github.com/nitesh/vaani/internal/ai/stt"
+	"github.com/nitesh/vaani/internal/ai/tts"
+)
+
+// fakeSTT records every fed frame and lets a test push transcript results.
+type fakeSTT struct {
+	mu      sync.Mutex
+	fed     [][]byte
+	results chan stt.Result
+	closed  bool
+}
+
+func newFakeSTT() *fakeSTT { return &fakeSTT{results: make(chan stt.Result, 16)} }
+
+func (f *fakeSTT) Feed(pcm []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	cp := make([]byte, len(pcm))
+	copy(cp, pcm)
+	f.fed = append(f.fed, cp)
+
+	return nil
+}
+
+func (f *fakeSTT) Results() <-chan stt.Result { return f.results }
+
+func (f *fakeSTT) Close() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if !f.closed {
+		close(f.results)
+		f.closed = true
+	}
+
+	return nil
+}
+
+func (f *fakeSTT) fedCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return len(f.fed)
+}
+
+func (f *fakeSTT) sendFinal(text string) { f.results <- stt.Result{Text: text, Final: true} }
+
+// fakeTTS records Speak/Cancel calls and lets a test control audio output.
+type fakeTTS struct {
+	mu        sync.Mutex
+	spoken    []string
+	cancelled bool
+	audio     chan []byte
+	closed    bool
+}
+
+func newFakeTTS() *fakeTTS { return &fakeTTS{audio: make(chan []byte, 16)} }
+
+func (f *fakeTTS) Speak(text string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.spoken = append(f.spoken, text)
+
+	return nil
+}
+
+func (f *fakeTTS) Audio() <-chan []byte { return f.audio }
+
+func (f *fakeTTS) Cancel() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.cancelled = true
+
+	return nil
+}
+
+func (f *fakeTTS) Close() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if !f.closed {
+		close(f.audio)
+		f.closed = true
+	}
+
+	return nil
+}
+
+func (f *fakeTTS) wasCancelled() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.cancelled
+}
+
+func (f *fakeTTS) spokenCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return len(f.spoken)
+}
+
+// fakeLLM streams a fixed token list, respecting context cancellation.
+type fakeLLM struct {
+	tokens []string
+	err    error
+}
+
+func (f *fakeLLM) Stream(ctx context.Context, _ []llm.Message, onToken func(string)) error {
+	for _, tok := range f.tokens {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		onToken(tok)
+	}
+
+	return f.err
+}
+
+func testConfig(sttClient stt.Client, ttsClient tts.Client, llmClient llmStreamer, guard, postCut time.Duration) Config {
+	return Config{
+		STT:            sttClient,
+		NewTTS:         func() (tts.Client, error) { return ttsClient, nil },
+		LLM:            llmClient,
+		BargeIn:        NewEnergyDetector(floor),
+		BargeInGuard:   guard,
+		PostCutSilence: postCut,
+		Sink:           NoopSink{},
+	}
+}
+
+func TestHandler_ListeningFeedsSTTAndReturnsNoAudio(t *testing.T) {
+	fSTT := newFakeSTT()
+	h := NewHandler(context.Background(), "call1", testConfig(fSTT, newFakeTTS(), &fakeLLM{}, 0, 0))
+
+	out := h.ProcessFrame(context.Background(), "call1", constFrame(quietAmplitude))
+
+	assert.Nil(t, out)
+	assert.Equal(t, 1, fSTT.fedCount())
+	assert.Equal(t, StateListening, h.State())
+}
+
+func TestHandler_FullTurnEndToEnd(t *testing.T) {
+	fSTT := newFakeSTT()
+	fTTS := newFakeTTS()
+	fLLM := &fakeLLM{tokens: []string{"Hello", " there."}}
+
+	h := NewHandler(context.Background(), "call1", testConfig(fSTT, fTTS, fLLM, 0, 0))
+
+	fSTT.sendFinal("hi there")
+
+	require.Eventually(t, func() bool { return fTTS.spokenCount() > 0 }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return h.State() == StateSpeaking }, time.Second, time.Millisecond)
+
+	fTTS.audio <- constFrame(loudAmplitude)
+
+	var gotFrame []byte
+
+	require.Eventually(t, func() bool {
+		out := h.ProcessFrame(context.Background(), "call1", constFrame(quietAmplitude))
+		if len(out) == 1 {
+			gotFrame = out[0]
+			return true
+		}
+
+		return false
+	}, time.Second, time.Millisecond)
+
+	assert.Len(t, gotFrame, 640)
+
+	close(fTTS.audio)
+
+	require.Eventually(t, func() bool { return h.State() == StateListening }, time.Second, time.Millisecond)
+}
+
+func TestHandler_BargeInExecutesCutsAndFlushesPreroll(t *testing.T) {
+	fSTT := newFakeSTT()
+	fTTS := newFakeTTS()
+	fLLM := &fakeLLM{tokens: []string{"a long response the caller interrupts"}}
+
+	h := NewHandler(context.Background(), "call1", testConfig(fSTT, fTTS, fLLM, 0, 50*time.Millisecond))
+
+	fSTT.sendFinal("hi")
+	require.Eventually(t, func() bool { return h.State() == StateSpeaking }, time.Second, time.Millisecond)
+
+	// Quiet SPEAKING frames first, so preroll has content besides the trigger.
+	h.ProcessFrame(context.Background(), "call1", constFrame(quietAmplitude))
+	h.ProcessFrame(context.Background(), "call1", constFrame(quietAmplitude))
+
+	fedBefore := fSTT.fedCount()
+
+	h.ProcessFrame(context.Background(), "call1", constFrame(loudAmplitude))
+	h.ProcessFrame(context.Background(), "call1", constFrame(loudAmplitude))
+	out := h.ProcessFrame(context.Background(), "call1", constFrame(loudAmplitude))
+
+	assert.Nil(t, out, "the triggering tick returns no agent audio")
+	assert.Equal(t, StateTranscribing, h.State(), "must flip state immediately, not wait for the event loop")
+
+	require.Eventually(t, fTTS.wasCancelled, time.Second, time.Millisecond, "cut #2: TTS must be cancelled")
+	assert.Greater(t, fSTT.fedCount(), fedBefore, "preroll frames must be flushed to STT")
+}
+
+func TestHandler_BargeInRespectsGuardWindow(t *testing.T) {
+	fSTT := newFakeSTT()
+	fTTS := newFakeTTS()
+	fLLM := &fakeLLM{tokens: []string{"hi"}}
+
+	h := NewHandler(context.Background(), "call1", testConfig(fSTT, fTTS, fLLM, time.Hour, 0))
+
+	fSTT.sendFinal("hi")
+	require.Eventually(t, func() bool { return h.State() == StateSpeaking }, time.Second, time.Millisecond)
+
+	for i := 0; i < 10; i++ {
+		h.ProcessFrame(context.Background(), "call1", constFrame(loudAmplitude))
+	}
+
+	assert.Equal(t, StateSpeaking, h.State(), "loud frames inside the guard window must not trigger barge-in")
+	assert.False(t, fTTS.wasCancelled())
+}
+
+func TestHandler_PostCutSilenceGateDropsTooSoonFinal(t *testing.T) {
+	fSTT := newFakeSTT()
+	h := NewHandler(context.Background(), "call1", testConfig(fSTT, newFakeTTS(), &fakeLLM{}, 0, time.Hour))
+
+	h.silenceUntil.Store(time.Now().Add(time.Hour).UnixNano()) // simulate a cut that just happened
+
+	fSTT.sendFinal("too soon")
+	time.Sleep(50 * time.Millisecond) // let readSTT/run process the event
+
+	assert.Equal(t, StateListening, h.State(), "final inside the post-cut gate must be dropped, not start a turn")
+}
+
+func TestHandler_ProcessFrameNeverBlocks(t *testing.T) {
+	fSTT := newFakeSTT()
+	h := NewHandler(context.Background(), "call1", testConfig(fSTT, newFakeTTS(), &fakeLLM{}, 0, 0))
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		for i := 0; i < 1000; i++ {
+			h.ProcessFrame(context.Background(), "call1", constFrame(quietAmplitude))
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ProcessFrame blocked")
+	}
+}
