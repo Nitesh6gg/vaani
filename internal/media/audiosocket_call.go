@@ -187,6 +187,7 @@ func (c *AudioSocketCallMedia) readLoop(ctx context.Context, done chan<- struct{
 		case AudioSocketKindSlin16:
 			if len(frame.Payload) != FrameSize {
 				c.sink.Malformed()
+				logFrameSizeOnce(c.callID, int(frame.Kind), len(frame.Payload))
 				slog.Debug("audiosocket frame wrong size", "call_id", c.callID, "size", len(frame.Payload))
 
 				continue
@@ -234,7 +235,7 @@ func (c *AudioSocketCallMedia) releaseLoop(ctx context.Context) {
 
 		c.recorder.WriteIn(pcm)
 
-		level := rms(pcm)
+		level := RMS(pcm)
 		c.sink.AudioLevel(level)
 		c.rmsMu.Lock()
 		c.rmsSum += level

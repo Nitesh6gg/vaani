@@ -244,6 +244,7 @@ func (c *CallMedia) readLoop(ctx context.Context, done chan<- struct{}) {
 		// count it instead.
 		if len(pkt.Payload) != FrameSize {
 			c.sink.PayloadSizeMismatch()
+			logFrameSizeOnce(c.callID, int(pkt.PayloadType), len(pkt.Payload))
 			slog.Debug("rtp payload size mismatch; dropping", "call_id", c.callID,
 				"size", len(pkt.Payload), "want", FrameSize)
 
@@ -286,7 +287,7 @@ func (c *CallMedia) releaseLoop(ctx context.Context) {
 		NormalizeToLE(pcm, c.fromWire)
 		c.recorder.WriteIn(pcm)
 
-		level := rms(pcm)
+		level := RMS(pcm)
 		c.sink.AudioLevel(level)
 		c.rmsMu.Lock()
 		c.rmsSum += level
@@ -389,9 +390,11 @@ func (c *CallMedia) observeDrift(now time.Time) {
 	c.prevRelease = now
 }
 
-// rms computes the root-mean-square level of a little-endian PCM16 buffer. Not
+// RMS computes the root-mean-square level of a little-endian PCM16 buffer. Not
 // VAD -- just an observability signal that real audio (not silence) is flowing.
-func rms(pcm []byte) float64 {
+// Exported so other packages (e.g. internal/ai/agent's energy-based barge-in
+// detector) can reuse it instead of recomputing the same thing.
+func RMS(pcm []byte) float64 {
 	n := len(pcm) / 2
 	if n == 0 {
 		return 0
