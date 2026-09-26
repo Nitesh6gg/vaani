@@ -505,6 +505,7 @@ func (m *Manager) newAgentHandler(ctx context.Context, callID string) media.Hand
 			})
 		},
 		LLM:            llm.NewClient(m.cfg.LLMBaseURL, m.cfg.LLMAPIKey, m.cfg.LLMModel),
+		SystemPrompt:   m.cfg.AgentSystemPrompt,
 		BargeIn:        bargeIn,
 		BargeInGuard:   m.cfg.BargeInGuard,
 		PostCutSilence: m.cfg.PostCutSilence,

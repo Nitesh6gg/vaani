@@ -74,7 +74,7 @@ func run() error {
 	ports := media.NewPortAllocator(cfg.MediaPortBase, cfg.MediaPortCount)
 	mgr := vaaniari.NewManager(cl, cfg, ports)
 
-	slog.Info("vaani running", "metrics_addr", cfg.MetricsAddr, "media_ip", cfg.MediaIP)
+	slog.Info("vaani running", "metrics_addr", cfg.MetricsAddr, "media_ip", cfg.MediaIP, "app_mode", cfg.AppMode)
 
 	runDone := make(chan struct{})
 

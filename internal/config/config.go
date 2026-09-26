@@ -102,6 +102,10 @@ type Config struct {
 	LLMBaseURL string
 	LLMAPIKey  string
 	LLMModel   string
+	// AgentSystemPrompt is prepended as the system message on every call (see
+	// internal/ai/agent.Config.SystemPrompt). Empty by default -- the LLM gets
+	// no system message at all unless this is set.
+	AgentSystemPrompt string
 
 	// SarvamAPIKey authenticates both Sarvam STT and TTS (internal/ai/stt,
 	// internal/ai/tts) -- one key per Sarvam account covers both products.
@@ -163,6 +167,7 @@ func Load() (Config, error) {
 		LLMBaseURL:          getEnv("LLM_BASE_URL", ""),
 		LLMAPIKey:           getEnv("LLM_API_KEY", ""),
 		LLMModel:            getEnv("LLM_MODEL", ""),
+		AgentSystemPrompt:   getEnv("AGENT_SYSTEM_PROMPT", ""),
 		SarvamAPIKey:        getEnv("SARVAM_API_KEY", ""),
 		SarvamSTTModel:      getEnv("SARVAM_STT_MODEL", "saaras:v4"),
 		SarvamSTTLanguage:   getEnv("SARVAM_STT_LANGUAGE", "unknown"),
