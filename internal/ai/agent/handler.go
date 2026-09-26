@@ -59,6 +59,17 @@ const prerollFrames = 10
 // audio past an interruption, only avoids dropping it before one.
 const outboundBufferFrames = int(30 * time.Second / media.FrameInterval)
 
+// speakingDrainTimeoutTicks is the dead-call safeguard horizon for the
+// Speaking state: 500 consecutive 20ms release ticks (10s) with an empty
+// outbound queue and no ttsDeliveryDone means the TTS connection died
+// mid-turn (or its completion event was lost) -- handleTTSDone will never
+// run, and without this the turn would never end and STT would never be fed
+// again (inbound RTP keeps flowing, so the media plane's own dead-call
+// detection sees a healthy call). A synthesis stall legitimately holds the
+// queue empty for at most a couple of seconds -- observed first-audio
+// latency is 0.4-0.7s. See processSpeakingFrame.
+const speakingDrainTimeoutTicks = 500
+
 // llmStreamer is the subset of *llm.Client that Handler needs, as an
 // interface so tests can inject a fake without a live LLM endpoint.
 type llmStreamer interface {
@@ -124,6 +135,7 @@ type ttsDoneEvent struct{ gen uint64 }
 type bargeInEvent struct{}
 type greetingEvent struct{}
 type ttsPlaybackDoneEvent struct{}
+type ttsDrainTimeoutEvent struct{}
 
 // Handler implements media.Handler: Sarvam STT -> LLM -> Sarvam TTS with local
 // barge-in detection. See docs/AUDIO_PIPELINE.md's Handler Contract and
@@ -135,7 +147,7 @@ type ttsPlaybackDoneEvent struct{}
 //   - state/speakingSince/silenceUntil/ttsDeliveryDone: atomics, written by
 //     whichever goroutine reaches the transition, read by any.
 //   - tts/turnCancel/history: touched only by run()'s goroutine.
-//   - preroll: touched only by ProcessFrame's goroutine.
+//   - preroll/emptyTicks: touched only by ProcessFrame's goroutine.
 //   - per-turn chunker: a local variable inside runLLMTurn, never shared.
 //   - outbound: a channel (safe for concurrent send/receive by construction).
 type Handler struct {
@@ -178,6 +190,13 @@ type Handler struct {
 
 	// ProcessFrame-goroutine-owned only.
 	preroll [][]byte
+	// emptyTicks counts consecutive Speaking-state release ticks that found
+	// the outbound queue empty without ttsDeliveryDone set -- the drain
+	// dead-call safeguard in processSpeakingFrame. A counter, not a stored
+	// timestamp: a wall-clock stamp from the previous turn's drain would
+	// mis-time the next turn's first-audio window (Listening can last
+	// minutes). Reset on every pop, barge-in, and playback-done.
+	emptyTicks int
 
 	// TTS PCM re-sliced to 640B frames, drained by ProcessFrame at real-time
 	// pace. See outboundBufferFrames for why this is sized in seconds, not
@@ -264,6 +283,7 @@ func (h *Handler) processSpeakingFrame(pcm []byte) [][]byte {
 		h.silenceUntil.Store(time.Now().Add(h.cfg.PostCutSilence).UnixNano())
 		h.cfg.Sink.BargeIn()
 		slog.Info("agent barge-in detected", "call_id", h.callID)
+		h.emptyTicks = 0
 
 		select {
 		case h.events <- bargeInEvent{}:
@@ -276,6 +296,8 @@ func (h *Handler) processSpeakingFrame(pcm []byte) [][]byte {
 
 	select {
 	case frame := <-h.outbound:
+		h.emptyTicks = 0
+
 		return [][]byte{frame}
 	default:
 	}
@@ -286,10 +308,35 @@ func (h *Handler) processSpeakingFrame(pcm []byte) [][]byte {
 	// once per generation, even if several ticks in a row find an empty queue
 	// before run() gets around to processing the event.
 	if h.ttsDeliveryDone.CompareAndSwap(true, false) {
+		h.emptyTicks = 0
+
 		select {
 		case h.events <- ttsPlaybackDoneEvent{}:
 		default:
 			slog.Error("agent: events channel full dropping ttsPlaybackDoneEvent", "call_id", h.callID)
+		}
+
+		return nil
+	}
+
+	// Dead-call safeguard (see speakingDrainTimeoutTicks): TTS gone silent
+	// mid-turn without delivery-done. Like a barge-in, the state flip happens
+	// right here (this goroutine) so the very next tick resumes feeding STT,
+	// and an event tells run() to clear its turn state; the guard means this
+	// can't stomp on a barge-in that already advanced us to Transcribing.
+	h.emptyTicks++
+	if h.emptyTicks >= speakingDrainTimeoutTicks {
+		h.emptyTicks = 0
+		h.cfg.Sink.Error("tts_drain_timeout")
+		slog.Warn("speaking with empty outbound queue and no tts delivery-done for 10s; forcing turn end (tts connection likely dead)",
+			"call_id", h.callID)
+
+		if h.state.CompareAndSwap(int32(StateSpeaking), int32(StateListening)) {
+			select {
+			case h.events <- ttsDrainTimeoutEvent{}:
+			default:
+				slog.Error("agent: events channel full dropping ttsDrainTimeoutEvent", "call_id", h.callID)
+			}
 		}
 	}
 
@@ -373,6 +420,11 @@ func (h *Handler) handleEvent(ev any) {
 		h.handleGreeting()
 	case ttsPlaybackDoneEvent:
 		h.finishTurn(h.curGen)
+	case ttsDrainTimeoutEvent:
+		// State was already flipped by processSpeakingFrame; this only clears
+		// run()-owned turn state so a dead turn's <640B ttsBuf tail can't leak
+		// into the front of the next turn's audio.
+		h.ttsBuf = nil
 	}
 }
 

@@ -447,3 +447,42 @@ func TestHandler_ProcessFrameNeverBlocks(t *testing.T) {
 		t.Fatal("ProcessFrame blocked")
 	}
 }
+
+// TestHandler_DrainTimeoutEndsTurnWhenTTSDiesWithoutDone is the dead-call
+// safeguard regression: if the TTS connection dies mid-turn (or its completion
+// event is lost), handleTTSDone never runs and ttsDeliveryDone is never set --
+// and with the playout fix, nothing else would ever end the turn. STT would
+// never be fed again on a call whose inbound audio is otherwise perfectly
+// healthy (so the media plane's dead-call detection sees nothing wrong either).
+// processSpeakingFrame must force the turn closed after
+// speakingDrainTimeoutTicks consecutive empty ticks.
+func TestHandler_DrainTimeoutEndsTurnWhenTTSDiesWithoutDone(t *testing.T) {
+	fSTT := newFakeSTT()
+	fTTS := newFakeTTS()
+	fLLM := &fakeLLM{tokens: []string{"hi"}}
+
+	// Guard window spans the whole test: loud frames must never barge in here,
+	// the drain timeout is the only path back to Listening.
+	h := NewHandler(context.Background(), "call1", testConfig(fSTT, fTTS, fLLM, time.Hour, 0))
+
+	fSTT.sendFinal("hi")
+	require.Eventually(t, func() bool { return fTTS.spokenCount() > 0 }, time.Second, time.Millisecond)
+
+	const gen = 1
+
+	fTTS.audio <- tts.Chunk{PCM: constFrame(loudAmplitude), Gen: gen}
+	require.Eventually(t, func() bool { return h.State() == StateSpeaking }, time.Second, time.Millisecond)
+
+	// Play out the one queued frame, then let the queue sit empty with no Done
+	// ever arriving (the connection "died"). require.Eventually drives
+	// ProcessFrame repeatedly, standing in for the release loop's ticks.
+	require.Eventually(t, func() bool {
+		h.ProcessFrame(context.Background(), "call1", constFrame(quietAmplitude))
+		return h.State() == StateListening
+	}, 5*time.Second, time.Millisecond, "turn must end via the drain timeout, not stay wedged in Speaking forever")
+
+	// The point of the safeguard: the caller can be heard again.
+	fedAfter := fSTT.fedCount()
+	h.ProcessFrame(context.Background(), "call1", constFrame(quietAmplitude))
+	assert.Equal(t, fedAfter+1, fSTT.fedCount(), "Listening must feed STT again once the wedged turn is closed")
+}
