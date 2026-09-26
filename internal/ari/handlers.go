@@ -11,11 +11,64 @@ import (
 	"github.com/CyCoreSystems/ari/v5"
 	"github.com/CyCoreSystems/ari/v5/rid"
 
+	"github.com/nitesh/vaani/internal/ai/agent"
+	"github.com/nitesh/vaani/internal/ai/llm"
+	"github.com/nitesh/vaani/internal/ai/stt"
+	"github.com/nitesh/vaani/internal/ai/tts"
 	"github.com/nitesh/vaani/internal/config"
 	"github.com/nitesh/vaani/internal/media"
 	"github.com/nitesh/vaani/internal/metrics"
 	"github.com/nitesh/vaani/internal/session"
 )
+
+// connectRetryAttempts/connectRetryBaseDelay bound the retry budget for a
+// call's initial STT connection and its first-turn TTS connection: a handful
+// of quick attempts, not the standing background retry loop that a sibling
+// project's own incident history (D:\go-agent-worker's ADR-011) warns
+// against for a connection that drops mid-call -- this only ever runs at
+// connection-open time and always terminates, in success or exhaustion.
+const (
+	connectRetryAttempts  = 3
+	connectRetryBaseDelay = 500 * time.Millisecond
+)
+
+// dialWithRetry calls dial up to connectRetryAttempts times with exponential
+// backoff, stopping early if ctx is done. Used for both the call-scoped STT
+// connection and the lazily-opened, call-scoped TTS connection (see
+// tts.Client's doc comment) -- both are opened once per call, so a small
+// bounded retry here is worth it even though the provider itself offers no
+// retry of its own.
+func dialWithRetry[T any](ctx context.Context, callID, what string, dial func() (T, error)) (T, error) {
+	var (
+		v     T
+		err   error
+		delay = connectRetryBaseDelay
+	)
+
+	for attempt := 1; attempt <= connectRetryAttempts; attempt++ {
+		v, err = dial()
+		if err == nil {
+			return v, nil
+		}
+
+		if attempt == connectRetryAttempts {
+			break
+		}
+
+		slog.Warn("agent: connect failed, retrying", "call_id", callID, "what", what, "attempt", attempt, "error", err)
+
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			var zero T
+			return zero, ctx.Err()
+		}
+
+		delay *= 2
+	}
+
+	return v, fmt.Errorf("%s: %w", what, err)
+}
 
 // audioSocketAcceptTimeout bounds how long completeBridge waits for Asterisk to
 // actually open the AudioSocket TCP connection after the channel is bridged.
@@ -393,17 +446,70 @@ func (m *Manager) completeBridge(c *call) {
 }
 
 // mediaHandler builds the Handler for a new call from config: SilentHandler if
-// TEST_SILENT_HANDLER=1 (a debug hook -- never set in production, since it means
-// the call carries no audio at all), otherwise nil (CallMedia/AudioSocketCallMedia
-// both default that to LoopbackHandler).
-func (m *Manager) mediaHandler(callID string) media.Handler {
-	if !m.cfg.TestSilentHandler {
+// TEST_SILENT_HANDLER=1 (a debug hook -- never set in production, since it
+// means the call carries no audio at all); agent.Handler if AppMode is
+// "agent"; otherwise nil (CallMedia/AudioSocketCallMedia both default that to
+// LoopbackHandler, which is what AppMode "loopback" relies on for
+// telephony-only testing, e.g. SIPp load tests, with no AI dependency at all).
+// ctx is the call's own context (session.Call.Ctx): agent.NewHandler's
+// background goroutines and its STT/TTS connections all stop when it's
+// cancelled at hangup, so there is nothing further to close here.
+func (m *Manager) mediaHandler(ctx context.Context, callID string) media.Handler {
+	if m.cfg.TestSilentHandler {
+		slog.Warn("TEST_SILENT_HANDLER=1: this call will carry no audio", "call_id", callID)
+		return media.SilentHandler{}
+	}
+
+	if m.cfg.AppMode != "agent" {
 		return nil
 	}
 
-	slog.Warn("TEST_SILENT_HANDLER=1: this call will carry no audio", "call_id", callID)
+	return m.newAgentHandler(ctx, callID)
+}
 
-	return media.SilentHandler{}
+// newAgentHandler wires internal/ai/{stt,tts,llm,agent} together for one
+// call, using m.cfg's SARVAM_*/LLM_*/BARGE_IN_* settings (validated non-empty
+// at config.Load() time when AppMode is "agent"). If the STT connection can't
+// be established even after dialWithRetry's budget, the call falls back to
+// LoopbackHandler (nil) rather than failing the call outright -- logged
+// loudly since a caller in agent mode getting loopback behavior instead is a
+// real, visible degradation, not a silent one.
+func (m *Manager) newAgentHandler(ctx context.Context, callID string) media.Handler {
+	sttClient, err := dialWithRetry(ctx, callID, "stt connect", func() (stt.Client, error) {
+		return stt.NewSarvamClient(ctx, callID, stt.Config{
+			APIKey:   m.cfg.SarvamAPIKey,
+			Model:    m.cfg.SarvamSTTModel,
+			Language: m.cfg.SarvamSTTLanguage,
+		})
+	})
+	if err != nil {
+		slog.Error("agent: STT connect failed after retries, falling back to loopback", "call_id", callID, "error", err)
+		return nil
+	}
+
+	var bargeIn agent.BargeInDetector = agent.NoopBargeInDetector{}
+	if m.cfg.BargeInEnabled {
+		bargeIn = agent.NewEnergyDetector(m.cfg.BargeInRMSFloor)
+	}
+
+	return agent.NewHandler(ctx, callID, agent.Config{
+		STT: sttClient,
+		NewTTS: func() (tts.Client, error) {
+			return dialWithRetry(ctx, callID, "tts connect", func() (tts.Client, error) {
+				return tts.NewSarvamClient(ctx, callID, tts.Config{
+					APIKey:   m.cfg.SarvamAPIKey,
+					Voice:    m.cfg.SarvamTTSVoice,
+					Model:    m.cfg.SarvamTTSModel,
+					Language: m.cfg.SarvamTTSLanguage,
+				})
+			})
+		},
+		LLM:            llm.NewClient(m.cfg.LLMBaseURL, m.cfg.LLMAPIKey, m.cfg.LLMModel),
+		BargeIn:        bargeIn,
+		BargeInGuard:   m.cfg.BargeInGuard,
+		PostCutSilence: m.cfg.PostCutSilence,
+		Sink:           metrics.AgentSink{},
+	})
 }
 
 // startRTPMedia constructs and runs the RTP media plane for an already-bridged
@@ -420,7 +526,7 @@ func (m *Manager) startRTPMedia(c *call) {
 		JitterBufferPackets: m.cfg.JitterBufferPackets,
 		FromWire:            fromWire,
 		RecordDir:           m.cfg.RecordDir,
-		Handler:             m.mediaHandler(c.ID),
+		Handler:             m.mediaHandler(c.Ctx, c.ID),
 		DebugAudio:          m.cfg.DebugAudio,
 		MediaDeadTimeout:    m.cfg.MediaDeadTimeout,
 	})
@@ -482,7 +588,7 @@ func (m *Manager) startAudioSocketMedia(c *call) {
 	m.mu.Lock()
 	c.asm = media.NewAudioSocketCallMedia(c.ID, conn, metrics.AudioSocketSink{}, media.AudioSocketConfig{
 		RecordDir:        m.cfg.RecordDir,
-		Handler:          m.mediaHandler(c.ID),
+		Handler:          m.mediaHandler(c.Ctx, c.ID),
 		DebugAudio:       m.cfg.DebugAudio,
 		MediaDeadTimeout: m.cfg.MediaDeadTimeout,
 	})

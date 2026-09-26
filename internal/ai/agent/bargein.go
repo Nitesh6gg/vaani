@@ -70,3 +70,12 @@ func (d *EnergyDetector) Reset() {
 	d.history = [bargeInHistoryFrames]bool{}
 	d.idx = 0
 }
+
+// NoopBargeInDetector never reports speech: BARGE_IN_ENABLED=0 selects this
+// instead of EnergyDetector, so the agent keeps talking over any inbound
+// audio until its turn finishes -- useful for isolating whether a problem is
+// in barge-in detection itself versus the rest of the pipeline.
+type NoopBargeInDetector struct{}
+
+func (NoopBargeInDetector) Detect([]byte) bool { return false }
+func (NoopBargeInDetector) Reset()             {}
