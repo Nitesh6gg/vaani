@@ -42,9 +42,17 @@ type Sink interface {
 // phase. Handler defaults to LoopbackHandler if nil.
 type Config struct {
 	JitterBufferPackets int
-	FromWire            Endianness
-	Handler             Handler
-	RecordDir           string
+	// FromWire is the wire byte order of inbound RTP L16 payloads; everything
+	// from the jitter buffer onward is normalized to LE.
+	FromWire Endianness
+	// ToWire is the wire byte order for outbound RTP L16 payloads: handler
+	// output is LE by contract and gets converted to this on the way out.
+	// Deployments that verified AUDIO_L16_ENDIANNESS=be inbound need the same
+	// swap outbound, or Asterisk plays the agent's voice as byte-swapped
+	// noise. Zero value (LittleEndian) is a no-op.
+	ToWire    Endianness
+	Handler   Handler
+	RecordDir string
 	// DebugAudio, when true, registers this call with the /debug/audio/{callID}
 	// tap registry (see audiotap.go) so a live listener can stream its inbound
 	// audio. Costs one map entry and a per-tick no-subscriber check when false
@@ -89,6 +97,7 @@ type CallMedia struct {
 	jb       *JitterBuffer
 	handler  Handler
 	fromWire Endianness
+	toWire   Endianness
 	recorder *WavRecorder
 	watchdog *Watchdog
 	seq      SeqTracker
@@ -130,6 +139,7 @@ func NewCallMedia(callID string, conn *net.UDPConn, sink Sink, cfg Config) *Call
 		jb:           NewJitterBuffer(cfg.JitterBufferPackets, sink),
 		handler:      handler,
 		fromWire:     cfg.FromWire,
+		toWire:       cfg.ToWire,
 		recorder:     NewWavRecorder(cfg.RecordDir, callID),
 		watchdog:     NewWatchdog(callID, WatchdogTimeout, cfg.MediaDeadTimeout, sink),
 		tap:          tap,
@@ -343,6 +353,12 @@ func (c *CallMedia) writeLoop(ctx context.Context) {
 		}
 
 		c.recorder.WriteOut(*frame)
+
+		// Byte order for the wire only: the recorder's WAV stays LE (WAV is LE
+		// by definition), the RTP payload must match what the verified inbound
+		// order says Asterisk expects outbound too. No-op unless ToWire is
+		// BigEndian.
+		FromLE(*frame, c.toWire)
 
 		pkt := c.sender.Build(*frame)
 

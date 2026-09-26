@@ -31,6 +31,12 @@ type AudioSocketSink interface {
 type AudioSocketConfig struct {
 	Handler   Handler
 	RecordDir string
+	// ToWire exists for symmetry with Config.ToWire so the write path looks
+	// identical across transports; AudioSocket's payload is little-endian by
+	// protocol definition, so callers must leave it at the zero value
+	// (LittleEndian) -- anything else is a programming error, not a deployment
+	// question.
+	ToWire Endianness
 	// DebugAudio, when true, registers this call with the /debug/audio/{callID}
 	// tap registry (see audiotap.go). Same contract as Config.DebugAudio.
 	DebugAudio bool
@@ -59,6 +65,7 @@ type AudioSocketCallMedia struct {
 	conn     net.Conn
 	sink     AudioSocketSink
 	handler  Handler
+	toWire   Endianness
 	recorder *WavRecorder
 	watchdog *Watchdog
 	tap      *AudioTap
@@ -98,6 +105,7 @@ func NewAudioSocketCallMedia(callID string, conn net.Conn, sink AudioSocketSink,
 		conn:         conn,
 		sink:         sink,
 		handler:      handler,
+		toWire:       cfg.ToWire,
 		recorder:     NewWavRecorder(cfg.RecordDir, callID),
 		watchdog:     NewWatchdog(callID, WatchdogTimeout, cfg.MediaDeadTimeout, sink),
 		tap:          tap,
@@ -294,6 +302,10 @@ func (c *AudioSocketCallMedia) writeLoop(ctx context.Context) {
 		}
 
 		c.recorder.WriteOut(*frame)
+
+		// Symmetry hook with CallMedia.writeLoop; always LE (no-op) unless a
+		// caller ignored AudioSocketConfig.ToWire's contract.
+		FromLE(*frame, c.toWire)
 
 		err := WriteAudioSocketFrame(c.conn, AudioSocketKindSlin16, *frame)
 

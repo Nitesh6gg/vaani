@@ -116,6 +116,95 @@ func TestCallMedia_EndToEndLoopback(t *testing.T) {
 	}
 }
 
+// TestCallMedia_ToWireBigEndianSwapsOutboundPayload proves the outbound
+// endianness hook end to end: with ToWire=BigEndian (a deployment that verified
+// AUDIO_L16_ENDIANNESS=be), the RTP payload actually put on the wire must be
+// pairwise byte-swapped relative to the handler's LE output -- Asterisk's
+// externalMedia L16 is symmetric, so without this swap the caller would hear
+// byte-swapped noise while the local WAV (recorded pre-swap) sounds fine.
+func TestCallMedia_ToWireBigEndianSwapsOutboundPayload(t *testing.T) {
+	serverConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+
+	clientConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	defer func() { _ = clientConn.Close() }()
+
+	cm := NewCallMedia("towire-call", serverConn, &fakeCallSink{}, Config{
+		JitterBufferPackets: 3,
+		FromWire:            LittleEndian,
+		ToWire:              BigEndian,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+
+	go func() {
+		cm.Run(ctx)
+		close(runDone)
+	}()
+
+	serverAddr := serverConn.LocalAddr().(*net.UDPAddr)
+	sender := NewSender()
+
+	payload := make([]byte, FrameSize)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+
+	for seq := 0; seq < 6; seq++ {
+		pkt := sender.Build(payload)
+
+		out, err := pkt.Marshal()
+		require.NoError(t, err)
+
+		_, err = clientConn.WriteToUDP(out, serverAddr)
+		require.NoError(t, err)
+
+		time.Sleep(FrameInterval)
+	}
+
+	require.NoError(t, clientConn.SetReadDeadline(time.Now().Add(2*time.Second)))
+
+	sawSwappedAudio := false
+	buf := make([]byte, 1500)
+
+	for i := 0; i < 20; i++ {
+		n, _, err := clientConn.ReadFromUDP(buf)
+		if err != nil {
+			break
+		}
+
+		pkt, err := ParseRTP(buf[:n])
+		if err != nil || len(pkt.Payload) != FrameSize {
+			continue
+		}
+
+		swapped := true
+		for j := 0; j+1 < len(pkt.Payload); j += 2 {
+			if pkt.Payload[j] != payload[j+1] || pkt.Payload[j+1] != payload[j] {
+				swapped = false
+				break
+			}
+		}
+
+		if swapped && pkt.Payload[0] != payload[0] {
+			sawSwappedAudio = true
+			break
+		}
+	}
+
+	assert.True(t, sawSwappedAudio, "the echoed RTP payload must be pairwise byte-swapped on the wire under ToWire=BigEndian")
+
+	cancel()
+
+	select {
+	case <-runDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("CallMedia.Run did not return promptly after context cancellation")
+	}
+}
+
 // TestCallMedia_DebugAudioPublishesToTap proves the DEBUG_AUDIO wiring end to
 // end: with Config.DebugAudio set, a live tap is registered under the call ID,
 // real inbound audio is published to it as the call runs, and it's unregistered

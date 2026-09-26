@@ -77,6 +77,54 @@ func TestNormalizeToLE_OddTrailingByteLeftAlone(t *testing.T) {
 	assert.Equal(t, byte(0x03), pcm[2], "trailing unpaired byte must be left untouched")
 }
 
+func TestFromLE(t *testing.T) {
+	le := sineLE(440, 320, SampleRate)
+
+	cases := []struct {
+		name string
+		to   Endianness
+		want []byte // expected result of FromLE(leCopy, to)
+	}{
+		{
+			name: "little endian is a no-op",
+			to:   LittleEndian,
+			want: le,
+		},
+		{
+			name: "big endian swaps every sample pair",
+			to:   BigEndian,
+			want: func() []byte {
+				be := make([]byte, len(le))
+				for i := 0; i+1 < len(le); i += 2 {
+					sample := binary.LittleEndian.Uint16(le[i:])
+					binary.BigEndian.PutUint16(be[i:], sample)
+				}
+				return be
+			}(),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pcm := append([]byte(nil), le...)
+			FromLE(pcm, tc.to)
+			assert.Equal(t, tc.want, pcm)
+
+			// And the exact inverse: what NormalizeToLE converts in,
+			// FromLE must convert back out.
+			roundTrip := append([]byte(nil), tc.want...)
+			NormalizeToLE(roundTrip, tc.to)
+			assert.Equal(t, le, roundTrip, "FromLE must invert NormalizeToLE")
+		})
+	}
+}
+
+func TestFromLE_OddTrailingByteLeftAlone(t *testing.T) {
+	pcm := []byte{0x01, 0x02, 0x03}
+
+	assert.NotPanics(t, func() { FromLE(pcm, BigEndian) })
+	assert.Equal(t, byte(0x03), pcm[2], "trailing unpaired byte must be left untouched")
+}
+
 func TestWarnIfUnset_LogsWhenEnvVarAbsent(t *testing.T) {
 	restoreLogger := captureSlog(t)
 

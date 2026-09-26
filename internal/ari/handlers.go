@@ -527,10 +527,15 @@ func (m *Manager) startRTPMedia(c *call) {
 	c.cm = media.NewCallMedia(c.ID, c.udpConn, metrics.Sink{}, media.Config{
 		JitterBufferPackets: m.cfg.JitterBufferPackets,
 		FromWire:            fromWire,
-		RecordDir:           m.cfg.RecordDir,
-		Handler:             m.mediaHandler(c.Ctx, c.ID),
-		DebugAudio:          m.cfg.DebugAudio,
-		MediaDeadTimeout:    m.cfg.MediaDeadTimeout,
+		// The verified inbound order is also the outbound order: Asterisk's
+		// externalMedia RTP L16 is symmetric, so a "be" deployment must swap
+		// handler output (LE by contract) back to BE on the way out too, or
+		// the caller hears byte-swapped noise while the WAV sounds fine.
+		ToWire:           fromWire,
+		RecordDir:        m.cfg.RecordDir,
+		Handler:          m.mediaHandler(c.Ctx, c.ID),
+		DebugAudio:       m.cfg.DebugAudio,
+		MediaDeadTimeout: m.cfg.MediaDeadTimeout,
 	})
 
 	c.SetState(session.StateMediaActive)
@@ -591,6 +596,7 @@ func (m *Manager) startAudioSocketMedia(c *call) {
 	c.asm = media.NewAudioSocketCallMedia(c.ID, conn, metrics.AudioSocketSink{}, media.AudioSocketConfig{
 		RecordDir:        m.cfg.RecordDir,
 		Handler:          m.mediaHandler(c.Ctx, c.ID),
+		ToWire:           media.LittleEndian, // AudioSocket payload is LE by protocol; see AudioSocketConfig.ToWire
 		DebugAudio:       m.cfg.DebugAudio,
 		MediaDeadTimeout: m.cfg.MediaDeadTimeout,
 	})

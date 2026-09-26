@@ -60,3 +60,19 @@ func NormalizeToLE(pcm []byte, from Endianness) {
 		pcm[i], pcm[i+1] = pcm[i+1], pcm[i]
 	}
 }
+
+// FromLE rewrites pcm in place from the Handler contract's little-endian byte
+// order into `to`, for audio headed back out onto the wire -- the exact inverse
+// of NormalizeToLE. Zero cost when to is already LittleEndian (AudioSocket's
+// payload is LE by protocol definition, so only the RTP path ever sets
+// BigEndian here). A trailing odd byte is left untouched rather than panicking.
+func FromLE(pcm []byte, to Endianness) {
+	if to == LittleEndian {
+		return
+	}
+
+	n := len(pcm) - (len(pcm) % 2)
+	for i := 0; i < n; i += 2 {
+		pcm[i], pcm[i+1] = pcm[i+1], pcm[i]
+	}
+}
