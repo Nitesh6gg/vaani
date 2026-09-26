@@ -74,7 +74,9 @@ type Config struct {
 	STT stt.Client
 	// NewTTS is a factory, not a live client: the TTS connection is billed on
 	// open (docs/AI_PROVIDERS.md), so it must open lazily at the first
-	// THINKING transition, never at call start.
+	// THINKING transition, never at call start. It is called at most once per
+	// call: the resulting Client is reused across every turn (see
+	// tts.Client's doc comment) and only replaced if a barge-in cancels it.
 	NewTTS       func() (tts.Client, error)
 	LLM          llmStreamer
 	SystemPrompt string
@@ -95,8 +97,11 @@ type Config struct {
 
 type finalTranscriptEvent struct{ text string }
 type llmDoneEvent struct{ err error }
-type ttsAudioEvent struct{ pcm []byte }
-type ttsDoneEvent struct{}
+type ttsAudioEvent struct {
+	pcm []byte
+	gen uint64
+}
+type ttsDoneEvent struct{ gen uint64 }
 type bargeInEvent struct{}
 
 // Handler implements media.Handler: Sarvam STT -> LLM -> Sarvam TTS with local
@@ -128,6 +133,13 @@ type Handler struct {
 	turnCancel context.CancelFunc
 	history    []llm.Message
 	ttsBuf     []byte
+	// curGen increments once per turn. Every Speak call and every inbound
+	// ttsAudioEvent/ttsDoneEvent is tagged with the generation active when it
+	// was created; handlers drop anything that doesn't match curGen, which is
+	// what makes a barge-in's stale, already-in-flight TTS audio harmless even
+	// though the connection itself is reused across turns (see tts.Client's
+	// doc comment).
+	curGen uint64
 
 	// ProcessFrame-goroutine-owned only.
 	preroll [][]byte
@@ -297,9 +309,9 @@ func (h *Handler) handleEvent(ev any) {
 	case llmDoneEvent:
 		h.handleLLMDone(e.err)
 	case ttsAudioEvent:
-		h.handleTTSAudio(e.pcm)
+		h.handleTTSAudio(e.pcm, e.gen)
 	case ttsDoneEvent:
-		h.handleTTSDone()
+		h.handleTTSDone(e.gen)
 	case bargeInEvent:
 		h.handleBargeIn()
 	}
@@ -320,6 +332,9 @@ func (h *Handler) handleFinalTranscript(text string) {
 	h.history = append(h.history, llm.Message{Role: "user", Content: text})
 	h.cfg.Sink.TurnStarted()
 
+	h.curGen++
+	gen := h.curGen
+
 	if h.tts == nil {
 		t, err := h.cfg.NewTTS()
 		if err != nil {
@@ -339,27 +354,34 @@ func (h *Handler) handleFinalTranscript(text string) {
 
 	history := append([]llm.Message(nil), h.history...)
 
-	go h.runLLMTurn(ctx, history, h.tts)
+	go h.runLLMTurn(ctx, history, h.tts, gen)
 }
 
-func (h *Handler) runLLMTurn(ctx context.Context, history []llm.Message, ttsClient tts.Client) {
+func (h *Handler) runLLMTurn(ctx context.Context, history []llm.Message, ttsClient tts.Client, gen uint64) {
 	chunker := &SentenceChunker{}
 
 	err := h.cfg.LLM.Stream(ctx, history, func(tok string) {
 		for _, chunk := range chunker.Feed(tok) {
-			h.sendToTTS(ttsClient, chunk)
+			h.sendToTTS(ttsClient, chunk, gen)
 		}
 	})
 
 	if ctx.Err() != nil {
-		return // cancelled by barge-in or call teardown; turn abandoned
+		// Cancelled by barge-in or call teardown; a barge-in already called
+		// Cancel on this exact ttsClient, so no further Speak calls for gen
+		// are possible and there's nothing to end.
+		return
 	}
 
 	if err == nil {
 		if remainder := chunker.Flush(); remainder != "" {
-			h.sendToTTS(ttsClient, remainder)
+			h.sendToTTS(ttsClient, remainder, gen)
 		}
 	}
+
+	// No further Speak(gen) calls are coming. ttsClient.Done() will yield gen
+	// once its audio (if any was sent at all) has fully arrived.
+	ttsClient.EndGeneration(gen)
 
 	select {
 	case h.events <- llmDoneEvent{err: err}:
@@ -367,8 +389,8 @@ func (h *Handler) runLLMTurn(ctx context.Context, history []llm.Message, ttsClie
 	}
 }
 
-func (h *Handler) sendToTTS(ttsClient tts.Client, text string) {
-	if err := ttsClient.Speak(text); err != nil {
+func (h *Handler) sendToTTS(ttsClient tts.Client, text string, gen uint64) {
+	if err := ttsClient.Speak(text, gen); err != nil {
 		h.cfg.Sink.Error("tts_speak")
 		return
 	}
@@ -378,23 +400,42 @@ func (h *Handler) sendToTTS(ttsClient tts.Client, text string) {
 	}
 }
 
+// readTTS drains ttsClient's Audio and Done channels for as long as either
+// still has values to deliver -- including whatever was already buffered
+// before the connection closed -- then returns once both are closed. One
+// instance runs per tts.Client (i.e. per call, not per turn): setting a
+// closed channel's local variable to nil makes that select case block
+// forever without spinning, so the other channel keeps draining normally
+// until it closes too.
 func (h *Handler) readTTS(ttsClient tts.Client) {
-	for {
+	audioCh := ttsClient.Audio()
+	doneCh := ttsClient.Done()
+
+	for audioCh != nil || doneCh != nil {
 		select {
 		case <-h.baseCtx.Done():
 			return
-		case pcm, ok := <-ttsClient.Audio():
-			if !ok {
-				select {
-				case h.events <- ttsDoneEvent{}:
-				case <-h.baseCtx.Done():
-				}
 
-				return
+		case chunk, ok := <-audioCh:
+			if !ok {
+				audioCh = nil
+				continue
 			}
 
 			select {
-			case h.events <- ttsAudioEvent{pcm: pcm}:
+			case h.events <- ttsAudioEvent{pcm: chunk.PCM, gen: chunk.Gen}:
+			case <-h.baseCtx.Done():
+				return
+			}
+
+		case gen, ok := <-doneCh:
+			if !ok {
+				doneCh = nil
+				continue
+			}
+
+			select {
+			case h.events <- ttsDoneEvent{gen: gen}:
 			case <-h.baseCtx.Done():
 				return
 			}
@@ -412,7 +453,11 @@ func (h *Handler) readTTS(ttsClient tts.Client) {
 // less frequent), and CallMedia's own releaseLoop copies whatever ProcessFrame
 // returns into a pooled buffer anyway. Move to the pool if profiling ever
 // shows this matters.
-func (h *Handler) handleTTSAudio(pcm []byte) {
+func (h *Handler) handleTTSAudio(pcm []byte, gen uint64) {
+	if gen != h.curGen {
+		return // stale generation from an interrupted turn -- drop it
+	}
+
 	h.ttsBuf = append(h.ttsBuf, pcm...)
 
 	for len(h.ttsBuf) >= media.FrameSize {
@@ -428,7 +473,11 @@ func (h *Handler) handleTTSAudio(pcm []byte) {
 	}
 }
 
-func (h *Handler) handleTTSDone() {
+func (h *Handler) handleTTSDone(gen uint64) {
+	if gen != h.curGen {
+		return // a barge-in already moved past this generation
+	}
+
 	// Only move back to Listening if still in this turn's Speaking/Thinking
 	// state -- a barge-in may have already advanced us to Transcribing, and
 	// this must not stomp on that.
@@ -437,36 +486,20 @@ func (h *Handler) handleTTSDone() {
 		h.state.Store(int32(StateListening))
 	}
 
-	h.tts = nil // ready to lazily reopen next turn
 	h.ttsBuf = nil
+	// h.tts is deliberately left connected -- it's reused for the next turn
+	// rather than reopened (see tts.Client's doc comment).
 }
 
 func (h *Handler) handleLLMDone(err error) {
 	if err != nil {
 		h.cfg.Sink.Error("llm")
 	}
-
-	if h.tts == nil {
-		if State(h.state.Load()) == StateThinking {
-			// No TTS was ever opened this turn (LLM produced nothing, or
-			// failed before any chunk was sent) -- nothing to wait for.
-			h.state.Store(int32(StateListening))
-		}
-
-		return
-	}
-
-	// The turn's text is fully generated, so no further Speak calls are
-	// coming on this connection -- request a graceful close. tts.Client.Close
-	// waits for any already-issued Speak calls' audio to finish arriving
-	// before actually closing, so this does not cut off the tail of the
-	// reply; Audio() closing afterward is what fires handleTTSDone and moves
-	// the state back to Listening once playback has genuinely finished.
-	// Without this call nothing ever closes the connection on a normal,
-	// uninterrupted turn, and the handler would stay stuck past SPEAKING.
-	if err := h.tts.Close(); err != nil {
-		h.cfg.Sink.Error("tts_close")
-	}
+	// The Listening transition happens via handleTTSDone once ttsClient.Done
+	// yields this turn's generation -- EndGeneration (called by runLLMTurn
+	// right before this event is sent) fires that immediately when the LLM
+	// produced no output at all, so there's no separate "nothing was spoken"
+	// case to handle here.
 }
 
 func (h *Handler) handleBargeIn() {
@@ -475,11 +508,17 @@ func (h *Handler) handleBargeIn() {
 		h.turnCancel = nil
 	}
 
+	h.curGen++ // invalidate the interrupted turn's in-flight audio/done events
+
 	if h.tts != nil {
 		if err := h.tts.Cancel(); err != nil {
 			h.cfg.Sink.Error("tts_cancel")
 		}
+
+		h.tts = nil // reopen fresh next turn; this connection is being torn down
 	}
+
+	h.ttsBuf = nil
 
 	for {
 		select {

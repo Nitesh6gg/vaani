@@ -36,6 +36,10 @@ func wsURL(httpURL string) string {
 	return "ws" + strings.TrimPrefix(httpURL, "http")
 }
 
+func sendFinal(conn *websocket.Conn) error {
+	return conn.WriteJSON(map[string]any{"type": "event", "data": map[string]any{"event_type": "final"}})
+}
+
 func TestSarvamClient_DialRequestsCompletionEventAndModel(t *testing.T) {
 	gotQuery := make(chan map[string][]string, 1)
 	gotKey := make(chan string, 1)
@@ -130,7 +134,7 @@ func TestSarvamClient_SpeakSendsTextThenFlush(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = c.Close() }()
 
-	require.NoError(t, c.Speak("hello there"))
+	require.NoError(t, c.Speak("hello there", 1))
 
 	m1 := <-msgs
 	assert.Equal(t, "text", m1["type"])
@@ -150,14 +154,16 @@ func TestSarvamClient_SpeakEmptyTextIsNoop(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = c.Close() }()
 
-	assert.NoError(t, c.Speak(""))
+	assert.NoError(t, c.Speak("", 1))
 }
 
-func TestSarvamClient_AudioEventDeliversDecodedPCM(t *testing.T) {
+func TestSarvamClient_AudioEventTaggedWithOutstandingGeneration(t *testing.T) {
 	payload := []byte{10, 20, 30, 40}
 
 	srv := ttsServer(t, func(conn *websocket.Conn, r *http.Request) {
 		_, _, _ = conn.ReadMessage() // config
+		_, _, _ = conn.ReadMessage() // text
+		_, _, _ = conn.ReadMessage() // flush
 		_ = conn.WriteJSON(map[string]any{
 			"type": "audio",
 			"data": map[string]any{"audio": base64.StdEncoding.EncodeToString(payload)},
@@ -168,15 +174,18 @@ func TestSarvamClient_AudioEventDeliversDecodedPCM(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = c.Close() }()
 
+	require.NoError(t, c.Speak("hello", 42))
+
 	select {
 	case chunk := <-c.Audio():
-		assert.Equal(t, payload, chunk)
+		assert.Equal(t, payload, chunk.PCM)
+		assert.Equal(t, uint64(42), chunk.Gen)
 	case <-time.After(time.Second):
 		t.Fatal("no audio chunk received")
 	}
 }
 
-func TestSarvamClient_CloseWaitsForPendingFlushBeforeClosingAudio(t *testing.T) {
+func TestSarvamClient_DoneFiresOnceItsFinalArrives(t *testing.T) {
 	finalNow := make(chan struct{})
 
 	srv := ttsServer(t, func(conn *websocket.Conn, r *http.Request) {
@@ -184,79 +193,116 @@ func TestSarvamClient_CloseWaitsForPendingFlushBeforeClosingAudio(t *testing.T) 
 		_, _, _ = conn.ReadMessage() // text
 		_, _, _ = conn.ReadMessage() // flush
 		<-finalNow
-		_ = conn.WriteJSON(map[string]any{"type": "event", "data": map[string]any{"event_type": "final"}})
+		_ = sendFinal(conn)
 	})
 
 	c, err := NewSarvamClient(context.Background(), "call1", Config{WSURL: wsURL(srv.URL), APIKey: "k", Model: "bulbul:v3", Voice: "shubh"})
 	require.NoError(t, err)
+	defer func() { _ = c.Close() }()
 
-	require.NoError(t, c.Speak("one sentence"))
-
-	// Close itself is non-blocking -- it schedules the eventual shutdown
-	// rather than waiting here. What must hold is that Audio() doesn't close
-	// until the outstanding flush's final actually arrives.
-	require.NoError(t, c.Close())
+	require.NoError(t, c.Speak("one sentence", 7))
+	c.EndGeneration(7)
 
 	select {
-	case _, open := <-c.Audio():
-		if !open {
-			t.Fatal("Audio() closed before the outstanding flush's final event arrived")
-		}
+	case <-c.Done():
+		t.Fatal("Done fired before the outstanding flush's final event arrived")
 	case <-time.After(50 * time.Millisecond):
-		// No audio chunk and channel still open -- expected, nothing sent yet.
 	}
 
-	close(finalNow) // let the server send "final" now
+	close(finalNow)
 
-	require.Eventually(t, func() bool {
-		select {
-		case _, open := <-c.Audio():
-			return !open
-		default:
-			return false
-		}
-	}, time.Second, 5*time.Millisecond, "Audio() must close once the pending flush's final arrives and Close was requested")
+	select {
+	case gen := <-c.Done():
+		assert.Equal(t, uint64(7), gen)
+	case <-time.After(time.Second):
+		t.Fatal("Done never fired after the final event arrived")
+	}
 }
 
-func TestSarvamClient_MultipleSpeaksOnlyCloseAfterAllFinals(t *testing.T) {
-	sendFinal := make(chan struct{}, 2)
+func TestSarvamClient_EndGenerationWithNoSpeakCallsFiresDoneImmediately(t *testing.T) {
+	srv := ttsServer(t, func(conn *websocket.Conn, r *http.Request) {
+		_, _, _ = conn.ReadMessage() // config
+	})
+
+	c, err := NewSarvamClient(context.Background(), "call1", Config{WSURL: wsURL(srv.URL), APIKey: "k", Model: "bulbul:v3", Voice: "shubh"})
+	require.NoError(t, err)
+	defer func() { _ = c.Close() }()
+
+	c.EndGeneration(3) // an LLM turn that produced no text at all
+
+	select {
+	case gen := <-c.Done():
+		assert.Equal(t, uint64(3), gen)
+	case <-time.After(time.Second):
+		t.Fatal("Done never fired for a generation with no outstanding Speak calls")
+	}
+}
+
+func TestSarvamClient_MultipleSpeaksOnlyDoneAfterAllFinalsForThatGeneration(t *testing.T) {
+	sendFinalNow := make(chan struct{}, 2)
 
 	srv := ttsServer(t, func(conn *websocket.Conn, r *http.Request) {
 		_, _, _ = conn.ReadMessage() // config
 		for i := 0; i < 2; i++ {
 			_, _, _ = conn.ReadMessage() // text
 			_, _, _ = conn.ReadMessage() // flush
-			<-sendFinal
-			_ = conn.WriteJSON(map[string]any{"type": "event", "data": map[string]any{"event_type": "final"}})
+			<-sendFinalNow
+			_ = sendFinal(conn)
 		}
 	})
 
 	c, err := NewSarvamClient(context.Background(), "call1", Config{WSURL: wsURL(srv.URL), APIKey: "k", Model: "bulbul:v3", Voice: "shubh"})
 	require.NoError(t, err)
+	defer func() { _ = c.Close() }()
 
-	require.NoError(t, c.Speak("sentence one"))
-	require.NoError(t, c.Speak("sentence two"))
-	require.NoError(t, c.Close())
+	require.NoError(t, c.Speak("sentence one", 5))
+	require.NoError(t, c.Speak("sentence two", 5))
+	c.EndGeneration(5)
 
-	sendFinal <- struct{}{} // first sentence's final
+	sendFinalNow <- struct{}{} // first sentence's final
 
-	// Still one pending flush -- Audio() must not have closed yet.
 	select {
-	case _, open := <-c.Audio():
-		assert.True(t, open, "Audio() closed after only one of two pending finals arrived")
+	case <-c.Done():
+		t.Fatal("Done fired after only one of two pending finals arrived")
 	case <-time.After(100 * time.Millisecond):
 	}
 
-	sendFinal <- struct{}{} // second sentence's final
+	sendFinalNow <- struct{}{} // second sentence's final
 
-	require.Eventually(t, func() bool {
-		select {
-		case _, open := <-c.Audio():
-			return !open
-		default:
-			return false
+	select {
+	case gen := <-c.Done():
+		assert.Equal(t, uint64(5), gen)
+	case <-time.After(time.Second):
+		t.Fatal("Done never fired once both finals arrived")
+	}
+}
+
+func TestSarvamClient_ReusedAcrossTurnsSecondSpeakUsesSameConnection(t *testing.T) {
+	connCount := make(chan struct{}, 4)
+
+	srv := ttsServer(t, func(conn *websocket.Conn, r *http.Request) {
+		connCount <- struct{}{}
+		_, _, _ = conn.ReadMessage() // config
+		for i := 0; i < 2; i++ {
+			_, _, _ = conn.ReadMessage() // text
+			_, _, _ = conn.ReadMessage() // flush
+			_ = sendFinal(conn)
 		}
-	}, time.Second, 5*time.Millisecond)
+	})
+
+	c, err := NewSarvamClient(context.Background(), "call1", Config{WSURL: wsURL(srv.URL), APIKey: "k", Model: "bulbul:v3", Voice: "shubh"})
+	require.NoError(t, err)
+	defer func() { _ = c.Close() }()
+
+	require.NoError(t, c.Speak("turn one", 1))
+	c.EndGeneration(1)
+	<-c.Done() // wait for the first turn's flush+final round trip
+
+	require.NoError(t, c.Speak("turn two", 2))
+	c.EndGeneration(2)
+	<-c.Done()
+
+	assert.Len(t, connCount, 1, "a second Speak call on the same Client must not open a new connection")
 }
 
 func TestSarvamClient_CancelClosesImmediatelyRegardlessOfPending(t *testing.T) {
@@ -271,7 +317,7 @@ func TestSarvamClient_CancelClosesImmediatelyRegardlessOfPending(t *testing.T) {
 	c, err := NewSarvamClient(context.Background(), "call1", Config{WSURL: wsURL(srv.URL), APIKey: "k", Model: "bulbul:v3", Voice: "shubh"})
 	require.NoError(t, err)
 
-	require.NoError(t, c.Speak("interrupted mid-flight"))
+	require.NoError(t, c.Speak("interrupted mid-flight", 1))
 	require.NoError(t, c.Cancel())
 
 	require.Eventually(t, func() bool {

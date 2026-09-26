@@ -58,30 +58,48 @@ func (f *fakeSTT) fedCount() int {
 
 func (f *fakeSTT) sendFinal(text string) { f.results <- stt.Result{Text: text, Final: true} }
 
-// fakeTTS records Speak/Cancel calls and lets a test control audio output.
+// fakeTTS records Speak/Cancel calls and lets a test control audio/done
+// output. It mirrors the real client's call-scoped, reused-across-turns
+// design: Audio and Done only close on Cancel/Close (connection torn down for
+// good), never between turns -- a test signals one turn's completion by
+// sending its generation on the done channel, not by closing anything.
 type fakeTTS struct {
-	mu        sync.Mutex
-	spoken    []string
-	cancelled bool
-	audio     chan []byte
-	closed    bool
+	mu         sync.Mutex
+	spoken     []string
+	spokenGens []uint64
+	ended      []uint64
+	cancelled  bool
+	audio      chan tts.Chunk
+	done       chan uint64
+	closed     bool
 }
 
-func newFakeTTS() *fakeTTS { return &fakeTTS{audio: make(chan []byte, 16)} }
+func newFakeTTS() *fakeTTS {
+	return &fakeTTS{audio: make(chan tts.Chunk, 16), done: make(chan uint64, 16)}
+}
 
-func (f *fakeTTS) Speak(text string) error {
+func (f *fakeTTS) Speak(text string, gen uint64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	f.spoken = append(f.spoken, text)
+	f.spokenGens = append(f.spokenGens, gen)
 
 	return nil
 }
 
-func (f *fakeTTS) Audio() <-chan []byte { return f.audio }
+func (f *fakeTTS) EndGeneration(gen uint64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.ended = append(f.ended, gen)
+}
+
+func (f *fakeTTS) Audio() <-chan tts.Chunk { return f.audio }
+func (f *fakeTTS) Done() <-chan uint64     { return f.done }
 
 // Cancel matches the real client's immediate-close semantics (barge-in cut
-// #2): it closes Audio() right away, discarding anything in flight.
+// #2): it closes Audio()/Done() right away, discarding anything in flight.
 func (f *fakeTTS) Cancel() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -90,20 +108,26 @@ func (f *fakeTTS) Cancel() error {
 
 	if !f.closed {
 		close(f.audio)
+		close(f.done)
 		f.closed = true
 	}
 
 	return nil
 }
 
-// Close is a graceful-shutdown request, matching the real client: it must not
-// cut off audio a test is still expecting to arrive over Audio(). Real
-// sarvamClient waits for outstanding Speak calls' "final" events before
-// actually closing; this fake has no such bookkeeping; tests that need
-// Audio() to close (to observe Handler's transition back to Listening) do so
-// explicitly with their own close(fTTS.audio) once they're done pushing
-// frames, so Close intentionally does nothing to the channel here.
+// Close matches the real client's call-teardown semantics: unlike Cancel it's
+// only ever invoked once, from run()'s ctx.Done() path, so an immediate close
+// here is safe.
 func (f *fakeTTS) Close() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if !f.closed {
+		close(f.audio)
+		close(f.done)
+		f.closed = true
+	}
+
 	return nil
 }
 
@@ -176,7 +200,9 @@ func TestHandler_FullTurnEndToEnd(t *testing.T) {
 	require.Eventually(t, func() bool { return fTTS.spokenCount() > 0 }, time.Second, time.Millisecond)
 	require.Eventually(t, func() bool { return h.State() == StateSpeaking }, time.Second, time.Millisecond)
 
-	fTTS.audio <- constFrame(loudAmplitude)
+	const gen = 1 // this is the handler's first-ever turn
+
+	fTTS.audio <- tts.Chunk{PCM: constFrame(loudAmplitude), Gen: gen}
 
 	var gotFrame []byte
 
@@ -192,7 +218,7 @@ func TestHandler_FullTurnEndToEnd(t *testing.T) {
 
 	assert.Len(t, gotFrame, 640)
 
-	close(fTTS.audio)
+	fTTS.done <- gen
 
 	require.Eventually(t, func() bool { return h.State() == StateListening }, time.Second, time.Millisecond)
 }

@@ -8,37 +8,60 @@
 // where each was confirmed against the real API.
 package tts
 
+// Chunk is one piece of decoded PCM, tagged with the generation number the
+// caller passed to the Speak call that produced it. A caller tracking "the
+// current generation" can drop any Chunk whose Gen doesn't match, discarding
+// audio left over from an interrupted turn no matter when it arrives --
+// necessary because the connection is reused across many turns (see Client's
+// doc comment) and the provider has no per-request cancel.
+type Chunk struct {
+	PCM []byte
+	Gen uint64
+}
+
 // Client streams text in and receives synthesized 16kHz LE PCM16 audio back.
-// Billing note (docs/AI_PROVIDERS.md): the connection is charged on open, so
-// callers open it lazily (first THINKING transition, not at call start) --
-// see AgentHandler.Config.NewTTS. Vaani opens one Client per turn rather than
-// reusing one across a whole call: Sarvam's connection has no per-request
-// cancel, so a reused connection can deliver an interrupted turn's stale audio
-// into a later turn (a sibling project's docs/DECISIONS.md ADR-015 hit this
-// live and fixed it with generation-tagging); a fresh per-turn connection has
-// no later turn for stale audio to leak into in the first place.
+//
+// One Client is opened lazily per call (first THINKING transition, never at
+// call start -- the connection is billed on open, per docs/AI_PROVIDERS.md)
+// and reused across every turn in that call, not reopened per turn: a fresh
+// WebSocket handshake on every reply would add real, recurring latency
+// against the TTFA budget, and -- since the connection is what's billed --
+// multiply the connection charge by the number of turns instead of paying it
+// once per call. This matches a sibling project's live-verified design
+// (D:\go-agent-worker's internal/tts), which reuses one connection for a
+// whole call and solves the resulting problem -- the provider has no
+// per-request cancel, so a request abandoned by a barge-in can still deliver
+// its audio after a newer turn has started -- with generation tagging
+// (docs/DECISIONS.md ADR-015): every Chunk and Done signal carries the
+// generation of the Speak call that produced it, so a caller only has to
+// compare against its own current generation, never guess from timing.
 type Client interface {
-	// Speak sends one text chunk (one SentenceChunker flush) to synthesize.
-	// May be called more than once per turn (once per chunker flush); all
-	// calls share this one connection/turn.
-	Speak(text string) error
-	// Audio returns the channel of raw PCM byte chunks as they arrive. Chunks
-	// are not necessarily frame-aligned; the caller re-slices them to 640-byte
-	// frames. Closed when the connection ends (via Cancel, or via Close once
-	// every outstanding Speak call's audio has fully arrived).
-	Audio() <-chan []byte
+	// Speak sends one text chunk (one SentenceChunker flush) to synthesize,
+	// tagged with gen. May be called more than once per turn (once per
+	// chunker flush) and across many turns on this one connection; each
+	// call's audio and completion are identified by gen, not by connection
+	// state.
+	Speak(text string, gen uint64) error
+	// EndGeneration signals that no further Speak calls will be made for gen
+	// (the turn's LLM stream is done producing text). Once every Speak(gen)
+	// call's audio has fully arrived, gen is emitted on Done -- including
+	// immediately, if no Speak call for gen was ever made (an LLM turn that
+	// produced no output).
+	EndGeneration(gen uint64)
+	// Audio returns the channel of decoded PCM chunks as they arrive, each
+	// tagged with its originating generation. Chunks are not necessarily
+	// frame-aligned; the caller re-slices them to 640-byte frames. Closed
+	// when the connection ends for good (Cancel or Close), not between turns.
+	Audio() <-chan Chunk
+	// Done yields a generation once its audio is fully delivered (see
+	// EndGeneration). Closed alongside Audio when the connection ends.
+	Done() <-chan uint64
 	// Cancel closes the connection immediately, discarding any outstanding
-	// Speak calls' in-flight audio -- barge-in's cut #2. Sarvam has no
-	// per-request cancel message, so this is the only way to stop it: closing
-	// the connection removes any chance of stale audio arriving after the
-	// fact, rather than waiting on Sarvam's own end-of-request signal (see
-	// sarvam.go's doc comment for why that signal alone isn't fast enough).
+	// generations' in-flight audio -- barge-in's cut #2. The provider has no
+	// per-request cancel message, so this is the only way to stop it. The
+	// caller is expected to open a fresh Client for the next turn.
 	Cancel() error
-	// Close requests a graceful shutdown: no further Speak calls are expected
-	// (the turn's LLM stream is done), but audio for already-issued Speak
-	// calls is still in flight and must be allowed to finish arriving over
-	// Audio() before the connection actually closes -- otherwise the tail of
-	// the reply gets cut off.
+	// Close ends the connection for good (call teardown).
 	Close() error
 }
 
