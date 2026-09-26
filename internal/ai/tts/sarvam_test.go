@@ -157,6 +157,48 @@ func TestSarvamClient_SpeakEmptyTextIsNoop(t *testing.T) {
 	assert.NoError(t, c.Speak("", 1))
 }
 
+func TestSarvamClient_SpeakWhitespaceOnlyTextIsNoop(t *testing.T) {
+	srv := ttsServer(t, func(conn *websocket.Conn, r *http.Request) {
+		_, _, _ = conn.ReadMessage() // config
+	})
+
+	c, err := NewSarvamClient(context.Background(), "call1", Config{WSURL: wsURL(srv.URL), APIKey: "k", Model: "bulbul:v3", Voice: "shubh"})
+	require.NoError(t, err)
+	defer func() { _ = c.Close() }()
+
+	// SentenceChunker treats "\n" as a sentence delimiter, so a bare newline
+	// can reach Speak as a "complete sentence" -- Sarvam rejects it server-side
+	// (400: 'text' cannot be empty) if it's ever actually sent.
+	assert.NoError(t, c.Speak("\n", 1))
+	assert.NoError(t, c.Speak("   ", 1))
+}
+
+func TestSarvamClient_ProviderErrorResolvesPendingRequestLikeAFinal(t *testing.T) {
+	srv := ttsServer(t, func(conn *websocket.Conn, r *http.Request) {
+		_, _, _ = conn.ReadMessage() // config
+		_, _, _ = conn.ReadMessage() // text
+		_, _, _ = conn.ReadMessage() // flush
+		_ = conn.WriteJSON(map[string]any{
+			"type": "error",
+			"data": map[string]any{"message": "400: 'text' cannot be empty"},
+		})
+	})
+
+	c, err := NewSarvamClient(context.Background(), "call1", Config{WSURL: wsURL(srv.URL), APIKey: "k", Model: "bulbul:v3", Voice: "shubh"})
+	require.NoError(t, err)
+	defer func() { _ = c.Close() }()
+
+	require.NoError(t, c.Speak("some text", 9))
+	c.EndGeneration(9)
+
+	select {
+	case gen := <-c.Done():
+		assert.Equal(t, uint64(9), gen, "an error response must resolve its request, or Done never fires and the call wedges")
+	case <-time.After(time.Second):
+		t.Fatal("Done never fired after a provider error -- pendingGens entry leaked")
+	}
+}
+
 func TestSarvamClient_AudioEventTaggedWithOutstandingGeneration(t *testing.T) {
 	payload := []byte{10, 20, 30, 40}
 

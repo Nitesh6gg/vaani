@@ -140,6 +140,13 @@ type Handler struct {
 	// though the connection itself is reused across turns (see tts.Client's
 	// doc comment).
 	curGen uint64
+	// turnStartedAt/ttfaLoggedGen are run()-owned bookkeeping for the per-turn
+	// latency logs (handleFinalTranscript/handleTTSAudio/handleTTSDone):
+	// turnStartedAt marks when the current generation's transcript was
+	// accepted, and ttfaLoggedGen records which generation's first TTS audio
+	// chunk has already been logged, so repeat chunks don't repeat the log.
+	turnStartedAt time.Time
+	ttfaLoggedGen uint64
 
 	// ProcessFrame-goroutine-owned only.
 	preroll [][]byte
@@ -334,12 +341,16 @@ func (h *Handler) handleFinalTranscript(text string) {
 
 	h.curGen++
 	gen := h.curGen
+	h.turnStartedAt = time.Now()
+
+	slog.Info("stt final transcript", "call_id", h.callID, "gen", gen, "text", text)
 
 	if h.tts == nil {
 		t, err := h.cfg.NewTTS()
 		if err != nil {
 			h.cfg.Sink.Error("tts_open")
 			h.state.Store(int32(StateListening))
+			slog.Error("tts open failed", "call_id", h.callID, "gen", gen, "error", err)
 
 			return
 		}
@@ -354,13 +365,21 @@ func (h *Handler) handleFinalTranscript(text string) {
 
 	history := append([]llm.Message(nil), h.history...)
 
-	go h.runLLMTurn(ctx, history, h.tts, gen)
+	go h.runLLMTurn(ctx, history, h.tts, gen, h.turnStartedAt)
 }
 
-func (h *Handler) runLLMTurn(ctx context.Context, history []llm.Message, ttsClient tts.Client, gen uint64) {
+func (h *Handler) runLLMTurn(ctx context.Context, history []llm.Message, ttsClient tts.Client, gen uint64, turnStartedAt time.Time) {
 	chunker := &SentenceChunker{}
 
+	var firstTokenAt time.Time
+
 	err := h.cfg.LLM.Stream(ctx, history, func(tok string) {
+		if firstTokenAt.IsZero() {
+			firstTokenAt = time.Now()
+			slog.Info("llm first token", "call_id", h.callID, "gen", gen,
+				"latency_ms", firstTokenAt.Sub(turnStartedAt).Milliseconds())
+		}
+
 		for _, chunk := range chunker.Feed(tok) {
 			h.sendToTTS(ttsClient, chunk, gen)
 		}
@@ -370,6 +389,9 @@ func (h *Handler) runLLMTurn(ctx context.Context, history []llm.Message, ttsClie
 		// Cancelled by barge-in or call teardown; a barge-in already called
 		// Cancel on this exact ttsClient, so no further Speak calls for gen
 		// are possible and there's nothing to end.
+		slog.Info("llm turn cancelled", "call_id", h.callID, "gen", gen,
+			"duration_ms", time.Since(turnStartedAt).Milliseconds())
+
 		return
 	}
 
@@ -377,6 +399,12 @@ func (h *Handler) runLLMTurn(ctx context.Context, history []llm.Message, ttsClie
 		if remainder := chunker.Flush(); remainder != "" {
 			h.sendToTTS(ttsClient, remainder, gen)
 		}
+
+		slog.Info("llm turn complete", "call_id", h.callID, "gen", gen,
+			"duration_ms", time.Since(turnStartedAt).Milliseconds())
+	} else {
+		slog.Warn("llm turn error", "call_id", h.callID, "gen", gen,
+			"duration_ms", time.Since(turnStartedAt).Milliseconds(), "error", err)
 	}
 
 	// No further Speak(gen) calls are coming. ttsClient.Done() will yield gen
@@ -392,8 +420,12 @@ func (h *Handler) runLLMTurn(ctx context.Context, history []llm.Message, ttsClie
 func (h *Handler) sendToTTS(ttsClient tts.Client, text string, gen uint64) {
 	if err := ttsClient.Speak(text, gen); err != nil {
 		h.cfg.Sink.Error("tts_speak")
+		slog.Warn("tts speak failed", "call_id", h.callID, "gen", gen, "error", err)
+
 		return
 	}
+
+	slog.Info("tts speak", "call_id", h.callID, "gen", gen, "chars", len([]rune(text)))
 
 	if h.state.CompareAndSwap(int32(StateThinking), int32(StateSpeaking)) {
 		h.speakingSince.Store(time.Now().UnixNano())
@@ -458,6 +490,12 @@ func (h *Handler) handleTTSAudio(pcm []byte, gen uint64) {
 		return // stale generation from an interrupted turn -- drop it
 	}
 
+	if h.ttfaLoggedGen != gen {
+		h.ttfaLoggedGen = gen
+		slog.Info("tts first audio", "call_id", h.callID, "gen", gen,
+			"latency_ms", time.Since(h.turnStartedAt).Milliseconds())
+	}
+
 	h.ttsBuf = append(h.ttsBuf, pcm...)
 
 	for len(h.ttsBuf) >= media.FrameSize {
@@ -477,6 +515,9 @@ func (h *Handler) handleTTSDone(gen uint64) {
 	if gen != h.curGen {
 		return // a barge-in already moved past this generation
 	}
+
+	slog.Info("turn complete", "call_id", h.callID, "gen", gen,
+		"total_latency_ms", time.Since(h.turnStartedAt).Milliseconds())
 
 	// Only move back to Listening if still in this turn's Speaking/Thinking
 	// state -- a barge-in may have already advanced us to Transcribing, and

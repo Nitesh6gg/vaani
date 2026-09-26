@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -53,6 +54,13 @@ const keepaliveInterval = 20 * time.Second
 //     next. Audio and "final" events instead arrive strictly in the order
 //     their requests were sent, which is what generation tagging below relies
 //     on to attribute each chunk.
+//   - A whitespace-only "text" value (e.g. a bare "\n") is rejected with
+//     {"type":"error",...,"message":"400: 'text' cannot be empty"} -- observed
+//     live when SentenceChunker flushed a lone newline as a "sentence".
+//     Sarvam sends this error INSTEAD OF a "final" for that request, never
+//     both, so onFinal's bookkeeping runs on error too (see receiveLoop);
+//     otherwise that request's pendingGens entry would never clear and its
+//     generation's Done would never fire, wedging the call.
 //   - Sarvam has no "stop synthesizing" message. Once text+flush is sent,
 //     audio keeps arriving until Sarvam is done, regardless of what the
 //     caller wants by then -- its own {"type":"event","event_type":"final"}
@@ -158,7 +166,12 @@ func (c *sarvamClient) writeJSON(conn *websocket.Conn, v any) error {
 // Speak sends text for synthesis followed by a flush so Sarvam emits audio,
 // tagging the outstanding request with gen for later attribution.
 func (c *sarvamClient) Speak(text string, gen uint64) error {
-	if text == "" {
+	// Whitespace-only text (e.g. SentenceChunker treats "\n" as a sentence
+	// delimiter, so a bare newline in the LLM's stream can flush as a
+	// "sentence") isn't caught by a plain empty-string check, but Sarvam
+	// trims it server-side and rejects it with a 400 -- see the doc comment
+	// above: "'text' cannot be empty".
+	if strings.TrimSpace(text) == "" {
 		return nil
 	}
 
@@ -248,9 +261,13 @@ func (c *sarvamClient) forceClose() {
 }
 
 // onFinal pops the oldest outstanding request off pendingGens (Sarvam
-// delivers "final" events in send order) and, if that was the last
+// delivers "final"/error events in send order) and, if that was the last
 // outstanding request for its generation and EndGeneration has already been
-// called for it, emits Done.
+// called for it, emits Done. Also called for a provider error (see
+// receiveLoop): Sarvam sends error INSTEAD OF final for a rejected request,
+// never both, but that request is just as resolved either way -- no more
+// audio is coming for it, so its slot must clear the same way or its
+// generation's Done would never fire.
 func (c *sarvamClient) onFinal() {
 	c.genMu.Lock()
 	if len(c.pendingGens) == 0 {
@@ -301,6 +318,7 @@ func (c *sarvamClient) receiveLoop() {
 		switch {
 		case m.Type == "error":
 			slog.Warn("tts provider error", "call_id", c.callID, "message", m.Data.Message)
+			c.onFinal() // the rejected request is resolved, not retried -- see onFinal's doc comment
 		case m.Type == "event" && m.Data.EventType == "final":
 			c.onFinal()
 		case m.Type == "audio" && m.Data.Audio != "":
