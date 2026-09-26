@@ -45,6 +45,20 @@ func (s State) String() string {
 // STT first, recovering the start of the interrupting utterance.
 const prerollFrames = 10
 
+// outboundBufferFrames sizes Handler.outbound. This is not a jitter margin --
+// it's the gap between how TTS audio arrives and how it can be played out.
+// Sarvam delivers a whole turn's synthesized audio over the network in a
+// fraction of a second (far faster than real time), but the phone leg can
+// only ever consume it at exactly one 20ms frame at a time; that mismatch has
+// to sit somewhere. A too-small buffer here doesn't smooth anything, it just
+// drops the excess -- observed live: a 5-frame (100ms) buffer silently
+// dropped 1915 frames (~38s of audio) across a handful of short turns via the
+// select-default branch in handleTTSAudio. Sized for 30s of audio, comfortably
+// past any single realistic reply; barge-in already drains this queue
+// entirely (handleBargeIn), so a larger buffer doesn't risk playing stale
+// audio past an interruption, only avoids dropping it before one.
+const outboundBufferFrames = int(30 * time.Second / media.FrameInterval)
+
 // llmStreamer is the subset of *llm.Client that Handler needs, as an
 // interface so tests can inject a fake without a live LLM endpoint.
 type llmStreamer interface {
@@ -151,8 +165,9 @@ type Handler struct {
 	// ProcessFrame-goroutine-owned only.
 	preroll [][]byte
 
-	// TTS PCM re-sliced to 640B frames, drained by ProcessFrame. Cap 5 per
-	// spec, matching CallMedia's own outbound queue depth.
+	// TTS PCM re-sliced to 640B frames, drained by ProcessFrame at real-time
+	// pace. See outboundBufferFrames for why this is sized in seconds, not
+	// CallMedia's 5-frame jitter margin.
 	outbound chan []byte
 }
 
@@ -169,7 +184,7 @@ func NewHandler(ctx context.Context, callID string, cfg Config) *Handler {
 		cfg:      cfg,
 		baseCtx:  ctx,
 		events:   make(chan any, 8),
-		outbound: make(chan []byte, 5),
+		outbound: make(chan []byte, outboundBufferFrames),
 	}
 	h.state.Store(int32(StateListening))
 
@@ -426,10 +441,11 @@ func (h *Handler) sendToTTS(ttsClient tts.Client, text string, gen uint64) {
 	}
 
 	slog.Info("tts speak", "call_id", h.callID, "gen", gen, "chars", len([]rune(text)))
-
-	if h.state.CompareAndSwap(int32(StateThinking), int32(StateSpeaking)) {
-		h.speakingSince.Store(time.Now().UnixNano())
-	}
+	// The Thinking -> Speaking transition happens in handleTTSAudio, once real
+	// audio for gen actually arrives -- not here, when text is merely sent.
+	// Flipping here left a silence gap exactly as long as Sarvam's
+	// synthesis+network round trip (ProcessFrame would already be draining an
+	// empty outbound queue).
 }
 
 // readTTS drains ttsClient's Audio and Done channels for as long as either
@@ -494,6 +510,13 @@ func (h *Handler) handleTTSAudio(pcm []byte, gen uint64) {
 		h.ttfaLoggedGen = gen
 		slog.Info("tts first audio", "call_id", h.callID, "gen", gen,
 			"latency_ms", time.Since(h.turnStartedAt).Milliseconds())
+
+		// Only start draining outbound to the caller once real audio has
+		// actually arrived -- see sendToTTS's comment for why this doesn't
+		// happen when Speak() merely sends text.
+		if h.state.CompareAndSwap(int32(StateThinking), int32(StateSpeaking)) {
+			h.speakingSince.Store(time.Now().UnixNano())
+		}
 	}
 
 	h.ttsBuf = append(h.ttsBuf, pcm...)
@@ -507,6 +530,7 @@ func (h *Handler) handleTTSAudio(pcm []byte, gen uint64) {
 		case h.outbound <- frame:
 		default:
 			h.cfg.Sink.Error("tts_outbound_full")
+			slog.Warn("tts outbound buffer full, dropping frame", "call_id", h.callID, "gen", gen)
 		}
 	}
 }

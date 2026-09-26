@@ -198,11 +198,14 @@ func TestHandler_FullTurnEndToEnd(t *testing.T) {
 	fSTT.sendFinal("hi there")
 
 	require.Eventually(t, func() bool { return fTTS.spokenCount() > 0 }, time.Second, time.Millisecond)
-	require.Eventually(t, func() bool { return h.State() == StateSpeaking }, time.Second, time.Millisecond)
 
 	const gen = 1 // this is the handler's first-ever turn
 
+	// State only flips to Speaking once real audio arrives, not merely once
+	// Speak() sends text -- see sendToTTS/handleTTSAudio's comments.
 	fTTS.audio <- tts.Chunk{PCM: constFrame(loudAmplitude), Gen: gen}
+
+	require.Eventually(t, func() bool { return h.State() == StateSpeaking }, time.Second, time.Millisecond)
 
 	var gotFrame []byte
 
@@ -231,6 +234,9 @@ func TestHandler_BargeInExecutesCutsAndFlushesPreroll(t *testing.T) {
 	h := NewHandler(context.Background(), "call1", testConfig(fSTT, fTTS, fLLM, 0, 50*time.Millisecond))
 
 	fSTT.sendFinal("hi")
+	require.Eventually(t, func() bool { return fTTS.spokenCount() > 0 }, time.Second, time.Millisecond)
+
+	fTTS.audio <- tts.Chunk{PCM: constFrame(quietAmplitude), Gen: 1}
 	require.Eventually(t, func() bool { return h.State() == StateSpeaking }, time.Second, time.Millisecond)
 
 	// Quiet SPEAKING frames first, so preroll has content besides the trigger.
@@ -258,6 +264,9 @@ func TestHandler_BargeInRespectsGuardWindow(t *testing.T) {
 	h := NewHandler(context.Background(), "call1", testConfig(fSTT, fTTS, fLLM, time.Hour, 0))
 
 	fSTT.sendFinal("hi")
+	require.Eventually(t, func() bool { return fTTS.spokenCount() > 0 }, time.Second, time.Millisecond)
+
+	fTTS.audio <- tts.Chunk{PCM: constFrame(quietAmplitude), Gen: 1}
 	require.Eventually(t, func() bool { return h.State() == StateSpeaking }, time.Second, time.Millisecond)
 
 	for i := 0; i < 10; i++ {

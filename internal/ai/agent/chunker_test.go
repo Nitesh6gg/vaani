@@ -74,3 +74,33 @@ func TestSentenceChunker_FlushReturnsRemainderAndClearsBuffer(t *testing.T) {
 	assert.Equal(t, "trailing fragment no punctuation", c.Flush())
 	assert.Equal(t, "", c.Flush(), "second Flush on an empty buffer returns empty")
 }
+
+func TestSentenceChunker_DoesNotFlushPunctuationOnlyFragment(t *testing.T) {
+	c := &SentenceChunker{}
+
+	// An ellipsis arriving token by token must not flush three separate
+	// content-free "sentences" -- Sarvam's TTS rejects those with a 400.
+	out := c.Feed(".")
+	out = append(out, c.Feed(".")...)
+	out = append(out, c.Feed(".")...)
+
+	assert.Empty(t, out, "bare punctuation must not flush on its own")
+	assert.Equal(t, "...", string(c.buf))
+}
+
+func TestSentenceChunker_AbsorbsLeadingPunctuationIntoNextSentence(t *testing.T) {
+	c := &SentenceChunker{}
+
+	c.Feed("...")
+	out := c.Feed("Wow!")
+
+	assert.Equal(t, []string{"...Wow!"}, out, "held-back punctuation must absorb into the next real content")
+}
+
+func TestSentenceChunker_FlushDropsPunctuationOnlyRemainder(t *testing.T) {
+	c := &SentenceChunker{}
+
+	c.Feed("...")
+
+	assert.Equal(t, "", c.Flush(), "a content-free remainder has nothing to absorb into, so it's dropped")
+}
