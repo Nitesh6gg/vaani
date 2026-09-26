@@ -106,6 +106,11 @@ type Config struct {
 	// internal/ai/agent.Config.SystemPrompt). Empty by default -- the LLM gets
 	// no system message at all unless this is set.
 	AgentSystemPrompt string
+	// AgentGreeting, if set, is spoken once at the start of every call before
+	// the caller says anything, bypassing the LLM (see
+	// internal/ai/agent.Config.Greeting). Empty by default -- the agent stays
+	// silent until the caller speaks first.
+	AgentGreeting string
 
 	// SarvamAPIKey authenticates both Sarvam STT and TTS (internal/ai/stt,
 	// internal/ai/tts) -- one key per Sarvam account covers both products.
@@ -168,6 +173,7 @@ func Load() (Config, error) {
 		LLMAPIKey:           getEnv("LLM_API_KEY", ""),
 		LLMModel:            getEnv("LLM_MODEL", ""),
 		AgentSystemPrompt:   getEnv("AGENT_SYSTEM_PROMPT", ""),
+		AgentGreeting:       getEnv("AGENT_GREETING", ""),
 		SarvamAPIKey:        getEnv("SARVAM_API_KEY", ""),
 		SarvamSTTModel:      getEnv("SARVAM_STT_MODEL", "saaras:v4"),
 		SarvamSTTLanguage:   getEnv("SARVAM_STT_LANGUAGE", "unknown"),

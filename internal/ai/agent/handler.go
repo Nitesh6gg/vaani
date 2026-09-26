@@ -94,6 +94,11 @@ type Config struct {
 	NewTTS       func() (tts.Client, error)
 	LLM          llmStreamer
 	SystemPrompt string
+	// Greeting, if set, is spoken once at the start of the call, before the
+	// caller says anything -- bypasses the LLM entirely (it's fixed text, not
+	// generated) and is recorded into history as the agent's own turn so the
+	// LLM doesn't redundantly re-greet on the caller's first real reply.
+	Greeting string
 
 	BargeIn BargeInDetector
 	// BargeInGuard ignores barge-in detection for this long after entering
@@ -117,6 +122,7 @@ type ttsAudioEvent struct {
 }
 type ttsDoneEvent struct{ gen uint64 }
 type bargeInEvent struct{}
+type greetingEvent struct{}
 
 // Handler implements media.Handler: Sarvam STT -> LLM -> Sarvam TTS with local
 // barge-in detection. See docs/AUDIO_PIPELINE.md's Handler Contract and
@@ -194,6 +200,10 @@ func NewHandler(ctx context.Context, callID string, cfg Config) *Handler {
 
 	go h.readSTT()
 	go h.run()
+
+	if cfg.Greeting != "" {
+		h.events <- greetingEvent{} // buffer is fresh; guaranteed not to block
+	}
 
 	return h
 }
@@ -336,7 +346,64 @@ func (h *Handler) handleEvent(ev any) {
 		h.handleTTSDone(e.gen)
 	case bargeInEvent:
 		h.handleBargeIn()
+	case greetingEvent:
+		h.handleGreeting()
 	}
+}
+
+// openTTS lazily opens h.tts if not already open, logging and reverting to
+// Listening on failure. Returns false if the caller should abandon whatever
+// turn it was starting.
+func (h *Handler) openTTS(gen uint64) bool {
+	if h.tts != nil {
+		return true
+	}
+
+	t, err := h.cfg.NewTTS()
+	if err != nil {
+		h.cfg.Sink.Error("tts_open")
+		h.state.Store(int32(StateListening))
+		slog.Error("tts open failed", "call_id", h.callID, "gen", gen, "error", err)
+
+		return false
+	}
+
+	h.tts = t
+
+	go h.readTTS(t)
+
+	return true
+}
+
+// handleGreeting speaks Config.Greeting once, at call start, before the
+// caller has said anything -- fixed text, so it bypasses the LLM entirely.
+// Recorded into history as the agent's own turn so the LLM doesn't
+// redundantly re-greet on the caller's first real reply.
+func (h *Handler) handleGreeting() {
+	h.state.Store(int32(StateThinking))
+
+	h.curGen++
+	gen := h.curGen
+	h.turnStartedAt = time.Now()
+
+	slog.Info("agent greeting", "call_id", h.callID, "gen", gen, "text", h.cfg.Greeting)
+
+	if !h.openTTS(gen) {
+		return
+	}
+
+	h.history = append(h.history, llm.Message{Role: "assistant", Content: h.cfg.Greeting})
+
+	chunker := &SentenceChunker{}
+	for _, chunk := range chunker.Feed(h.cfg.Greeting) {
+		h.sendToTTS(h.tts, chunk, gen)
+	}
+
+	if remainder := chunker.Flush(); remainder != "" {
+		h.sendToTTS(h.tts, remainder, gen)
+	}
+
+	h.tts.EndGeneration(gen)
 }
 
 func (h *Handler) handleFinalTranscript(text string) {
@@ -360,19 +427,8 @@ func (h *Handler) handleFinalTranscript(text string) {
 
 	slog.Info("stt final transcript", "call_id", h.callID, "gen", gen, "text", text)
 
-	if h.tts == nil {
-		t, err := h.cfg.NewTTS()
-		if err != nil {
-			h.cfg.Sink.Error("tts_open")
-			h.state.Store(int32(StateListening))
-			slog.Error("tts open failed", "call_id", h.callID, "gen", gen, "error", err)
-
-			return
-		}
-
-		h.tts = t
-
-		go h.readTTS(t)
+	if !h.openTTS(gen) {
+		return
 	}
 
 	ctx, cancel := context.WithCancel(h.baseCtx)
@@ -455,11 +511,47 @@ func (h *Handler) sendToTTS(ttsClient tts.Client, text string, gen uint64) {
 // closed channel's local variable to nil makes that select case block
 // forever without spinning, so the other channel keeps draining normally
 // until it closes too.
+//
+// audioCh is drained with strict priority over doneCh (the non-blocking peek
+// below, tried before the real select). The TTS client always pushes a
+// generation's audio onto Audio() before pushing its Done signal -- that's a
+// single-goroutine happens-before at the source (sarvamClient.receiveLoop),
+// so whenever Done is ready, every audio chunk sent before it is already
+// available too. Without the priority peek, a plain `select` with both cases
+// ready picks between them at random, and once in a while forwards Done
+// first; handleTTSDone would then flip Thinking/Speaking straight to
+// Listening before handleTTSAudio's first chunk for that generation ever
+// runs its Thinking->Speaking CompareAndSwap, which then fails (state is no
+// longer Thinking) and never retries -- the rest of that generation's audio
+// still gets buffered by handleTTSAudio, but ProcessFrame never drains it
+// (State never reached Speaking), so it just sits in outbound until it
+// eventually overflows on a later turn. Observed live: turns 1-2 of a call
+// produced zero dropped-frame warnings (their audio silently never played,
+// but hadn't yet overflowed the buffer) and turn 3 suddenly produced
+// hundreds, once the accumulated undrained backlog from all three turns
+// finally exceeded outboundBufferFrames.
 func (h *Handler) readTTS(ttsClient tts.Client) {
 	audioCh := ttsClient.Audio()
 	doneCh := ttsClient.Done()
 
 	for audioCh != nil || doneCh != nil {
+		select {
+		case chunk, ok := <-audioCh:
+			if !ok {
+				audioCh = nil
+				continue
+			}
+
+			select {
+			case h.events <- ttsAudioEvent{pcm: chunk.PCM, gen: chunk.Gen}:
+			case <-h.baseCtx.Done():
+				return
+			}
+
+			continue
+		default:
+		}
+
 		select {
 		case <-h.baseCtx.Done():
 			return
@@ -516,6 +608,17 @@ func (h *Handler) handleTTSAudio(pcm []byte, gen uint64) {
 		// happen when Speak() merely sends text.
 		if h.state.CompareAndSwap(int32(StateThinking), int32(StateSpeaking)) {
 			h.speakingSince.Store(time.Now().UnixNano())
+		} else {
+			// Diagnostic for a suspected readTTS ordering race (see its doc
+			// comment): if this ever fires, state was something other than
+			// Thinking when the generation's first audio arrived -- most likely
+			// Listening, because handleTTSDone already ran for this gen. That
+			// would mean ProcessFrame never drains this generation's audio at
+			// all (State never reaches Speaking), and it just accumulates in
+			// outbound until a later turn's audio pushes the buffer over its
+			// cap.
+			slog.Warn("tts audio arrived but state was not Thinking; Speaking transition skipped",
+				"call_id", h.callID, "gen", gen, "state", State(h.state.Load()))
 		}
 	}
 

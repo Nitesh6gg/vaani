@@ -177,6 +177,44 @@ func testConfig(sttClient stt.Client, ttsClient tts.Client, llmClient llmStreame
 	}
 }
 
+func TestHandler_GreetingIsSpokenWithoutWaitingForCaller(t *testing.T) {
+	fSTT := newFakeSTT()
+	fTTS := newFakeTTS()
+
+	h := NewHandler(context.Background(), "call1", Config{
+		STT:      fSTT,
+		NewTTS:   func() (tts.Client, error) { return fTTS, nil },
+		LLM:      &fakeLLM{}, // must never be called for the greeting
+		Greeting: "Hi, this side Shubh.",
+		BargeIn:  NewEnergyDetector(floor),
+		Sink:     NoopSink{},
+	})
+
+	require.Eventually(t, func() bool { return fTTS.spokenCount() > 0 }, time.Second, time.Millisecond)
+	assert.Equal(t, []string{"Hi, this side Shubh."}, fTTS.spoken)
+
+	const gen = 1
+
+	fTTS.audio <- tts.Chunk{PCM: constFrame(loudAmplitude), Gen: gen}
+	require.Eventually(t, func() bool { return h.State() == StateSpeaking }, time.Second, time.Millisecond)
+
+	fTTS.done <- gen
+	require.Eventually(t, func() bool { return h.State() == StateListening }, time.Second, time.Millisecond)
+
+	assert.Equal(t, []llm.Message{{Role: "assistant", Content: "Hi, this side Shubh."}}, h.history,
+		"the greeting must be recorded so the LLM doesn't redundantly re-greet")
+}
+
+func TestHandler_NoGreetingConfiguredStaysSilentUntilCallerSpeaks(t *testing.T) {
+	fSTT := newFakeSTT()
+	h := NewHandler(context.Background(), "call1", testConfig(fSTT, newFakeTTS(), &fakeLLM{}, 0, 0))
+
+	time.Sleep(20 * time.Millisecond) // let NewHandler's goroutines settle
+
+	assert.Equal(t, StateListening, h.State())
+	assert.Empty(t, h.history)
+}
+
 func TestHandler_ListeningFeedsSTTAndReturnsNoAudio(t *testing.T) {
 	fSTT := newFakeSTT()
 	h := NewHandler(context.Background(), "call1", testConfig(fSTT, newFakeTTS(), &fakeLLM{}, 0, 0))
@@ -224,6 +262,43 @@ func TestHandler_FullTurnEndToEnd(t *testing.T) {
 	fTTS.done <- gen
 
 	require.Eventually(t, func() bool { return h.State() == StateListening }, time.Second, time.Millisecond)
+}
+
+// TestHandler_AudioBeforeDoneEvenWhenBothArriveTogether is a regression test
+// for a race in readTTS: the TTS client always pushes a generation's audio
+// before its Done signal, but a plain `select` between the two channels
+// doesn't preserve that ordering once both are already buffered -- it can
+// pick Done first, which flips state straight to Listening before
+// handleTTSAudio's first chunk for that generation ever gets a chance to
+// enter Speaking (its CompareAndSwap then fails silently and never retries).
+// Symptom in production: TTS audio was buffered but never drained, with
+// zero errors -- it only became visible once enough turns' worth of
+// never-drained audio finally overflowed the outbound buffer.
+func TestHandler_AudioBeforeDoneEvenWhenBothArriveTogether(t *testing.T) {
+	fSTT := newFakeSTT()
+	fTTS := newFakeTTS()
+	fLLM := &fakeLLM{tokens: []string{"hi"}}
+
+	h := NewHandler(context.Background(), "call1", testConfig(fSTT, fTTS, fLLM, 0, 0))
+
+	fSTT.sendFinal("hi")
+	require.Eventually(t, func() bool { return fTTS.spokenCount() > 0 }, time.Second, time.Millisecond)
+
+	const gen = 1
+
+	// A burst, not a single chunk: readTTS needs a backlog still sitting in
+	// audioCh at the moment doneCh also becomes ready for the race to have any
+	// window to occur at all -- a single chunk tends to already be drained by
+	// the time Done is pushed, since readTTS's consumption is fast relative to
+	// two sequential sends from this goroutine.
+	for i := 0; i < 20; i++ {
+		fTTS.audio <- tts.Chunk{PCM: constFrame(loudAmplitude), Gen: gen}
+	}
+	fTTS.done <- gen
+
+	require.Eventually(t, func() bool { return h.State() == StateListening }, time.Second, time.Millisecond)
+	assert.NotZero(t, h.speakingSince.Load(),
+		"Speaking must have been entered from the audio chunk even though Done arrived in the same batch")
 }
 
 func TestHandler_BargeInExecutesCutsAndFlushesPreroll(t *testing.T) {
