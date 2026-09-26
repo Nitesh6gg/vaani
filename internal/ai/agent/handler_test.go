@@ -199,10 +199,24 @@ func TestHandler_GreetingIsSpokenWithoutWaitingForCaller(t *testing.T) {
 	require.Eventually(t, func() bool { return h.State() == StateSpeaking }, time.Second, time.Millisecond)
 
 	fTTS.done <- gen
-	require.Eventually(t, func() bool { return h.State() == StateListening }, time.Second, time.Millisecond)
+	drainUntilListening(t, h)
 
 	assert.Equal(t, []llm.Message{{Role: "assistant", Content: "Hi, this side Shubh."}}, h.history,
 		"the greeting must be recorded so the LLM doesn't redundantly re-greet")
+}
+
+// drainUntilListening keeps calling ProcessFrame (as CallMedia's releaseLoop
+// would, once per 20ms tick) until the Handler reports Listening. Needed
+// after pushing a fake Done signal: the turn doesn't actually end until
+// ProcessFrame drains the last of outbound and observes delivery is also
+// done -- see handleTTSDone/processSpeakingFrame's comments.
+func drainUntilListening(t *testing.T, h *Handler) {
+	t.Helper()
+
+	require.Eventually(t, func() bool {
+		h.ProcessFrame(context.Background(), "call1", constFrame(quietAmplitude))
+		return h.State() == StateListening
+	}, time.Second, time.Millisecond)
 }
 
 func TestHandler_NoGreetingConfiguredStaysSilentUntilCallerSpeaks(t *testing.T) {
@@ -224,6 +238,54 @@ func TestHandler_ListeningFeedsSTTAndReturnsNoAudio(t *testing.T) {
 	assert.Nil(t, out)
 	assert.Equal(t, 1, fSTT.fedCount())
 	assert.Equal(t, StateListening, h.State())
+}
+
+// TestHandler_PlaysFullReplyEvenAfterTTSDoneFires is a regression test for the
+// bug where a reply was cut off almost immediately: handleTTSDone fires once
+// Sarvam has finished SENDING a generation's audio, which happens far faster
+// than real time, long before ProcessFrame (draining at exactly one 20ms
+// frame per tick) has had a chance to play it all. The old code moved
+// straight to Listening right there, which stopped ProcessFrame from
+// draining outbound at all -- most of every reply was simply never played,
+// left to leak out as stale fragments of later turns instead.
+func TestHandler_PlaysFullReplyEvenAfterTTSDoneFires(t *testing.T) {
+	fSTT := newFakeSTT()
+	fTTS := newFakeTTS()
+	fLLM := &fakeLLM{tokens: []string{"hi"}}
+
+	h := NewHandler(context.Background(), "call1", testConfig(fSTT, fTTS, fLLM, 0, 0))
+
+	fSTT.sendFinal("hi")
+	require.Eventually(t, func() bool { return fTTS.spokenCount() > 0 }, time.Second, time.Millisecond)
+
+	const gen = 1
+	const frameCount = 5
+
+	for i := 0; i < frameCount; i++ {
+		fTTS.audio <- tts.Chunk{PCM: constFrame(loudAmplitude), Gen: gen}
+	}
+
+	require.Eventually(t, func() bool { return h.State() == StateSpeaking }, time.Second, time.Millisecond)
+
+	// Sarvam finished sending before the caller has heard any of it -- this
+	// must not end the turn while outbound still holds unplayed frames.
+	fTTS.done <- gen
+	time.Sleep(20 * time.Millisecond) // let run() process the Done event
+	assert.Equal(t, StateSpeaking, h.State(), "must not drop to Listening while outbound still has queued frames")
+
+	played := 0
+
+	for played < frameCount {
+		out := h.ProcessFrame(context.Background(), "call1", constFrame(quietAmplitude))
+		if len(out) == 1 {
+			played++
+		}
+	}
+
+	assert.Equal(t, frameCount, played, "every queued frame must be played, not dropped")
+	assert.Equal(t, StateSpeaking, h.State(), "state only flips once an empty tick is observed after the queue drains")
+
+	drainUntilListening(t, h)
 }
 
 func TestHandler_FullTurnEndToEnd(t *testing.T) {
@@ -260,8 +322,7 @@ func TestHandler_FullTurnEndToEnd(t *testing.T) {
 	assert.Len(t, gotFrame, 640)
 
 	fTTS.done <- gen
-
-	require.Eventually(t, func() bool { return h.State() == StateListening }, time.Second, time.Millisecond)
+	drainUntilListening(t, h)
 }
 
 // TestHandler_AudioBeforeDoneEvenWhenBothArriveTogether is a regression test
@@ -296,9 +357,11 @@ func TestHandler_AudioBeforeDoneEvenWhenBothArriveTogether(t *testing.T) {
 	}
 	fTTS.done <- gen
 
-	require.Eventually(t, func() bool { return h.State() == StateListening }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return h.State() == StateSpeaking }, time.Second, time.Millisecond)
 	assert.NotZero(t, h.speakingSince.Load(),
 		"Speaking must have been entered from the audio chunk even though Done arrived in the same batch")
+
+	drainUntilListening(t, h)
 }
 
 func TestHandler_BargeInExecutesCutsAndFlushesPreroll(t *testing.T) {

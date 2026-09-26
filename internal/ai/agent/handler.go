@@ -123,6 +123,7 @@ type ttsAudioEvent struct {
 type ttsDoneEvent struct{ gen uint64 }
 type bargeInEvent struct{}
 type greetingEvent struct{}
+type ttsPlaybackDoneEvent struct{}
 
 // Handler implements media.Handler: Sarvam STT -> LLM -> Sarvam TTS with local
 // barge-in detection. See docs/AUDIO_PIPELINE.md's Handler Contract and
@@ -131,8 +132,8 @@ type greetingEvent struct{}
 // Concurrency design: every field below has exactly one owning goroutine, so
 // there is no lock in the hot path and nothing to get wrong under -race (which
 // this project's toolchain can't run locally -- see CLAUDE.md conventions):
-//   - state/speakingSince/silenceUntil: atomics, written by whichever
-//     goroutine reaches the transition, read by any.
+//   - state/speakingSince/silenceUntil/ttsDeliveryDone: atomics, written by
+//     whichever goroutine reaches the transition, read by any.
 //   - tts/turnCancel/history: touched only by run()'s goroutine.
 //   - preroll: touched only by ProcessFrame's goroutine.
 //   - per-turn chunker: a local variable inside runLLMTurn, never shared.
@@ -145,6 +146,13 @@ type Handler struct {
 	state         atomic.Int32
 	speakingSince atomic.Int64
 	silenceUntil  atomic.Int64
+	// ttsDeliveryDone is set once handleTTSDone has run for the current
+	// generation while still Speaking (Sarvam has finished sending audio, but
+	// outbound may still hold unplayed frames -- Sarvam delivers far faster
+	// than real time). processSpeakingFrame (a different goroutine) watches
+	// this and only ends the turn once outbound has also fully drained, so a
+	// reply is never cut off before the caller has actually heard all of it.
+	ttsDeliveryDone atomic.Bool
 
 	events chan any
 
@@ -255,6 +263,7 @@ func (h *Handler) processSpeakingFrame(pcm []byte) [][]byte {
 		h.cfg.BargeIn.Reset()
 		h.silenceUntil.Store(time.Now().Add(h.cfg.PostCutSilence).UnixNano())
 		h.cfg.Sink.BargeIn()
+		slog.Info("agent barge-in detected", "call_id", h.callID)
 
 		select {
 		case h.events <- bargeInEvent{}:
@@ -269,8 +278,22 @@ func (h *Handler) processSpeakingFrame(pcm []byte) [][]byte {
 	case frame := <-h.outbound:
 		return [][]byte{frame}
 	default:
-		return nil
 	}
+
+	// Nothing queued this tick. If TTS already finished delivering this
+	// generation's audio too, the reply is now fully played -- end the turn.
+	// CompareAndSwap makes the detect-and-consume atomic so this can only fire
+	// once per generation, even if several ticks in a row find an empty queue
+	// before run() gets around to processing the event.
+	if h.ttsDeliveryDone.CompareAndSwap(true, false) {
+		select {
+		case h.events <- ttsPlaybackDoneEvent{}:
+		default:
+			slog.Error("agent: events channel full dropping ttsPlaybackDoneEvent", "call_id", h.callID)
+		}
+	}
+
+	return nil
 }
 
 func (h *Handler) appendPreroll(pcm []byte) {
@@ -348,6 +371,8 @@ func (h *Handler) handleEvent(ev any) {
 		h.handleBargeIn()
 	case greetingEvent:
 		h.handleGreeting()
+	case ttsPlaybackDoneEvent:
+		h.finishTurn(h.curGen)
 	}
 }
 
@@ -638,14 +663,42 @@ func (h *Handler) handleTTSAudio(pcm []byte, gen uint64) {
 	}
 }
 
+// handleTTSDone fires once Sarvam has finished *sending* this generation's
+// audio -- not once the caller has finished *hearing* it. Sarvam delivers far
+// faster than real time (a multi-second reply can arrive in well under a
+// second), so ending the turn here unconditionally would cut most replies off
+// early: observed live, a ~3s greeting played for ~440ms before the state
+// flipped back to Listening and ProcessFrame stopped draining outbound,
+// leaving the rest to be played -- badly stale -- as fragments of later
+// turns. If still Speaking, this only records that delivery is done;
+// processSpeakingFrame (a different goroutine, draining outbound in real
+// time) is what actually ends the turn, once outbound is empty too.
 func (h *Handler) handleTTSDone(gen uint64) {
 	if gen != h.curGen {
 		return // a barge-in already moved past this generation
 	}
 
-	slog.Info("turn complete", "call_id", h.callID, "gen", gen,
-		"total_latency_ms", time.Since(h.turnStartedAt).Milliseconds())
+	slog.Info("tts delivery complete", "call_id", h.callID, "gen", gen,
+		"delivery_latency_ms", time.Since(h.turnStartedAt).Milliseconds())
 
+	switch State(h.state.Load()) {
+	case StateThinking:
+		// No audio was ever sent for this generation (e.g. the LLM produced no
+		// output) -- outbound is empty, nothing to drain, end the turn now.
+		h.finishTurn(gen)
+	case StateSpeaking:
+		h.ttsDeliveryDone.Store(true)
+	}
+	// StateTranscribing: a barge-in already cut this turn short; nothing to do.
+}
+
+// finishTurn ends the turn: moves back to Listening, logs the turn's real
+// end-to-end latency (transcript accepted to every frame of the reply
+// actually queued for playout), and clears per-turn state. Called either
+// directly from handleTTSDone (Thinking: nothing was ever queued) or via
+// ttsPlaybackDoneEvent, once processSpeakingFrame observes outbound has
+// fully drained after delivery finished.
+func (h *Handler) finishTurn(gen uint64) {
 	// Only move back to Listening if still in this turn's Speaking/Thinking
 	// state -- a barge-in may have already advanced us to Transcribing, and
 	// this must not stomp on that.
@@ -653,6 +706,9 @@ func (h *Handler) handleTTSDone(gen uint64) {
 	case StateSpeaking, StateThinking:
 		h.state.Store(int32(StateListening))
 	}
+
+	slog.Info("turn complete", "call_id", h.callID, "gen", gen,
+		"total_latency_ms", time.Since(h.turnStartedAt).Milliseconds())
 
 	h.ttsBuf = nil
 	// h.tts is deliberately left connected -- it's reused for the next turn
@@ -687,6 +743,11 @@ func (h *Handler) handleBargeIn() {
 	}
 
 	h.ttsBuf = nil
+	// Defensive: if handleTTSDone had just set this true for the
+	// now-interrupted generation (delivery finishing right as the caller
+	// barged in), leaving it true would make the *next* generation's first
+	// merely-transient empty tick wrongly end its turn early.
+	h.ttsDeliveryDone.Store(false)
 
 	for {
 		select {
