@@ -1,7 +1,10 @@
 package agent
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -13,6 +16,22 @@ import (
 	"github.com/nitesh/vaani/internal/ai/stt"
 	"github.com/nitesh/vaani/internal/ai/tts"
 )
+
+// captureSlog swaps the default slog logger for one writing to a buffer,
+// restores it on test cleanup, and returns a function that hands back that
+// buffer. Same pattern as internal/media's captureSlog (unexported there, so
+// duplicated rather than shared across packages).
+func captureSlog(t *testing.T) func() *bytes.Buffer {
+	t.Helper()
+
+	buf := &bytes.Buffer{}
+	original := slog.Default()
+
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(original) })
+
+	return func() *bytes.Buffer { return buf }
+}
 
 // fakeSTT records every fed frame and lets a test push transcript results.
 type fakeSTT struct {
@@ -485,4 +504,41 @@ func TestHandler_DrainTimeoutEndsTurnWhenTTSDiesWithoutDone(t *testing.T) {
 	fedAfter := fSTT.fedCount()
 	h.ProcessFrame(context.Background(), "call1", constFrame(quietAmplitude))
 	assert.Equal(t, fedAfter+1, fSTT.fedCount(), "Listening must feed STT again once the wedged turn is closed")
+}
+
+// TestHandler_OutboundBufferFullWarningLoggedOncePerGeneration is a regression
+// test for a live incident: an oversized reply overflowed the outbound
+// buffer and produced over 2000 individual WARN log lines within about a
+// second (nothing ever drains outbound in this test, so every push past
+// capacity hits the drop path). That logging burst is itself real CPU/I/O
+// work competing with the media pacers for the process's attention, so
+// dropped frames must be counted (Sink.Error, for metrics) without being
+// logged individually.
+func TestHandler_OutboundBufferFullWarningLoggedOncePerGeneration(t *testing.T) {
+	getLog := captureSlog(t)
+
+	fSTT := newFakeSTT()
+	fTTS := newFakeTTS()
+	fLLM := &fakeLLM{tokens: []string{"hi"}}
+
+	NewHandler(context.Background(), "call1", testConfig(fSTT, fTTS, fLLM, 0, 0))
+
+	fSTT.sendFinal("hi")
+	require.Eventually(t, func() bool { return fTTS.spokenCount() > 0 }, time.Second, time.Millisecond)
+
+	const gen = 1
+
+	for i := 0; i < outboundBufferFrames+50; i++ {
+		fTTS.audio <- tts.Chunk{PCM: constFrame(loudAmplitude), Gen: gen}
+	}
+
+	require.Eventually(t, func() bool {
+		return strings.Contains(getLog().String(), "tts outbound buffer full")
+	}, 2*time.Second, time.Millisecond)
+
+	// Let any further drops finish being processed before counting.
+	time.Sleep(100 * time.Millisecond)
+
+	assert.Equal(t, 1, strings.Count(getLog().String(), "tts outbound buffer full"),
+		"must log once per generation, not once per dropped frame")
 }

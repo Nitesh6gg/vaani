@@ -187,6 +187,12 @@ type Handler struct {
 	// chunk has already been logged, so repeat chunks don't repeat the log.
 	turnStartedAt time.Time
 	ttfaLoggedGen uint64
+	// dropWarnedGen records which generation's outbound-buffer-full warning has
+	// already been logged, so an oversized reply that overflows the buffer logs
+	// once for the whole turn instead of once per dropped frame -- observed
+	// live, a single long reply produced over 2000 individual WARN lines in
+	// under a second. Sink.Error still counts every drop for metrics.
+	dropWarnedGen uint64
 
 	// ProcessFrame-goroutine-owned only.
 	preroll [][]byte
@@ -710,7 +716,12 @@ func (h *Handler) handleTTSAudio(pcm []byte, gen uint64) {
 		case h.outbound <- frame:
 		default:
 			h.cfg.Sink.Error("tts_outbound_full")
-			slog.Warn("tts outbound buffer full, dropping frame", "call_id", h.callID, "gen", gen)
+
+			if h.dropWarnedGen != gen {
+				h.dropWarnedGen = gen
+				slog.Warn("tts outbound buffer full, dropping frames (further drops this turn are counted but not logged individually)",
+					"call_id", h.callID, "gen", gen)
+			}
 		}
 	}
 }
