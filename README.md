@@ -3,10 +3,20 @@
 Real-time voice agent: Asterisk ARI (telephony) + Go media plane + Sarvam STT/TTS + OpenAI-compatible LLM.
 
 ## Stack
-- Go 1.22+, Asterisk 22.8+ (PJSIP, ARI, AudioSocket/externalMedia)
+- Go 1.26+, Asterisk 22.8+ (PJSIP, ARI, AudioSocket/externalMedia)
 - STT: Sarvam `saaras:v4` (WebSocket, 16kHz PCM s16le)
 - TTS: Sarvam Bulbul v3 (WebSocket streaming, request 16kHz output)
 - LLM: OpenAI-compatible streaming API (shared http.Client, HTTP/2)
+- Barge-in VAD: TEN VAD (`VAD_MODE=ten`, Linux/cgo, vendored under
+  `third_party/ten-vad/`) or RMS energy (`VAD_MODE=energy`, default)
+
+## Agent mode
+`APP_MODE=agent` turns the loopback pipeline into a full voice agent: Sarvam
+STT → OpenAI-compatible LLM → Sarvam TTS, with caller interruption (barge-in)
+detectable by TEN VAD or a plain RMS gate. It needs `SARVAM_API_KEY`,
+`SARVAM_TTS_VOICE`, `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL` (validated at
+startup) — every knob is documented in `.env.example`, and the barge-in
+on/off + tuning knobs in `docs/AI_PROVIDERS.md`.
 
 ## Getting Started
 ```bash

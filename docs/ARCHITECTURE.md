@@ -55,6 +55,30 @@ Exactly two goroutines per call (reader, writer) connected by a capacity-5 buffe
 channel -- never a goroutine per frame. See `CLAUDE.md` for the full list of
 invariants this design exists to preserve.
 
+## Agent mode (`APP_MODE=agent`, Phase 3/4)
+
+Per call, `internal/ai/agent.Handler` implements the same `media.Handler` seam
+and drives a four-state turn loop over the media frames:
+
+```
+Listening/Transcribing: inbound audio -> Sarvam STT (WebSocket, per call)
+  final transcript -> LLM (OpenAI-compatible SSE stream)
+    -> sentence chunks -> Sarvam TTS (WebSocket, one connection per call)
+Speaking: TTS PCM re-framed to 640B frames -> played out at 20ms/tick
+  (one frame per ProcessFrame call; synthesis finishes long before the
+  caller has heard it all, so delivery-complete and playout-complete are
+  tracked separately)
+```
+
+Barge-in while speaking: a per-call VAD -- TEN VAD (`VAD_MODE=ten`, vendored
+under `third_party/ten-vad/`, `internal/ai/agent/tenvad`) or an RMS energy
+gate -- watches the inbound audio; a sustained speech verdict cuts the turn
+(LLM stream and TTS connection cancelled, queue drained) and the caller's
+utterance becomes the next turn. `BARGE_IN_ENABLED=0` puts the detector in
+observe-only mode: transitions keep logging, nothing is ever cut. Full knob
+table in `docs/AI_PROVIDERS.md`; state machine in
+`internal/ai/agent/handler.go`.
+
 ## Operability endpoints
 
 All served by `internal/metrics.Serve` on `METRICS_ADDR` (default `:9091`), with

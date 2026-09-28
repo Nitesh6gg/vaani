@@ -3,10 +3,12 @@
 Real-time voice agent: Asterisk ARI (telephony) + Go media plane + Sarvam STT/TTS + OpenAI-compatible LLM.
 
 ## Stack
-- Go 1.22+, Asterisk 22.8+ (PJSIP, ARI, externalMedia)
+- Go 1.26+, Asterisk 22.8+ (PJSIP, ARI, externalMedia)
 - STT: Sarvam `saaras:v4` (WebSocket, 16kHz PCM s16le)
 - TTS: Sarvam Bulbul v3 (WebSocket streaming, request 16kHz output)
 - LLM: OpenAI-compatible streaming API (shared http.Client, HTTP/2)
+- Barge-in VAD: TEN VAD (`VAD_MODE=ten`, Linux/cgo, vendored under
+  `third_party/ten-vad/`) or RMS energy (`VAD_MODE=energy`, default)
 
 ## Package Layout
 - `cmd/server/` — single entry point (monolith, NOT microservices)
@@ -14,6 +16,9 @@ Real-time voice agent: Asterisk ARI (telephony) + Go media plane + Sarvam STT/TT
 - `internal/media/` — RTP over UDP and AudioSocket over TCP (both via ARI
   externalMedia), port allocator, 20ms pacer, jitter buffer (RTP only), sync.Pool
 - `internal/ai/stt|llm|tts/` — provider clients
+- `internal/ai/agent/` — per-call agent Handler (STT→LLM→TTS state machine,
+  barge-in, playout queue); `internal/ai/agent/tenvad/` — TEN VAD cgo wrapper
+  (Linux only; native library vendored under `third_party/ten-vad/`)
 - `internal/session/` — per-call state machine, barge-in orchestration
 
 ## Critical Invariants (NEVER violate these)
@@ -34,13 +39,12 @@ Real-time voice agent: Asterisk ARI (telephony) + Go media plane + Sarvam STT/TT
    `ForceAttemptHTTP2=true`. Never create per-request clients.
 6. **One ARI WebSocket** for the whole process — never per-call.
 7. **Barge-in is 5 cuts**: pacer stop, STT cancel, LLM cancel, TTS stream close, queue flush.
-   Missing any one causes leaked audio or billing waste. **Unresolved tension for
-   Phase 4**: invariant #9's "RTP must never starve" means the write tick has to
-   keep firing (silence fallback) for as long as the call is active — so "pacer
-   stop" here almost certainly has to mean *stop feeding the outbound queue*, not
-   literally call `Pacer.Stop()` on the write loop's ticker. Resolve this
-   explicitly when barge-in is implemented; don't let it default to whichever
-   reading compiles first.
+   Missing any one causes leaked audio or billing waste. Phase 4 resolution of the
+   old "pacer stop vs RTP must never starve" tension: the write tick keeps firing
+   and emits silence per invariant #1/#9 — "pacer stop" is implemented as *stop
+   feeding the outbound queue*, i.e. the queue drain + playback state flip in
+   `internal/ai/agent/handler.go`, together with STT/LLM context cancellation,
+   TTS connection teardown, and `ttsBuf` clearing.
 8. **Audio format**: slin16 (16kHz 16-bit mono PCM) end-to-end. Asterisk handles μ-law transcoding.
 9. **One media socket per call**, bound to a port from the managed pool (never shared
    across calls), and bound/listening *before* the externalMedia channel is created —
@@ -49,10 +53,21 @@ Real-time voice agent: Asterisk ARI (telephony) + Go media plane + Sarvam STT/TT
    port-unreachable that can kill the flow across a routed/firewalled path). For RTP,
    also lock the remote address to the source of the first valid inbound packet.
 10. **RTP framing** (RTP only): sequence +1 and timestamp +320 per 20ms packet @
-    16kHz; validate version 2 on inbound. Payload endianness (s16le vs s16be) is
-    verified empirically via `cmd/endianness-check` — see `docs/AUDIO_PIPELINE.md`
-    before assuming either. AudioSocket has neither concern: TCP guarantees order,
-    and its audio payload is little-endian by protocol definition.
+    16kHz; validate version 2 on inbound, and drop/count any inbound payload
+    that isn't exactly 640 bytes — the whole pipeline has exactly one frame
+    shape. Payload endianness (s16le vs s16be) is verified empirically via
+    `cmd/endianness-check` — see `docs/AUDIO_PIPELINE.md` before assuming
+    either; the verified order applies SYMMETRICALLY (handler output is LE by
+    contract and must be converted back to the wire order on the way out).
+    AudioSocket has neither sequencing nor an endianness question: TCP
+    guarantees order, and its audio payload is little-endian by protocol
+    definition.
+11. **AudioSocket frames go out in ONE `conn.Write`** (`internal/media/audiosocket.go`):
+    header and payload written separately can land in separate TCP packets, and
+    Asterisk's res_audiosocket allows only 5ms between reading a frame's header
+    and its payload before it hangs the channel up ("Poll timed out while
+    waiting for data" — a real cross-subnet production incident, invisible on
+    localhost).
 
 ## Conventions
 - Errors: wrap with `fmt.Errorf("...: %w", err)`, never panic in request path.

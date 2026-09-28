@@ -21,6 +21,16 @@ from RTP pacing: once Phase 3 puts an LLM/TTS call inside `ProcessFrame`, a slow
 tick just falls back to a silence-filled outbound frame for that interval rather
 than delaying or bursting the paced RTP stream. See `internal/media/loopback.go`.
 
+**Outbound byte order** (`media.Config.ToWire`): the Handler contract is
+little-endian, but the verified RTP wire order (see "Endianness Verification")
+is symmetric -- what Asterisk sends inbound is what it expects outbound. So
+`writeLoop` converts each handler frame back to the wire order
+(`media.FromLE`) right before `Sender.Build`. The outbound WAV is written
+*before* that conversion and stays LE (WAV is LE by definition), so in a `be`
+deployment the out.wav sounds fine while the wire carries BE bytes -- the two
+are expected to differ byte-for-byte, the same misleading-signal trap as the
+jitter-buffer incident below.
+
 **RTP must never starve on an active call.** Once a remote is locked, the write
 tick always transmits exactly one packet every 20ms: a real frame from the
 handler's outbound queue, or a zeroed LE PCM16 silence frame
@@ -54,6 +64,15 @@ arithmetic so 16-bit sequence wraparound is handled correctly:
   its own fixed schedule, independent of when RTP actually begins flowing --
   could advance past sequence numbers no packet had reached yet, permanently
   racing ahead of the real stream. This was a real production bug (see below).
+- **Priming cannot wedge**: two escapes guarantee the waiting state ends. A
+  packet landing outside the window while priming re-anchors the buffer on it
+  (counted in `vaani_rtp_out_of_window_total`; nothing real has been released
+  yet, so the partial window costs only silence), and the wait itself is
+  bounded at ~2×window release ticks, after which the buffer activates with a
+  partial window and the starve-freeze machinery below takes over. Before
+  these, a single genuinely lost packet inside the first window could never be
+  recovered -- every newer packet stayed out-of-window forever and the call's
+  inbound audio was silence for its entire lifetime, silently and uncounted.
 - **Starve-freeze + re-anchor** (`vaani_jb_reanchors_total`): Vaani's release
   ticker and Asterisk's RTP pacing clock are two independent, unsynchronized
   20ms clocks that drift relative to each other over a long call. After 3
@@ -207,6 +226,15 @@ on a single TCP stream:
 | 0x12 for slin16  | big-endian uint16     | Raw PCM16 (Little-Endian)|
 +------------------+-----------------------+--------------------------+
 ```
+
+**Header and payload go out in ONE `conn.Write`** (`writeAudioSocketFrameInto`)
+-- a real cross-subnet production incident. Written separately, TCP can put
+them in separate packets, and Asterisk's res_audiosocket allows only **5ms**
+between reading a frame's header and reading its payload
+(`ast_wait_for_input(svc, 5)` in `ast_audiosocket_receive_frame_with_hangup`)
+before it logs "Poll timed out while waiting for data" and hangs the channel
+up mid-call. Invisible on localhost (microsecond gaps); roundly fatal across a
+routed path.
 
 Vaani binds a TCP listener the same "before Asterisk knows the address" way it
 binds the UDP socket for RTP (see the invariant in `CLAUDE.md`); once the call is

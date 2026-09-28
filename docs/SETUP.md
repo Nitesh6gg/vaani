@@ -69,3 +69,24 @@ indefinitely (no `StasisEnd` ever fires) instead of tearing down normally.
 
 See `docs/AUDIO_PIPELINE.md` -- run `go run ./cmd/endianness-check` against a live
 `make up` stack.
+
+## Barge-in / TEN VAD (`VAD_MODE=ten`)
+
+The barge-in detector is selectable via `VAD_MODE` (full knob table in
+`.env.example` and `docs/AI_PROVIDERS.md`):
+
+- `energy` (default): RMS threshold, pure Go, no extra dependencies.
+- `ten`: TEN Framework's TEN VAD neural model. Linux x86-64 + cgo only (the
+  deployment target); the native library is vendored under
+  `third_party/ten-vad/` -- no clone or download needed, but the box must have
+  `gcc` (any cgo build) and LLVM libc++, which Debian does not ship by default:
+
+      apt-get install -y libc++1 libc++abi1
+
+  Without it the link fails with "libc++.so.1, needed by libten_vad.so, not
+  found" and a wall of `std::__1::...` undefined references.
+
+On non-Linux builds (or if the library can't load) the server starts fine and
+each call falls back to the energy detector with a loud warning --
+`BARGE_IN_ENABLED=0` + `VAD_MODE=ten` still runs the VAD in observe-only mode
+(speech started/ended logs, no cuts).

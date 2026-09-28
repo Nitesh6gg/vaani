@@ -41,7 +41,30 @@ control-plane calls, SIGTERM-under-load, real CPU/RSS numbers) need to be run
 against a live Asterisk + SIPp environment and the results recorded there.
 
 ## Phase 3 — STT + LLM + TTS Integration
-TODO: not yet scoped. Depends on the endianness finding from Phase 1.
+Status: **done and running in production** (`APP_MODE=agent`). What shipped:
+- `internal/ai/stt|llm|tts`: Sarvam `saaras:v4` STT (WebSocket, per-call),
+  OpenAI-compatible streaming LLM (SSE over the shared HTTP/2 client), Sarvam
+  Bulbul v3 TTS (WebSocket; one connection per call reused across turns,
+  cancelled and reopened on barge-in).
+- `internal/ai/agent`: per-call Handler state machine
+  (Listening/Transcribing/Thinking/Speaking), sentence chunking feeding TTS,
+  a 30s playout queue drained at exactly real-time pace (synthesis finishes
+  far earlier than the caller hears it — delivery and playout are tracked
+  separately), post-cut silence gate, drain-timeout dead-call safeguard.
+- Diagnostics: rejected TTS text logging, provider-initiated close logging,
+  per-call `speech started`/`speech ended` transitions.
 
 ## Phase 4 — Barge-in Orchestration
-TODO: not yet scoped.
+Status: **done**. Barge-in runs behind the `BargeInDetector` seam
+(`internal/ai/agent/bargein.go`): `VAD_MODE=energy` (RMS threshold, default)
+or `VAD_MODE=ten` (TEN Framework's TEN VAD neural model, vendored under
+`third_party/ten-vad`, Linux/cgo). Cuts implemented: LLM context cancel + TTS
+connection teardown + outbound queue drain + playback state flip, with the
+write pacer continuing to emit silence per the invariant #1/#7 resolution in
+`AGENTS.md`. `BARGE_IN_ENABLED=0` puts the detector in observe-only mode
+(VAD logs keep flowing, nothing is ever cut). Still open: acoustic echo
+suppression — a caller on speakerphone leaks the agent's own voice into the
+mic and can false-trigger interrupts; no code-side fix yet.
+
+**Not done: the load test run** (Phase 2 carry-over) — `docs/LOADTEST.md` is
+still a template awaiting real numbers.
