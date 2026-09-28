@@ -3,6 +3,7 @@ package agent
 import (
 	"encoding/binary"
 	"log/slog"
+	"time"
 )
 
 // tenVadHopSize is TEN VAD's analysis hop in samples: 256 = 16ms at 16kHz.
@@ -29,7 +30,8 @@ type HopSpeechFunc func(hop []int16) (bool, error)
 // per 20ms frame -- no locking, no blocking, no I/O (the native process call
 // is CPU-only and bounded).
 type TenVadDetector struct {
-	hop HopSpeechFunc
+	callID string
+	hop    HopSpeechFunc
 
 	// carry holds LE-decoded samples not yet a full hop; grown by 320 every
 	// Detect call, drained 256 at a time.
@@ -40,26 +42,42 @@ type TenVadDetector struct {
 	// Debug (every failed hop still votes "not speech").
 	hopErrLogged bool
 
+	// speechActive/speechStartedAt track the vote window's state so Detect
+	// can log SPEECH ONSET and OFFSET transitions -- "speech started" when
+	// sustained caller speech first crosses the vote threshold, "speech
+	// ended" (with how long it lasted) when it drops back. Per-hop verdicts
+	// themselves are never logged: at ~60 hops/sec/call that's a log flood.
+	// These are ProcessFrame-goroutine-owned, like everything else here.
+	speechActive    bool
+	speechStartedAt time.Time
+
 	history [bargeInHistoryFrames]bool
 	idx     int
 }
 
 // NewTenVadDetector creates a detector that feeds hops to hop (the native
 // TEN VAD binding on Linux, a fake in tests) and votes on its per-hop
-// verdicts.
-func NewTenVadDetector(hop HopSpeechFunc) *TenVadDetector {
-	return &TenVadDetector{hop: hop, carry: make([]int16, 0, tenVadHopSize+320)}
+// verdicts, logging speech onset/offset transitions under callID.
+func NewTenVadDetector(callID string, hop HopSpeechFunc) *TenVadDetector {
+	return &TenVadDetector{
+		callID: callID,
+		hop:    hop,
+		carry:  make([]int16, 0, tenVadHopSize+320),
+	}
 }
 
 // Detect decodes one 20ms LE PCM16 frame (the BargeInDetector contract),
 // drains every full hop it completes into the VAD, and reports whether the
 // last bargeInHistoryFrames hops contain bargeInVotesNeeded speech verdicts.
 // A hop that errors counts as "not speech" -- barge-in must never wedge on a
-// detector problem.
+// detector problem. Logs "speech started"/"speech ended" on window
+// transitions, nothing else.
 func (d *TenVadDetector) Detect(pcm []byte) bool {
 	for i := 0; i+1 < len(pcm); i += 2 {
 		d.carry = append(d.carry, int16(binary.LittleEndian.Uint16(pcm[i:])))
 	}
+
+	result := false
 
 	for len(d.carry) >= tenVadHopSize {
 		hop := d.carry[:tenVadHopSize]
@@ -68,9 +86,9 @@ func (d *TenVadDetector) Detect(pcm []byte) bool {
 		if err != nil {
 			if !d.hopErrLogged {
 				d.hopErrLogged = true
-				slog.Warn("ten vad process failed; hops count as silence until it recovers", "error", err)
+				slog.Warn("ten vad process failed; hops count as silence until it recovers", "call_id", d.callID, "error", err)
 			} else {
-				slog.Debug("ten vad process failed", "error", err)
+				slog.Debug("ten vad process failed", "call_id", d.callID, "error", err)
 			}
 		}
 
@@ -78,25 +96,44 @@ func (d *TenVadDetector) Detect(pcm []byte) bool {
 		d.idx = (d.idx + 1) % len(d.history)
 
 		d.carry = d.carry[tenVadHopSize:]
-	}
 
-	votes := 0
-	for _, speech := range d.history {
-		if speech {
-			votes++
+		// The window verdict as of THIS hop drives the onset/offset logs --
+		// a single Detect call can straddle a transition (it usually carries
+		// two hops), and each transition must log exactly once.
+		votes := 0
+		for _, speech := range d.history {
+			if speech {
+				votes++
+			}
+		}
+
+		result = votes >= bargeInVotesNeeded
+
+		switch {
+		case result && !d.speechActive:
+			d.speechActive = true
+			d.speechStartedAt = time.Now()
+			slog.Info("speech started", "call_id", d.callID)
+		case !result && d.speechActive:
+			d.speechActive = false
+			slog.Info("speech ended", "call_id", d.callID,
+				"duration_ms", time.Since(d.speechStartedAt).Milliseconds())
 		}
 	}
 
-	return votes >= bargeInVotesNeeded
+	return result
 }
 
 // Reset clears the carry buffer and vote history for a new SPEAKING turn.
-// The native instance's internal model state persists across turns -- it
-// carries no per-turn decision memory that would misfire here, and
+// Deliberately does NOT log "speech ended": Reset runs right after a barge-in
+// fired, whose own log line already marks the onset; an offset here would be
+// noise. The native instance's internal model state persists across turns --
+// it carries no per-turn decision memory that would misfire here, and
 // re-creating the instance per turn would put a native allocation on the
 // barge-in path for no benefit.
 func (d *TenVadDetector) Reset() {
 	d.carry = d.carry[:0]
 	d.history = [bargeInHistoryFrames]bool{}
 	d.idx = 0
+	d.speechActive = false
 }

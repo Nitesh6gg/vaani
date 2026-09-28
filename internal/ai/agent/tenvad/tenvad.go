@@ -116,7 +116,7 @@ func Version() string {
 // native TEN VAD instance. The instance is per-call (one detector per call,
 // created in newAgentHandler) so calls never share VAD state; the GC
 // finalizer reclaims it at teardown.
-func NewBargeInDetector(threshold float64) (agent.BargeInDetector, error) {
+func NewBargeInDetector(callID string, threshold float64) (agent.BargeInDetector, error) {
 	vad, err := New(HopSize, float32(threshold))
 	if err != nil {
 		return nil, err
@@ -127,5 +127,5 @@ func NewBargeInDetector(threshold float64) (agent.BargeInDetector, error) {
 		return speech, err
 	}
 
-	return agent.NewTenVadDetector(hop), nil
+	return agent.NewTenVadDetector(callID, hop), nil
 }

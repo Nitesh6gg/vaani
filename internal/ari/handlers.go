@@ -532,7 +532,7 @@ func (m *Manager) newAgentHandler(ctx context.Context, callID string) media.Hand
 // never a failed call: a worse detector beats no detector.
 func (m *Manager) newBargeInDetector(callID string) agent.BargeInDetector {
 	if m.cfg.VadMode == "ten" {
-		det, err := tenvad.NewBargeInDetector(m.cfg.TenVadThreshold)
+		det, err := tenvad.NewBargeInDetector(callID, m.cfg.TenVadThreshold)
 		if err != nil {
 			slog.Warn("agent: TEN VAD unavailable, falling back to the energy detector",
 				"call_id", callID, "error", err)

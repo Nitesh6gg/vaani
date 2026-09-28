@@ -15,7 +15,7 @@ import (
 
 // NewBargeInDetector always fails off-Linux: VAD_MODE=ten cannot work
 // without the native library.
-func NewBargeInDetector(threshold float64) (agent.BargeInDetector, error) {
+func NewBargeInDetector(callID string, threshold float64) (agent.BargeInDetector, error) {
 	return nil, errors.New("tenvad: TEN VAD needs a Linux cgo build (VAD_MODE=ten falls back to the energy detector on this platform)")
 }
 
