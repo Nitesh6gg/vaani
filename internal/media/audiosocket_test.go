@@ -86,6 +86,61 @@ func TestWriteAudioSocketFrame_RejectsOversizedPayload(t *testing.T) {
 	assert.ErrorIs(t, err, ErrAudioSocketFrameTooLarge)
 }
 
+// countingWriter records the length of every Write call it receives.
+type countingWriter struct {
+	writeLens []int
+}
+
+func (w *countingWriter) Write(p []byte) (int, error) {
+	w.writeLens = append(w.writeLens, len(p))
+	return len(p), nil
+}
+
+// TestWriteAudioSocketFrame_SingleWriteCall is the regression test for a live
+// disconnect bug: header and payload previously went out as two separate
+// Write calls, which Go's (Nagle-disabled) TCP sockets can put in different
+// packets. Asterisk's res_audiosocket reads the header, then reads the
+// payload with only a 5ms poll timeout on that second read -- any network
+// delay between the two packets past 5ms (never visible on localhost, real
+// over a routed cross-subnet path) made it log "Poll timed out while waiting
+// for data" and hang up the channel mid-call.
+func TestWriteAudioSocketFrame_SingleWriteCall(t *testing.T) {
+	w := &countingWriter{}
+	payload := make([]byte, FrameSize)
+
+	require.NoError(t, WriteAudioSocketFrame(w, AudioSocketKindSlin16, payload))
+
+	require.Len(t, w.writeLens, 1, "header and payload must go out in one Write call, not two")
+	assert.Equal(t, audioSocketHeaderSize+FrameSize, w.writeLens[0])
+}
+
+func TestWriteAudioSocketFrameInto_SingleWriteCall(t *testing.T) {
+	w := &countingWriter{}
+
+	var buf [audioSocketHeaderSize + FrameSize]byte
+
+	payload := make([]byte, FrameSize)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+
+	require.NoError(t, writeAudioSocketFrameInto(w, buf[:], AudioSocketKindSlin16, payload))
+
+	require.Len(t, w.writeLens, 1, "the reused-buffer hot path must also write header+payload in one call")
+	assert.Equal(t, audioSocketHeaderSize+FrameSize, w.writeLens[0])
+	assert.Equal(t, payload, buf[audioSocketHeaderSize:], "payload must be copied into the shared buffer correctly")
+}
+
+func TestWriteAudioSocketFrameInto_RejectsOversizedPayload(t *testing.T) {
+	w := &countingWriter{}
+
+	var buf [audioSocketHeaderSize + FrameSize]byte
+
+	err := writeAudioSocketFrameInto(w, buf[:], AudioSocketKindSlin16, make([]byte, audioSocketMaxPayload+1))
+	assert.ErrorIs(t, err, ErrAudioSocketFrameTooLarge)
+	assert.Empty(t, w.writeLens, "must reject before ever calling Write")
+}
+
 // TestAudioSocketFrame_MultipleFramesOnOneStream proves frames can be read back
 // to back from a single stream (the real TCP usage pattern), since AudioSocket
 // carries a continuous sequence of frames, not one per connection.

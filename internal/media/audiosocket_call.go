@@ -75,6 +75,12 @@ type AudioSocketCallMedia struct {
 	inbound      chan *[]byte
 	outbound     chan *[]byte
 
+	// writeBuf is writeLoop's reused header+payload scratch buffer for
+	// writeAudioSocketFrameInto -- sized once for the one frame size this hot
+	// path ever sends, so it never allocates (invariant #3). writeLoop-goroutine-
+	// owned only.
+	writeBuf [audioSocketHeaderSize + FrameSize]byte
+
 	prevRelease time.Time
 
 	// rmsSum/rmsTicks accumulate under rmsMu: releaseLoop writes them on every
@@ -276,11 +282,13 @@ func (c *AudioSocketCallMedia) releaseLoop(ctx context.Context) {
 // startup), it still sends a silence frame on schedule, per the pacer invariant.
 //
 // A failed write is fatal to this call's media, not just a dropped frame:
-// WriteAudioSocketFrame writes header and payload as separate writes, so a
-// payload failure leaves the framed stream misaligned -- every subsequent frame
-// would be parsed at the wrong boundary, corrupting audio rather than degrading
-// it. On the first write error the loop stops writing and closes the connection
-// (which also unblocks the reader); call teardown follows via StasisEnd.
+// writeAudioSocketFrameInto writes header+payload as one Write call (see
+// audiosocket.go's package doc comment for why that matters), but a short
+// write or any error still leaves the framed stream misaligned -- every
+// subsequent frame would be parsed at the wrong boundary, corrupting audio
+// rather than degrading it. On the first write error the loop stops writing
+// and closes the connection (which also unblocks the reader); call teardown
+// follows via StasisEnd.
 func (c *AudioSocketCallMedia) writeLoop(ctx context.Context) {
 	dead := false
 
@@ -307,7 +315,7 @@ func (c *AudioSocketCallMedia) writeLoop(ctx context.Context) {
 		// caller ignored AudioSocketConfig.ToWire's contract.
 		FromLE(*frame, c.toWire)
 
-		err := WriteAudioSocketFrame(c.conn, AudioSocketKindSlin16, *frame)
+		err := writeAudioSocketFrameInto(c.conn, c.writeBuf[:], AudioSocketKindSlin16, *frame)
 
 		PutFrame(frame)
 
