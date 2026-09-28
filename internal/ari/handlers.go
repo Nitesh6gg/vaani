@@ -498,10 +498,11 @@ func (m *Manager) newAgentHandler(ctx context.Context, callID string) media.Hand
 		return nil
 	}
 
-	var bargeIn agent.BargeInDetector = agent.NoopBargeInDetector{}
-	if m.cfg.BargeInEnabled {
-		bargeIn = m.newBargeInDetector(callID)
-	}
+	// VAD_MODE=ten always runs the real TEN VAD -- even with barge-in
+	// disabled, where it observes (speech started/ended logs) without ever
+	// cutting. BARGE_IN_ENABLED then only decides whether the detector's
+	// verdict is allowed to cut playback (see agent.Config.BargeInObserveOnly).
+	bargeIn := m.newBargeInDetector(callID)
 
 	return agent.NewHandler(ctx, callID, agent.Config{
 		STT: sttClient,
@@ -515,21 +516,25 @@ func (m *Manager) newAgentHandler(ctx context.Context, callID string) media.Hand
 				})
 			})
 		},
-		LLM:            llm.NewClient(m.cfg.LLMBaseURL, m.cfg.LLMAPIKey, m.cfg.LLMModel),
-		SystemPrompt:   m.cfg.AgentSystemPrompt,
-		Greeting:       m.cfg.AgentGreeting,
-		BargeIn:        bargeIn,
-		BargeInGuard:   m.cfg.BargeInGuard,
-		PostCutSilence: m.cfg.PostCutSilence,
-		Sink:           metrics.AgentSink{},
+		LLM:                llm.NewClient(m.cfg.LLMBaseURL, m.cfg.LLMAPIKey, m.cfg.LLMModel),
+		SystemPrompt:       m.cfg.AgentSystemPrompt,
+		Greeting:           m.cfg.AgentGreeting,
+		BargeIn:            bargeIn,
+		BargeInObserveOnly: !m.cfg.BargeInEnabled,
+		BargeInGuard:       m.cfg.BargeInGuard,
+		PostCutSilence:     m.cfg.PostCutSilence,
+		Sink:               metrics.AgentSink{},
 	})
 }
 
 // newBargeInDetector builds the caller-interrupt detector for one call.
 // VAD_MODE=ten selects TEN VAD (a real neural VAD -- see
-// internal/ai/agent/tenvad); anything it needs (the native library, a Linux
-// cgo build) missing is a loud warn plus fallback to the energy detector,
-// never a failed call: a worse detector beats no detector.
+// internal/ai/agent/tenvad) and runs it regardless of BARGE_IN_ENABLED:
+// disabled barge-in means observe-only, not a dead VAD. Energy mode keeps
+// the old semantics -- disabled barge-in is a true no-op, since the RMS
+// detector has no logging to offer. Anything TEN VAD needs (the native
+// library, a Linux cgo build) missing is a loud warn plus fallback to the
+// energy detector, never a failed call: a worse detector beats no detector.
 func (m *Manager) newBargeInDetector(callID string) agent.BargeInDetector {
 	if m.cfg.VadMode == "ten" {
 		det, err := tenvad.NewBargeInDetector(callID, m.cfg.TenVadThreshold)
@@ -537,14 +542,24 @@ func (m *Manager) newBargeInDetector(callID string) agent.BargeInDetector {
 			slog.Warn("agent: TEN VAD unavailable, falling back to the energy detector",
 				"call_id", callID, "error", err)
 		} else {
+			mode := "cutting"
+			if !m.cfg.BargeInEnabled {
+				mode = "observe-only (BARGE_IN_ENABLED=0)"
+			}
+
 			slog.Info("agent: barge-in detector: TEN VAD",
-				"call_id", callID, "threshold", m.cfg.TenVadThreshold, "ten_vad_version", tenvad.Version())
+				"call_id", callID, "threshold", m.cfg.TenVadThreshold,
+				"ten_vad_version", tenvad.Version(), "mode", mode)
 
 			return det
 		}
 	}
 
-	return agent.NewEnergyDetector(m.cfg.BargeInRMSFloor)
+	if m.cfg.BargeInEnabled {
+		return agent.NewEnergyDetector(m.cfg.BargeInRMSFloor)
+	}
+
+	return agent.NoopBargeInDetector{}
 }
 
 // startRTPMedia constructs and runs the RTP media plane for an already-bridged

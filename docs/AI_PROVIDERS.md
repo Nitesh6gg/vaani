@@ -60,7 +60,7 @@ startup -- changing any of them requires a restart.
 
 | Env | Meaning |
 |---|---|
-| `BARGE_IN_ENABLED` | `1` (default) = interruption on. `0` = off: the agent never gets interrupted and talks over any inbound audio until its turn finishes (a no-op detector is wired in; all VAD logging disappears with it). |
+| `BARGE_IN_ENABLED` | `1` (default) = interruption on. `0` = never cut, two flavors: with `VAD_MODE=ten` the VAD still runs in observe-only mode and keeps logging `speech started`/`speech ended`; with `VAD_MODE=energy` barge-in is fully off (no-op detector). |
 | `VAD_MODE` | `energy` (default): RMS-threshold detector, no native dependency. `ten`: TEN VAD, a real neural VAD that tells speech from coughs/music/line noise (native library vendored under `third_party/ten-vad`; Linux/cgo only -- elsewhere, or if the library can't load, calls fall back to `energy` with a loud warning). |
 | `TEN_VAD_THRESHOLD` | TEN VAD speech-probability threshold in [0,1], default 0.5. Only used when `VAD_MODE=ten`. |
 | `BARGE_IN_RMS_FLOOR` | Energy detector's RMS speech threshold. Only used when `VAD_MODE=energy`. |

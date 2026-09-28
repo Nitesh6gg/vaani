@@ -112,6 +112,13 @@ type Config struct {
 	Greeting string
 
 	BargeIn BargeInDetector
+	// BargeInObserveOnly, when true, runs the detector for observability but
+	// never cuts: the speech started/ended transition logs keep flowing while
+	// the agent talks over any inbound audio until its turn finishes. Set by
+	// the wiring when BARGE_IN_ENABLED=0 and VAD_MODE selects a detector with
+	// logging (TEN VAD) -- "observe, don't cut". With it false, a sustained
+	// Detect verdict cuts playback as usual.
+	BargeInObserveOnly bool
 	// BargeInGuard ignores barge-in detection for this long after entering
 	// SPEAKING, so the agent's own voice leaking into the mic at the start of
 	// playback can't immediately trigger a false self-interrupt.
@@ -276,10 +283,21 @@ func (h *Handler) ProcessFrame(_ context.Context, _ string, pcm []byte) [][]byte
 }
 
 func (h *Handler) processSpeakingFrame(pcm []byte) [][]byte {
-	h.appendPreroll(pcm)
+	// The preroll buffer exists solely to recover the interrupting
+	// utterance's start on a cut; in observe-only mode no cut can ever fire,
+	// so skip the per-frame copy entirely.
+	if !h.cfg.BargeInObserveOnly {
+		h.appendPreroll(pcm)
+	}
+
+	// Detect runs on every SPEAKING frame whether or not cuts are enabled:
+	// it feeds the vote window and drives the speech started/ended
+	// transition logs. In observe-only mode (BARGE_IN_ENABLED=0 with a
+	// logging VAD) the verdict changes nothing else.
+	detected := h.cfg.BargeIn.Detect(pcm)
 
 	elapsed := time.Duration(time.Now().UnixNano() - h.speakingSince.Load())
-	if elapsed >= h.cfg.BargeInGuard && h.cfg.BargeIn.Detect(pcm) {
+	if detected && !h.cfg.BargeInObserveOnly && elapsed >= h.cfg.BargeInGuard {
 		// Order matters: flip state and flush BEFORE signaling run() to cut
 		// the turn, so the very next ProcessFrame call (20ms later) already
 		// resumes feeding STT live instead of re-detecting the same barge-in.

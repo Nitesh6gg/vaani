@@ -1,13 +1,17 @@
 package agent
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/nitesh/vaani/internal/ai/tts"
 )
 
 // pcmFrame encodes int16 samples as one 20ms LE PCM16 frame, the shape
@@ -242,4 +246,52 @@ func TestTenVadDetector_ResetDoesNotLogSpeechEnded(t *testing.T) {
 	d.Detect(loudFrame())
 	assert.Equal(t, 2, strings.Count(buf.String(), "speech started"))
 	assert.NotContains(t, buf.String(), "speech ended")
+}
+
+// TestHandler_ObserveOnlyNeverCuts pins the BARGE_IN_ENABLED=0 + VAD_MODE=ten
+// semantics ("observe, don't cut"): the real detector still runs and its
+// speech started transition still logs, but a sustained speech verdict never
+// fires a barge-in -- the agent keeps playing its reply, the TTS connection
+// stays alive, and no preroll is flushed to STT.
+func TestHandler_ObserveOnlyNeverCuts(t *testing.T) {
+	buf := captureSlog(t)()
+	fSTT := newFakeSTT()
+	fTTS := newFakeTTS()
+	fLLM := &fakeLLM{tokens: []string{"a reply the caller talks over"}}
+
+	rh := newLevelHop()
+
+	h := NewHandler(context.Background(), "call1", Config{
+		STT:                fSTT,
+		NewTTS:             func() (tts.Client, error) { return fTTS, nil },
+		LLM:                fLLM,
+		BargeIn:            NewTenVadDetector("call1", rh.detect),
+		BargeInObserveOnly: true,
+		BargeInGuard:       0,
+		PostCutSilence:     50 * time.Millisecond,
+		Sink:               NoopSink{},
+	})
+
+	fSTT.sendFinal("hi")
+	require.Eventually(t, func() bool { return fTTS.spokenCount() > 0 }, time.Second, time.Millisecond)
+
+	const gen = 1
+
+	fTTS.audio <- tts.Chunk{PCM: constFrame(loudAmplitude), Gen: gen}
+	require.Eventually(t, func() bool { return h.State() == StateSpeaking }, time.Second, time.Millisecond)
+
+	fedBefore := fSTT.fedCount()
+
+	// Far more loud frames than a 3-of-5 vote needs: in cutting mode this
+	// would fire barge-in several times over.
+	for i := 0; i < 12; i++ {
+		h.ProcessFrame(context.Background(), "call1", constFrame(loudAmplitude))
+	}
+
+	assert.Equal(t, StateSpeaking, h.State(), "observe-only must never leave Speaking via a barge-in")
+	assert.False(t, fTTS.wasCancelled(), "observe-only must never cancel the TTS connection")
+	assert.Equal(t, fedBefore, fSTT.fedCount(), "observe-only must not flush preroll to STT")
+	assert.Equal(t, 1, strings.Count(buf.String(), "speech started"),
+		"the detector's transition logging must survive in observe-only mode")
+	assert.NotContains(t, buf.String(), "agent barge-in detected")
 }
