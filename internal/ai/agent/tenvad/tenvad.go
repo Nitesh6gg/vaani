@@ -14,6 +14,14 @@
 // The wrapper deliberately stays a thin, dumb binding: all buffering and
 // voting policy lives in agent.TenVadDetector (pure Go, unit-tested on any
 // platform) so the logic is testable without the native library.
+//
+// The vendored library lives at the repo root, four levels up from this
+// package's directory. ${SRCDIR} is substituted at build time with an
+// absolute path, so the rpath keeps working for both `go run` and binaries
+// built from the same checkout. Everything in the comment block directly
+// above `import "C"` below is the cgo preamble, which cgo strips of its
+// comment markers and feeds to the C compiler as source -- prose must live
+// up here in the Go doc comment, never in the preamble.
 package tenvad
 
 import (
@@ -23,15 +31,9 @@ import (
 	"github.com/nitesh/vaani/internal/ai/agent"
 )
 
-// The vendored library lives at the repo root, four levels up from this
-// package's directory. ${SRCDIR} is substituted at build time with an
-// absolute path, so the rpath keeps working for both `go run` and binaries
-// built from the same checkout.
-//
 // #cgo CFLAGS: -I${SRCDIR}/../../../../third_party/ten-vad/include
 // #cgo LDFLAGS: -L${SRCDIR}/../../../../third_party/ten-vad/lib/Linux/x64 -lten_vad -Wl,-rpath,${SRCDIR}/../../../../third_party/ten-vad/lib/Linux/x64
 // #include <ten_vad.h>
-// #include <stdlib.h>
 import "C"
 
 // HopSize is TEN VAD's analysis hop in samples: 256 = 16ms at 16kHz (the
