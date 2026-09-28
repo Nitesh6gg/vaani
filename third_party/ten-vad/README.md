@@ -15,6 +15,15 @@ that is Vaani's only production target (deploy/asterisk builds on Debian); other
 platforms fall back to the energy detector via the `tenvad` stub (see the
 `//go:build` constraints in the wrapper).
 
+**System dependency:** `libten_vad.so` is built against LLVM's libc++ (its
+symbols are in the `std::__1::` namespace), which Debian does not ship by
+default. The deployment box needs
+
+    apt-get install -y libc++1 libc++abi1
+
+or the linker fails with "libc++.so.1, needed by libten_vad.so, not found" and
+a wall of `std::__1::...` undefined references.
+
 To refresh: download both files from a newer ten-vad commit with
 
     curl -sL -o include/ten_vad.h https://raw.githubusercontent.com/TEN-framework/ten-vad/main/include/ten_vad.h
