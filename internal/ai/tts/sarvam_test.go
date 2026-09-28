@@ -1,9 +1,11 @@
 package tts
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -370,4 +372,116 @@ func TestSarvamClient_CancelClosesImmediatelyRegardlessOfPending(t *testing.T) {
 			return false
 		}
 	}, time.Second, 5*time.Millisecond, "Cancel must close Audio() immediately, not wait for a final that never comes")
+}
+
+// captureSlog swaps the default slog logger for one writing to a buffer,
+// restores it on cleanup, and returns that buffer.
+func captureSlog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+
+	buf := &bytes.Buffer{}
+	original := slog.Default()
+
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(original) })
+
+	return buf
+}
+
+// TestSarvamClient_ProviderErrorLogsRejectedText pins the diagnostic for live
+// TTS rejections: Sarvam rejects one request of a multi-request reply with
+// only a generic error ("Text must contain at least one character from the
+// allowed languages"), so without naming the text there is no way to tell
+// WHICH sentence of the reply was silently skipped or why.
+func TestSarvamClient_ProviderErrorLogsRejectedText(t *testing.T) {
+	buf := captureSlog(t)
+
+	srv := ttsServer(t, func(conn *websocket.Conn, r *http.Request) {
+		_, _, _ = conn.ReadMessage() // config
+		_, _, _ = conn.ReadMessage() // text (first)
+		_, _, _ = conn.ReadMessage() // flush (first)
+		_, _, _ = conn.ReadMessage() // text (second)
+		_, _, _ = conn.ReadMessage() // flush (second)
+		// In-order: the error resolves the FIRST request, the final the second.
+		_ = conn.WriteJSON(map[string]any{
+			"type": "error",
+			"data": map[string]any{"message": "Text must contain at least one character from the allowed languages."},
+		})
+		_ = sendFinal(conn)
+	})
+
+	c, err := NewSarvamClient(context.Background(), "call1", Config{WSURL: wsURL(srv.URL), APIKey: "k", Model: "bulbul:v3", Voice: "shubh"})
+	require.NoError(t, err)
+	defer func() { _ = c.Close() }()
+
+	require.NoError(t, c.Speak("पहला वाक्य", 1))
+	require.NoError(t, c.Speak("second sentence", 1))
+	c.EndGeneration(1)
+
+	select {
+	case <-c.Done(): // fires only after both requests resolved: the log line is written by then
+	case <-time.After(time.Second):
+		t.Fatal("Done never fired")
+	}
+
+	assert.Contains(t, buf.String(), "tts provider error")
+	assert.Contains(t, buf.String(), `rejected_text="पहला वाक्य"`,
+		"the log must name the text Sarvam rejected (the first outstanding request), not the second")
+}
+
+func TestSarvamClient_TruncateRunes(t *testing.T) {
+	assert.Empty(t, truncateRunes("", 80))
+	assert.Equal(t, "short", truncateRunes("short", 80))
+	assert.Equal(t, strings.Repeat("a", 80)+"…", truncateRunes(strings.Repeat("a", 100), 80))
+	assert.Len(t, []rune(truncateRunes(strings.Repeat("अ", 100), 80)), 81, "Devanagari truncates by runes, not bytes")
+}
+
+// TestSarvamClient_ProviderCloseIsLoggedSelfCloseIsNot pins the close-source
+// diagnostic: when SARVAM drops (or the network kills) the websocket, the
+// receive loop used to exit silently and a mid-reply stall was
+// indistinguishable from a Vaani-side close. A provider-side close must log
+// an error; a Vaani-initiated close (Cancel/Close) must stay silent.
+func TestSarvamClient_ProviderCloseIsLoggedSelfCloseIsNot(t *testing.T) {
+	t.Run("provider closes", func(t *testing.T) {
+		buf := captureSlog(t)
+
+		srv := ttsServer(t, func(conn *websocket.Conn, r *http.Request) {
+			_, _, _ = conn.ReadMessage() // config
+			_ = conn.Close()             // provider drops the connection
+		})
+
+		c, err := NewSarvamClient(context.Background(), "call1", Config{WSURL: wsURL(srv.URL), APIKey: "k", Model: "bulbul:v3", Voice: "shubh"})
+		require.NoError(t, err)
+
+		for range c.Audio() { // returns once receiveLoop has observed the close
+		}
+
+		assert.Contains(t, buf.String(), "tts websocket closed by provider")
+	})
+
+	t.Run("vaani closes", func(t *testing.T) {
+		buf := captureSlog(t)
+
+		srv := ttsServer(t, func(conn *websocket.Conn, r *http.Request) {
+			_, _, _ = conn.ReadMessage() // config
+			<-r.Context().Done()         // hold the connection open until the test ends
+		})
+
+		c, err := NewSarvamClient(context.Background(), "call1", Config{WSURL: wsURL(srv.URL), APIKey: "k", Model: "bulbul:v3", Voice: "shubh"})
+		require.NoError(t, err)
+
+		require.NoError(t, c.Close())
+
+		require.Eventually(t, func() bool {
+			select {
+			case _, open := <-c.Audio():
+				return !open
+			default:
+				return false
+			}
+		}, time.Second, 5*time.Millisecond)
+
+		assert.NotContains(t, buf.String(), "tts websocket closed by provider",
+			"a Vaani-initiated close is not a provider failure and must not be logged as one")
+	})
 }

@@ -80,10 +80,11 @@ type sarvamClient struct {
 
 	writeMu sync.Mutex
 
-	genMu       sync.Mutex
-	pendingGens []uint64        // FIFO: one entry per outstanding Speak call, in send order
-	endedGens   map[uint64]bool // EndGeneration has been called for this gen
-	lastGen     uint64          // most recent gen seen, for tagging audio if pendingGens is briefly empty
+	genMu        sync.Mutex
+	pendingGens  []uint64        // FIFO: one entry per outstanding Speak call, in send order
+	pendingTexts []string        // FIFO, lockstep with pendingGens: the text of each outstanding request, for provider-error logs
+	endedGens    map[uint64]bool // EndGeneration has been called for this gen
+	lastGen      uint64          // most recent gen seen, for tagging audio if pendingGens is briefly empty
 
 	stateMu sync.Mutex
 	closed  bool // connection already torn down; guards against a double-close
@@ -184,6 +185,7 @@ func (c *sarvamClient) Speak(text string, gen uint64) error {
 
 	c.genMu.Lock()
 	c.pendingGens = append(c.pendingGens, gen)
+	c.pendingTexts = append(c.pendingTexts, text)
 	c.lastGen = gen
 	c.genMu.Unlock()
 
@@ -267,15 +269,26 @@ func (c *sarvamClient) forceClose() {
 // receiveLoop): Sarvam sends error INSTEAD OF final for a rejected request,
 // never both, but that request is just as resolved either way -- no more
 // audio is coming for it, so its slot must clear the same way or its
-// generation's Done would never fire.
-func (c *sarvamClient) onFinal() {
+// generation's Done would never fire. Returns the popped request's text (the
+// one Sarvam just finished synthesizing or rejected), for error logging.
+func (c *sarvamClient) onFinal() string {
 	c.genMu.Lock()
 	if len(c.pendingGens) == 0 {
 		c.genMu.Unlock()
-		return
+
+		return ""
 	}
+
 	gen := c.pendingGens[0]
 	c.pendingGens = c.pendingGens[1:]
+
+	var text string
+
+	if len(c.pendingTexts) > 0 {
+		text = c.pendingTexts[0]
+		c.pendingTexts = c.pendingTexts[1:]
+	}
+
 	pending := c.genHasPendingLocked(gen)
 	ended := c.endedGens[gen]
 	c.genMu.Unlock()
@@ -283,6 +296,8 @@ func (c *sarvamClient) onFinal() {
 	if !pending && ended {
 		c.emitDone(gen)
 	}
+
+	return text
 }
 
 // peekGen returns the generation to attribute the next arriving audio chunk
@@ -307,6 +322,20 @@ func (c *sarvamClient) receiveLoop() {
 	for {
 		_, data, err := c.conn.ReadMessage()
 		if err != nil {
+			c.stateMu.Lock()
+			selfClosed := c.closed
+			c.stateMu.Unlock()
+
+			// A silent exit here made "Sarvam stopped responding" and
+			// "Vaani closed the connection" indistinguishable -- observed
+			// live: a turn's audio stopped arriving mid-reply and never
+			// resumed, with no log line at all. Log loudly only when VAANI
+			// didn't initiate the close.
+			if !selfClosed {
+				slog.Error("tts websocket closed by provider",
+					"call_id", c.callID, "error", err)
+			}
+
 			return
 		}
 
@@ -317,8 +346,15 @@ func (c *sarvamClient) receiveLoop() {
 
 		switch {
 		case m.Type == "error":
-			slog.Warn("tts provider error", "call_id", c.callID, "message", m.Data.Message)
-			c.onFinal() // the rejected request is resolved, not retried -- see onFinal's doc comment
+			// Sarvam sends error INSTEAD OF a "final" for the rejected
+			// request, so onFinal's pop both resolves the slot and yields
+			// exactly the text that was rejected. Without it the log only
+			// says WHAT category of rejection happened, not WHICH sentence
+			// of the reply was silently skipped.
+			slog.Warn("tts provider error",
+				"call_id", c.callID,
+				"message", m.Data.Message,
+				"rejected_text", truncateRunes(c.onFinal(), 80))
 		case m.Type == "event" && m.Data.EventType == "final":
 			c.onFinal()
 		case m.Type == "audio" && m.Data.Audio != "":
@@ -334,6 +370,22 @@ func (c *sarvamClient) receiveLoop() {
 			}
 		}
 	}
+}
+
+// truncateRunes caps s at max runes (appending an ellipsis when cut) so a
+// provider-error log can name the rejected text without dumping a whole
+// sentence into the log.
+func truncateRunes(s string, max int) string {
+	if s == "" {
+		return ""
+	}
+
+	runes := []rune(s)
+	if len(runes) <= max {
+		return s
+	}
+
+	return string(runes[:max]) + "…"
 }
 
 func (c *sarvamClient) keepaliveLoop(ctx context.Context) {

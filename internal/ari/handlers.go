@@ -167,7 +167,7 @@ func NewManager(cl ari.Client, cfg config.Config, ports *media.PortAllocator) *M
 // Run subscribes to the Stasis events this app cares about and dispatches them
 // until ctx is cancelled.
 func (m *Manager) Run(ctx context.Context) {
-	sub := m.cl.Bus().Subscribe(nil, "StasisStart", "StasisEnd", "ChannelDtmfReceived")
+	sub := m.cl.Bus().Subscribe(nil, "StasisStart", "StasisEnd", "ChannelDtmfReceived", "ChannelDestroyed")
 	defer sub.Cancel()
 
 	go m.watchConnectivity(ctx)
@@ -189,6 +189,16 @@ func (m *Manager) Run(ctx context.Context) {
 				m.onStasisEnd(e)
 			case *ari.ChannelDtmfReceived:
 				slog.Debug("dtmf received", "call_id", e.Channel.ID, "digit", e.Digit)
+			case *ari.ChannelDestroyed:
+				// StasisEnd alone doesn't say WHY a channel left.
+				// ChannelDestroyed carries the hangup cause, which
+				// distinguishes a normal caller hangup (16, "Normal
+				// Clearing") from carrier drops, busy/congestion, and
+				// Asterisk-initiated kicks (e.g. its AudioSocket read
+				// timeout) -- without it, every teardown looks identical.
+				slog.Info("channel destroyed",
+					"call_id", e.Channel.ID,
+					"cause", e.Cause, "cause_txt", e.CauseTxt)
 			}
 		}
 	}
@@ -642,7 +652,19 @@ func (m *Manager) onStasisEnd(e *ari.StasisEnd) {
 	m.mu.Unlock()
 
 	if ok {
+		// Reaching the active map means this is the call's FIRST StasisEnd
+		// (the maps were just cleared; the second leg's StasisEnd finds
+		// nothing) -- so this leg is the one that ended the call, and
+		// teardown is hanging up the other side in response. Paired with
+		// ChannelDestroyed's hangup cause, this says who ended the call.
+		leg := "externalMedia"
+		if id == c.ID {
+			leg = "caller"
+		}
+
+		slog.Info("call ended by leg", "call_id", c.ID, "leg", leg, "channel_id", id, "external_id", c.ExternalID)
 		m.teardown(c)
+
 		return
 	}
 

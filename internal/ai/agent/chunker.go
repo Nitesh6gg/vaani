@@ -65,22 +65,43 @@ func (c *SentenceChunker) Feed(token string) []string {
 // languages", observed live), and every such request is also a needless
 // network round trip that can stall audio delivery mid-turn. Withholding the
 // cut lets the punctuation absorb into the next real content instead.
+//
+// A '.' directly after a digit doesn't cut either, even though the digit
+// counts as content: it's a numbered-list marker ("1.", "\n2." -- observed
+// live: each marker flushed as its own digit-only chunk and was rejected by
+// Sarvam with that same 400, silently skipping a request mid-reply) or a
+// decimal point ("3.5" splitting into "3." + "5…"). Only '.' is special-cased
+// -- danda, !, ?, and newline don't occur inside numbers or list markers.
+// Tradeoff: an English sentence genuinely ending in a number ("born in
+// 1990.") merges into the following sentence and starts slightly later.
 func (c *SentenceChunker) nextCut() (cut int, ok bool) {
 	runeCount := 0
 	hasContent := false
+	var prev rune
 
 	for i := 0; i < len(c.buf); {
 		r, size := utf8.DecodeRune(c.buf[i:])
 		i += size
 		runeCount++
 
+		if runeCount >= chunkerRuneThreshold {
+			return i, true
+		}
+
+		if sentenceDelimiters[r] && hasContent {
+			if r == '.' && unicode.IsDigit(prev) {
+				prev = r
+				continue
+			}
+
+			return i, true
+		}
+
 		if unicode.IsLetter(r) || unicode.IsDigit(r) {
 			hasContent = true
 		}
 
-		if runeCount >= chunkerRuneThreshold || (sentenceDelimiters[r] && hasContent) {
-			return i, true
-		}
+		prev = r
 	}
 
 	return 0, false

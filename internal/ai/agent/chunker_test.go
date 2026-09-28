@@ -104,3 +104,66 @@ func TestSentenceChunker_FlushDropsPunctuationOnlyRemainder(t *testing.T) {
 
 	assert.Equal(t, "", c.Flush(), "a content-free remainder has nothing to absorb into, so it's dropped")
 }
+
+// TestSentenceChunker_DigitBeforeDotDoesNotCut is the regression test for the
+// live TTS rejections: a '.' directly after a digit is a numbered-list marker
+// ("1.", "\n2.") or a decimal point, not a sentence end. The digit counts as
+// content, so without this rule each marker flushed as its own digit-only
+// chunk, which Sarvam's TTS rejects with a 400 ("must contain at least one
+// character from the allowed languages") -- silently skipping a request
+// mid-reply.
+func TestSentenceChunker_DigitBeforeDotDoesNotCut(t *testing.T) {
+	cases := []struct {
+		name  string
+		feeds []string
+		want  []string
+	}{
+		{
+			name:  "numbered list marker absorbs into its sentence",
+			feeds: []string{"Steps: ", "1.", " Do the thing."},
+			want:  []string{"Steps: 1. Do the thing."},
+		},
+		{
+			name:  "marker arriving token by token still absorbs",
+			feeds: []string{"Hello there. ", "\n", "2.", " Second item."},
+			want:  []string{"Hello there.", " \n2. Second item."},
+		},
+		{
+			name:  "decimal point does not split the sentence",
+			feeds: []string{"It costs 3.5 units."},
+			want:  []string{"It costs 3.5 units."},
+		},
+		{
+			name:  "sentence genuinely ending in a number merges into the next",
+			feeds: []string{"He was born in 1990. He moved later."},
+			want:  []string{"He was born in 1990. He moved later."},
+		},
+		{
+			name:  "real sentences still cut normally after a digit sentence",
+			feeds: []string{"In 1990. Then what?"},
+			want:  []string{"In 1990. Then what?"},
+		},
+		{
+			name:  "danda is unaffected by the digit rule",
+			feeds: []string{"संख्या 5। अगला।"},
+			want:  []string{"संख्या 5।", " अगला।"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &SentenceChunker{}
+
+			var out []string
+
+			for _, tok := range tc.feeds {
+				out = append(out, c.Feed(tok)...)
+			}
+
+			if rest := c.Flush(); rest != "" {
+				out = append(out, rest)
+			}
+
+			assert.Equal(t, tc.want, out)
+		})
+	}
+}
