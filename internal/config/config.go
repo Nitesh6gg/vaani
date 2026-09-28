@@ -294,7 +294,12 @@ func Load() (Config, error) {
 
 	cfg.BargeInGuard = time.Duration(bargeInGuardMS) * time.Millisecond
 
-	postCutSilenceMS, err := getEnvInt("POST_CUT_SILENCE_MS", 300)
+	// 1200ms: after a barge-in cut, the STT flushes the ~200ms preroll as a
+	// junk partial-utterance final (observed live: 1-2 character fragments in
+	// random scripts) roughly 0.5-1.5s after the cut; a gate this long drops
+	// exactly those while still accepting the caller's real next utterance,
+	// which lands when they pause. Overridable via POST_CUT_SILENCE_MS.
+	postCutSilenceMS, err := getEnvInt("POST_CUT_SILENCE_MS", 1200)
 	if err != nil {
 		return Config{}, err
 	}

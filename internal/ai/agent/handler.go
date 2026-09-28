@@ -479,11 +479,18 @@ func (h *Handler) handleGreeting() {
 
 	chunker := &SentenceChunker{}
 	for _, chunk := range chunker.Feed(h.cfg.Greeting) {
-		h.sendToTTS(h.tts, chunk, gen)
+		if gen != h.curGen {
+			// A barge-in superseded the greeting mid-speak (run-goroutine
+			// check, so this is race-free): stop speaking into a torn-down
+			// TTS connection.
+			return
+		}
+
+		h.sendToTTS(h.baseCtx, h.tts, chunk, gen)
 	}
 
-	if remainder := chunker.Flush(); remainder != "" {
-		h.sendToTTS(h.tts, remainder, gen)
+	if remainder := chunker.Flush(); remainder != "" && gen == h.curGen {
+		h.sendToTTS(h.baseCtx, h.tts, remainder, gen)
 	}
 
 	h.tts.EndGeneration(gen)
@@ -535,7 +542,7 @@ func (h *Handler) runLLMTurn(ctx context.Context, history []llm.Message, ttsClie
 		}
 
 		for _, chunk := range chunker.Feed(tok) {
-			h.sendToTTS(ttsClient, chunk, gen)
+			h.sendToTTS(ctx, ttsClient, chunk, gen)
 		}
 	})
 
@@ -551,7 +558,7 @@ func (h *Handler) runLLMTurn(ctx context.Context, history []llm.Message, ttsClie
 
 	if err == nil {
 		if remainder := chunker.Flush(); remainder != "" {
-			h.sendToTTS(ttsClient, remainder, gen)
+			h.sendToTTS(ctx, ttsClient, remainder, gen)
 		}
 
 		slog.Info("llm turn complete", "call_id", h.callID, "gen", gen,
@@ -571,9 +578,30 @@ func (h *Handler) runLLMTurn(ctx context.Context, history []llm.Message, ttsClie
 	}
 }
 
-func (h *Handler) sendToTTS(ttsClient tts.Client, text string, gen uint64) {
+// sendToTTS sends one text chunk for synthesis. ctx is the owning turn's
+// context: once it's cancelled (barge-in cut the turn), Speak attempts stop
+// entirely and the doomed write -- the TTS connection is already torn down by
+// Cancel -- is logged at Debug, not Warn. Observed live: every barge-in
+// produced a "tts speak failed: use of closed network connection" warn that
+// was pure cancellation noise.
+func (h *Handler) sendToTTS(ctx context.Context, ttsClient tts.Client, text string, gen uint64) {
+	if ctx.Err() != nil {
+		slog.Debug("tts speak skipped; turn already cancelled",
+			"call_id", h.callID, "gen", gen, "chars", len([]rune(text)))
+
+		return
+	}
+
 	if err := ttsClient.Speak(text, gen); err != nil {
 		h.cfg.Sink.Error("tts_speak")
+
+		if ctx.Err() != nil {
+			slog.Debug("tts speak failed after turn cancellation; expected",
+				"call_id", h.callID, "gen", gen, "error", err)
+
+			return
+		}
+
 		slog.Warn("tts speak failed", "call_id", h.callID, "gen", gen, "error", err)
 
 		return
