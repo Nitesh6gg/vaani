@@ -1,11 +1,8 @@
 # AI Provider Specs
 
-**Status: Phase 3 design placeholder. Nothing in this document is implemented yet.**
-`APP_MODE=agent` (the config value that would select the Handler described here)
-is rejected at startup with "not implemented yet" -- see `internal/config/config.go`
-and `cmd/server/main.go`. This file exists so the intended shape is written down
-before implementation starts, and so `README.md`/`CLAUDE.md`/`AGENTS.md`'s Docs
-Index links to something real instead of a 404.
+**Status: Phase 3 is implemented and running** (`APP_MODE=agent`). This document
+is the design record the STT/LLM/TTS clients and the agent Handler were built
+against; where it and the code disagree, the code and `.env.example` win.
 
 Phase 1/2 (ARI wiring, RTP/AudioSocket media planes, jitter buffer, the Handler
 seam) are done and documented in `docs/ARCHITECTURE.md` and
@@ -55,6 +52,28 @@ tick -- see "The Handler Contract" in `docs/AUDIO_PIPELINE.md`).
   -- closing the WebSocket alone isn't enough if frames already queued for the
   writer would still play out after the caller starts talking; the outbound
   queue must be drained too.
+
+## Barge-in configuration
+
+The caller-interrupts-agent switch and its tuning knobs. All are read at
+startup -- changing any of them requires a restart.
+
+| Env | Meaning |
+|---|---|
+| `BARGE_IN_ENABLED` | `1` (default) = interruption on. `0` = off: the agent never gets interrupted and talks over any inbound audio until its turn finishes (a no-op detector is wired in; all VAD logging disappears with it). |
+| `VAD_MODE` | `energy` (default): RMS-threshold detector, no native dependency. `ten`: TEN VAD, a real neural VAD that tells speech from coughs/music/line noise (native library vendored under `third_party/ten-vad`; Linux/cgo only -- elsewhere, or if the library can't load, calls fall back to `energy` with a loud warning). |
+| `TEN_VAD_THRESHOLD` | TEN VAD speech-probability threshold in [0,1], default 0.5. Only used when `VAD_MODE=ten`. |
+| `BARGE_IN_RMS_FLOOR` | Energy detector's RMS speech threshold. Only used when `VAD_MODE=energy`. |
+| `BARGE_IN_GUARD_MS` | Ignores detection this long after playback starts, so the agent's own voice leaking into the mic can't immediately self-trigger. Default 300. |
+| `POST_CUT_SILENCE_MS` | After a cut, how long before a new turn is accepted: the cut flushes a junk partial-utterance transcript to STT ~0.5-1.5s later, and this gate drops exactly those while still catching the caller's real next utterance. Default 1200. |
+
+While the agent is speaking, the active detector logs `speech started` /
+`speech ended` transitions (one per utterance boundary; per-hop verdicts are
+never logged), and a sustained interrupt fires `agent barge-in detected`,
+which cuts playback, cancels the in-flight LLM stream and TTS connection, and
+flushes queued audio -- after which the caller's utterance becomes the next
+turn. Turning `BARGE_IN_ENABLED` to `0` silences all of it for a quiet test
+run.
 
 ## Open questions for implementation time
 
