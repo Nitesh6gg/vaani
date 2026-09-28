@@ -27,13 +27,15 @@ const (
 
 // EnergyDetector is the default BargeInDetector: a plain RMS-threshold gate.
 // VAD_MODE=energy selects this; VAD_MODE=ten swaps in TEN VAD
-// (internal/ai/agent/tenvad, Linux/cgo only) behind the same interface, with no
-// change to the state machine that consumes it.
+// (internal/ai/agent/tenvad + TenVadDetector in bargein_ten.go, Linux/cgo
+// only) behind the same interface, with no change to the state machine that
+// consumes it.
 //
 // ponytail: RMS-over-threshold is a naive heuristic with a real ceiling -- it
-// can't distinguish speech from a loud cough or music on hold. Upgrade path is
-// VAD_MODE=ten once it's benchmarked live; this is the correct default until
-// then; it needs no native dependency and no live tuning to ship.
+// can't distinguish speech from a loud cough or music on hold. That upgrade
+// path now exists (TenVadDetector); this remains the correct DEFAULT until
+// TEN VAD is benchmarked live, since it needs no native dependency and no
+// live tuning to ship.
 type EnergyDetector struct {
 	floor   float64
 	history [bargeInHistoryFrames]bool

@@ -12,6 +12,7 @@ import (
 	"github.com/CyCoreSystems/ari/v5/rid"
 
 	"github.com/nitesh/vaani/internal/ai/agent"
+	"github.com/nitesh/vaani/internal/ai/agent/tenvad"
 	"github.com/nitesh/vaani/internal/ai/llm"
 	"github.com/nitesh/vaani/internal/ai/stt"
 	"github.com/nitesh/vaani/internal/ai/tts"
@@ -499,7 +500,7 @@ func (m *Manager) newAgentHandler(ctx context.Context, callID string) media.Hand
 
 	var bargeIn agent.BargeInDetector = agent.NoopBargeInDetector{}
 	if m.cfg.BargeInEnabled {
-		bargeIn = agent.NewEnergyDetector(m.cfg.BargeInRMSFloor)
+		bargeIn = m.newBargeInDetector(callID)
 	}
 
 	return agent.NewHandler(ctx, callID, agent.Config{
@@ -522,6 +523,28 @@ func (m *Manager) newAgentHandler(ctx context.Context, callID string) media.Hand
 		PostCutSilence: m.cfg.PostCutSilence,
 		Sink:           metrics.AgentSink{},
 	})
+}
+
+// newBargeInDetector builds the caller-interrupt detector for one call.
+// VAD_MODE=ten selects TEN VAD (a real neural VAD -- see
+// internal/ai/agent/tenvad); anything it needs (the native library, a Linux
+// cgo build) missing is a loud warn plus fallback to the energy detector,
+// never a failed call: a worse detector beats no detector.
+func (m *Manager) newBargeInDetector(callID string) agent.BargeInDetector {
+	if m.cfg.VadMode == "ten" {
+		det, err := tenvad.NewBargeInDetector(m.cfg.TenVadThreshold)
+		if err != nil {
+			slog.Warn("agent: TEN VAD unavailable, falling back to the energy detector",
+				"call_id", callID, "error", err)
+		} else {
+			slog.Info("agent: barge-in detector: TEN VAD",
+				"call_id", callID, "threshold", m.cfg.TenVadThreshold, "ten_vad_version", tenvad.Version())
+
+			return det
+		}
+	}
+
+	return agent.NewEnergyDetector(m.cfg.BargeInRMSFloor)
 }
 
 // startRTPMedia constructs and runs the RTP media plane for an already-bridged

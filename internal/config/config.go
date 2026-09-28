@@ -144,6 +144,17 @@ type Config struct {
 	// PostCutSilence is how long a barge-in cut requires quiet before a new
 	// turn is accepted. See internal/ai/agent.Config.PostCutSilence.
 	PostCutSilence time.Duration
+	// VadMode selects the barge-in detector when BargeInEnabled: "energy"
+	// (default -- the RMS-threshold EnergyDetector, no native dependency) or
+	// "ten" (TEN VAD, a real neural VAD -- Linux/cgo only, vendored under
+	// third_party/ten-vad). VAD_MODE=ten on a platform without the native
+	// library falls back to the energy detector with a loud warning at call
+	// setup, never breaks the call.
+	VadMode string
+	// TenVadThreshold is TEN VAD's speech-probability threshold in [0,1];
+	// the native binary decision is probability >= threshold. 0.5 is the
+	// official example's value. Only meaningful when VadMode is "ten".
+	TenVadThreshold float64
 }
 
 // Load reads configuration from the environment, applying local-dev defaults that
@@ -181,6 +192,7 @@ func Load() (Config, error) {
 		SarvamTTSVoice:      getEnv("SARVAM_TTS_VOICE", ""),
 		SarvamTTSLanguage:   getEnv("SARVAM_TTS_LANGUAGE", "en-IN"),
 		BargeInEnabled:      getEnv("BARGE_IN_ENABLED", "1") == "1",
+		VadMode:             getEnv("VAD_MODE", "energy"),
 	}
 
 	var err error
@@ -257,6 +269,18 @@ func Load() (Config, error) {
 
 	if cfg.BargeInRMSFloor < 0 {
 		return Config{}, fmt.Errorf("config: BARGE_IN_RMS_FLOOR must be >= 0, got %v", cfg.BargeInRMSFloor)
+	}
+
+	if cfg.VadMode != "energy" && cfg.VadMode != "ten" {
+		return Config{}, fmt.Errorf("config: VAD_MODE must be \"energy\" or \"ten\", got %q", cfg.VadMode)
+	}
+
+	if cfg.TenVadThreshold, err = getEnvFloat("TEN_VAD_THRESHOLD", 0.5); err != nil {
+		return Config{}, err
+	}
+
+	if cfg.TenVadThreshold < 0 || cfg.TenVadThreshold > 1 {
+		return Config{}, fmt.Errorf("config: TEN_VAD_THRESHOLD must be in [0,1], got %v", cfg.TenVadThreshold)
 	}
 
 	bargeInGuardMS, err := getEnvInt("BARGE_IN_GUARD_MS", 300)
