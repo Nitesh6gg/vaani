@@ -7,11 +7,24 @@
 // and where each was confirmed against the real API.
 package stt
 
-// Result is one transcript event from the stream.
+// Result is one event from the stream: a transcript, or (Signal set, no
+// Text) the provider's own VAD noticing the caller start or stop speaking.
+// Both kinds share one channel so they arrive in the order the provider sent
+// them (see sarvam.go).
 type Result struct {
-	Text  string
-	Final bool
+	Text   string
+	Final  bool
+	Signal Signal
 }
+
+// Signal is a provider VAD event.
+type Signal int
+
+const (
+	NoSignal Signal = iota
+	SpeechStarted
+	SpeechEnded
+)
 
 // Client streams inbound audio to a speech-to-text provider and emits partial
 // and final transcript events. Implementations must tolerate Feed being called

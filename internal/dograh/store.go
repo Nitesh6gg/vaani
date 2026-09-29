@@ -60,19 +60,20 @@ type ToolRow struct {
 // published one (released_definition_id), else the legacy is_current row;
 // its template variables, else the workflow's. Tools are scoped to the
 // workflow's organization and must be active, as in Dograh's lookup.
-func (s *Store) Workflow(ctx context.Context, workflowID int, callVars map[string]any) (*agent.Node, []string, error) {
+func (s *Store) Workflow(ctx context.Context, workflowID int, callVars map[string]any) (*Workflow, []string, error) {
 	var (
-		defJSON, defVars, wfVars string
-		orgID                    *int64
+		defJSON, defVars, wfVars, defConfig string
+		orgID                               *int64
 	)
 
 	err := s.pool.QueryRow(ctx, `
 		SELECT d.workflow_json::text, COALESCE(d.template_context_variables::text, ''),
-			COALESCE(w.template_context_variables::text, ''), w.organization_id
+			COALESCE(w.template_context_variables::text, ''),
+			COALESCE(d.workflow_configurations::text, ''), w.organization_id
 		FROM workflows w
 		JOIN workflow_definitions d ON d.id = COALESCE(w.released_definition_id,
 			(SELECT id FROM workflow_definitions WHERE workflow_id = w.id AND is_current LIMIT 1))
-		WHERE w.id = $1`, workflowID).Scan(&defJSON, &defVars, &wfVars, &orgID)
+		WHERE w.id = $1`, workflowID).Scan(&defJSON, &defVars, &wfVars, &defConfig, &orgID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil, fmt.Errorf("dograh: workflow %d not found or has no published definition", workflowID)
 	}
@@ -105,7 +106,65 @@ func (s *Store) Workflow(ctx context.Context, workflowID int, callVars map[strin
 		return nil, nil, fmt.Errorf("dograh: workflow %d: %w", workflowID, err)
 	}
 
-	return start, warnings, nil
+	idle, maxDuration, warn := callLimits(defConfig)
+	if warn != "" {
+		warnings = append(warnings, warn)
+	}
+
+	return &Workflow{Start: start, IdleTimeout: idle, MaxDuration: maxDuration}, warnings, nil
+}
+
+// Workflow is what one call runs.
+type Workflow struct {
+	Start *agent.Node
+	// From the workflow's settings (see callLimits); 0 disables.
+	IdleTimeout time.Duration
+	MaxDuration time.Duration
+}
+
+// Dograh's backend defaults (api/services/pipecat/run_pipeline.py), used
+// when the workflow's settings were never saved.
+const (
+	defaultIdleTimeout = 10 * time.Second
+	defaultMaxDuration = 300 * time.Second
+)
+
+// callLimits reads max_user_idle_timeout and max_call_duration (seconds)
+// from a definition's workflow_configurations, as Dograh does. Idle 0
+// disables silence handling (pipecat's rule); a max duration <= 0 is taken
+// as "no limit". Unreadable settings fall back to the defaults, with a
+// warning.
+func callLimits(configJSON string) (idle, maxDuration time.Duration, warning string) {
+	idle, maxDuration = defaultIdleTimeout, defaultMaxDuration
+
+	var c struct {
+		Idle *float64 `json:"max_user_idle_timeout"`
+		Max  *float64 `json:"max_call_duration"`
+	}
+
+	if configJSON != "" {
+		if err := json.Unmarshal([]byte(configJSON), &c); err != nil {
+			return idle, maxDuration, "unreadable workflow_configurations, using default call limits: " + err.Error()
+		}
+	}
+
+	seconds := func(v float64) time.Duration {
+		if v <= 0 {
+			return 0
+		}
+
+		return time.Duration(v * float64(time.Second))
+	}
+
+	if c.Idle != nil {
+		idle = seconds(*c.Idle)
+	}
+
+	if c.Max != nil {
+		maxDuration = seconds(*c.Max)
+	}
+
+	return idle, maxDuration, ""
 }
 
 // templateVars decodes a template_context_variables JSON object; anything

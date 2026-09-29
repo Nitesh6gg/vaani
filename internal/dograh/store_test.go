@@ -77,6 +77,28 @@ func TestBuildWorkflowGreetingAndErrors(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestCallLimits(t *testing.T) {
+	cases := []struct {
+		name      string
+		json      string
+		idle, max time.Duration
+		warn      bool
+	}{
+		{"never saved", "", 10 * time.Second, 300 * time.Second, false},
+		{"empty object", "{}", 10 * time.Second, 300 * time.Second, false},
+		{"set in dograh", `{"max_call_duration": 600, "max_user_idle_timeout": 7.5, "smart_turn_stop_secs": 2}`, 7500 * time.Millisecond, 600 * time.Second, false},
+		{"zero disables", `{"max_call_duration": 0, "max_user_idle_timeout": 0}`, 0, 0, false},
+		{"garbage", `{"max_call_duration": "ten"}`, 10 * time.Second, 300 * time.Second, true},
+	}
+
+	for _, c := range cases {
+		idle, maxDuration, warn := callLimits(c.json)
+		assert.Equal(t, c.idle, idle, c.name)
+		assert.Equal(t, c.max, maxDuration, c.name)
+		assert.Equal(t, c.warn, warn != "", c.name)
+	}
+}
+
 func TestRenderTemplateMatchesDograh(t *testing.T) {
 	now := time.Date(2026, 9, 29, 10, 30, 0, 0, time.UTC) // a Tuesday
 	vars := map[string]any{

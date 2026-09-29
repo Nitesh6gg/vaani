@@ -527,7 +527,7 @@ func (m *Manager) mediaHandler(c *call) media.Handler {
 
 // loadWorkflow reads Dograh workflow DOGRAH_WORKFLOW_ID for call c, fresh on
 // every call so a publish in Dograh's editor applies to the next call.
-func (m *Manager) loadWorkflow(c *call) (*agent.Node, error) {
+func (m *Manager) loadWorkflow(c *call) (*dograh.Workflow, error) {
 	if m.store == nil {
 		return nil, errors.New("no dograh database (DOGRAH_DB_URL)")
 	}
@@ -535,7 +535,7 @@ func (m *Manager) loadWorkflow(c *call) (*agent.Node, error) {
 	qctx, cancel := context.WithTimeout(c.mediaCtx, 3*time.Second)
 	defer cancel()
 
-	start, warnings, err := m.store.Workflow(qctx, m.cfg.DograhWorkflowID, map[string]any{
+	wf, warnings, err := m.store.Workflow(qctx, m.cfg.DograhWorkflowID, map[string]any{
 		"caller_number": c.Info.CallerNumber,
 		"called_number": c.Info.CalledNumber,
 	})
@@ -548,14 +548,15 @@ func (m *Manager) loadWorkflow(c *call) (*agent.Node, error) {
 	}
 
 	opening := "llm"
-	if start.Greeting != "" {
+	if wf.Start.Greeting != "" {
 		opening = "greeting"
 	}
 
 	slog.Info("agent workflow loaded", "call_id", c.ID, "workflow_id", m.cfg.DograhWorkflowID,
-		"start_node", start.Name, "opening", opening, "start_tools", toolNames(start))
+		"start_node", wf.Start.Name, "opening", opening, "start_tools", toolNames(wf.Start),
+		"idle_timeout_s", wf.IdleTimeout.Seconds(), "max_duration_s", wf.MaxDuration.Seconds())
 
-	return start, nil
+	return wf, nil
 }
 
 // toolNames lists the functions the LLM is offered at n (tools, then edges).
@@ -585,7 +586,7 @@ func (m *Manager) newAgentHandler(c *call) media.Handler {
 
 	// Without its workflow the agent has no prompt and nothing to say: end
 	// the call rather than run a blank agent. Silence until the hangup lands.
-	start, err := m.loadWorkflow(c)
+	wf, err := m.loadWorkflow(c)
 	if err != nil {
 		slog.Error("agent: loading the dograh workflow failed; hanging up", "call_id", callID,
 			"workflow_id", m.cfg.DograhWorkflowID, "error", err)
@@ -625,8 +626,10 @@ func (m *Manager) newAgentHandler(c *call) media.Handler {
 				})
 			})
 		},
-		LLM:   llm.NewClient(m.cfg.LLMBaseURL, m.cfg.LLMAPIKey, m.cfg.LLMModel),
-		Start: start,
+		LLM:         llm.NewClient(m.cfg.LLMBaseURL, m.cfg.LLMAPIKey, m.cfg.LLMModel),
+		Start:       wf.Start,
+		IdleTimeout: wf.IdleTimeout,
+		MaxDuration: wf.MaxDuration,
 		// Hanging up the caller's channel fires StasisEnd, which runs the
 		// normal teardown (media plane, bridge, externalMedia channel).
 		Hangup: func() { hangupChannel(m.cl, callID, callID) },

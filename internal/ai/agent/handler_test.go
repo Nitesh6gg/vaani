@@ -1024,3 +1024,101 @@ func TestHandler_WorkflowWalk(t *testing.T) {
 	require.Eventually(t, func() bool { return hangups.Load() == 1 }, time.Second, time.Millisecond)
 	assert.Equal(t, 5, fLLM.streamCalls())
 }
+
+func lastMessage(msgs []llm.Message) llm.Message { return msgs[len(msgs)-1] }
+
+// TestHandler_SilentCallerIsAskedThenCallEnds mirrors Dograh's idle handling:
+// after the agent speaks, IdleTimeout of silence makes the LLM check whether
+// the caller is still there; a second silence gets a goodbye, then a hangup.
+func TestHandler_SilentCallerIsAskedThenCallEnds(t *testing.T) {
+	fSTT := newFakeSTT()
+	fTTS := newFakeTTS()
+	fLLM := &fakeLLM{rounds: []fakeRound{
+		{tokens: []string{"Are you there?"}},
+		{tokens: []string{"Have a good day."}},
+	}}
+
+	var hangups atomic.Int32
+
+	cfg := testConfig(fSTT, fTTS, fLLM, time.Hour, 0)
+	cfg.Start = &Node{Greeting: "Hello."}
+	cfg.IdleTimeout = 50 * time.Millisecond
+	cfg.Hangup = func() { hangups.Add(1) }
+	h := NewHandler(context.Background(), "call1", cfg)
+
+	require.Eventually(t, func() bool { return fTTS.spokenCount() == 1 }, time.Second, time.Millisecond)
+	playTurn(t, h, fTTS, 1, "Hello.")
+
+	require.Eventually(t, func() bool { return fTTS.spokenCount() == 2 }, time.Second, time.Millisecond)
+	assert.Equal(t, llm.Message{Role: "user", Content: idleFirstPrompt}, lastMessage(fLLM.seen[0]))
+	playTurn(t, h, fTTS, 2, "Are you there?")
+
+	require.Eventually(t, func() bool { return fTTS.spokenCount() == 3 }, time.Second, time.Millisecond)
+	assert.Equal(t, llm.Message{Role: "user", Content: idleFinalPrompt}, lastMessage(fLLM.seen[1]))
+	assert.Zero(t, hangups.Load(), "the goodbye must play first")
+	playTurn(t, h, fTTS, 3, "Have a good day.")
+
+	require.Eventually(t, func() bool { return hangups.Load() == 1 }, time.Second, time.Millisecond)
+	time.Sleep(150 * time.Millisecond)
+	assert.Equal(t, 2, fLLM.streamCalls(), "no more silence prompts once the call is ending")
+}
+
+// TestHandler_CallerSpeechPausesIdleClock: while the caller is speaking the
+// silence clock is stopped; if what they said never becomes a transcript
+// (noise), it restarts when they stop.
+func TestHandler_CallerSpeechPausesIdleClock(t *testing.T) {
+	fSTT := newFakeSTT()
+	fTTS := newFakeTTS()
+	fLLM := &fakeLLM{rounds: []fakeRound{{tokens: []string{"Still there?"}}}}
+
+	cfg := testConfig(fSTT, fTTS, fLLM, time.Hour, 0)
+	cfg.Start = &Node{Greeting: "Hello."}
+	cfg.IdleTimeout = 80 * time.Millisecond
+	h := NewHandler(context.Background(), "call1", cfg)
+
+	require.Eventually(t, func() bool { return fTTS.spokenCount() == 1 }, time.Second, time.Millisecond)
+	playTurn(t, h, fTTS, 1, "Hello.")
+
+	fSTT.results <- stt.Result{Signal: stt.SpeechStarted}
+	time.Sleep(250 * time.Millisecond)
+	assert.Zero(t, fLLM.streamCalls(), "no silence prompt while the caller is speaking")
+
+	fSTT.results <- stt.Result{Signal: stt.SpeechEnded} // no transcript follows
+	require.Eventually(t, func() bool { return fLLM.streamCalls() == 1 }, time.Second, time.Millisecond)
+	assert.Equal(t, idleFirstPrompt, lastMessage(fLLM.seen[0]).Content)
+}
+
+func TestHandler_MaxDurationHangsUpAtOnceWhenListening(t *testing.T) {
+	var hangups atomic.Int32
+
+	cfg := testConfig(newFakeSTT(), newFakeTTS(), &fakeLLM{}, time.Hour, 0)
+	cfg.MaxDuration = 30 * time.Millisecond
+	cfg.Hangup = func() { hangups.Add(1) }
+	NewHandler(context.Background(), "call1", cfg)
+
+	require.Eventually(t, func() bool { return hangups.Load() == 1 }, time.Second, time.Millisecond)
+}
+
+func TestHandler_MaxDurationLetsCurrentReplyFinish(t *testing.T) {
+	fSTT := newFakeSTT()
+	fTTS := newFakeTTS()
+
+	var hangups atomic.Int32
+
+	cfg := testConfig(fSTT, fTTS, &fakeLLM{tokens: []string{"A long answer."}}, time.Hour, 0)
+	cfg.MaxDuration = 100 * time.Millisecond
+	cfg.Hangup = func() { hangups.Add(1) }
+	h := NewHandler(context.Background(), "call1", cfg)
+
+	fSTT.sendFinal("tell me")
+	require.Eventually(t, func() bool { return fTTS.spokenCount() == 1 }, time.Second, time.Millisecond)
+	fTTS.audio <- tts.Chunk{PCM: constFrame(quietAmplitude), Gen: 1, Req: 1, Text: "A long answer."}
+	require.Eventually(t, func() bool { return h.State() == StateSpeaking }, time.Second, time.Millisecond)
+
+	time.Sleep(200 * time.Millisecond)
+	assert.Zero(t, hangups.Load(), "the reply in progress plays out first")
+
+	fTTS.done <- 1
+	drainUntilListening(t, h)
+	require.Eventually(t, func() bool { return hangups.Load() == 1 }, time.Second, time.Millisecond)
+}

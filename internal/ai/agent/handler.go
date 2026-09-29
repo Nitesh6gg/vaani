@@ -116,6 +116,16 @@ type Config struct {
 	// Hangup ends the call; used after end_call or at an end node, once the
 	// agent's last words have finished playing. Nil disables hanging up.
 	Hangup func()
+	// IdleTimeout is Dograh's max_user_idle_timeout: once the agent has
+	// finished speaking, this much caller silence makes the LLM ask whether
+	// they're still there; a second time, it says goodbye and the call ends.
+	// The caller starting to speak (the STT's VAD) stops the clock. 0
+	// disables.
+	IdleTimeout time.Duration
+	// MaxDuration is Dograh's max_call_duration: this long after the call
+	// started it ends -- at once if no reply is in progress, otherwise as soon
+	// as the current reply has played. 0 disables.
+	MaxDuration time.Duration
 	// Transfer dials destination (an Asterisk dial string) and blocks until
 	// it answers (returning connect) or fails, times out, or ctx ends
 	// (returning an error). Calling connect hands the caller over to the
@@ -183,6 +193,9 @@ type ttsDoneEvent struct{ gen uint64 }
 type bargeInEvent struct{}
 type greetingEvent struct{}
 type openingEvent struct{}
+type callerSpeechEvent struct{ started bool } // STT VAD: caller started/stopped speaking
+type idleEvent struct{ seq uint64 }
+type maxDurationEvent struct{}
 type ttsPlaybackDoneEvent struct{}
 type ttsDrainTimeoutEvent struct{}
 
@@ -277,6 +290,24 @@ type Handler struct {
 	// hangs up once the reply has played out.
 	turnToolMsgs    []llm.Message
 	hangupAfterTurn bool
+
+	// Caller-silence clock (Config.IdleTimeout), mirroring pipecat's
+	// UserIdleController: armed each time the agent finishes speaking,
+	// stopped when anyone starts speaking. idleSeq tags each timer so a stale
+	// one that fired just as it was stopped is ignored; idleArmed means the
+	// agent has spoken at least once; idleCount is how many times in a row
+	// the caller has been found silent.
+	idleTimer *time.Timer
+	idleSeq   uint64
+	idleArmed bool
+	idleCount int
+	// ending, once set (caller silent twice, or max call duration), is
+	// sticky: the call hangs up at the end of whatever turn is in progress,
+	// or at once when none is. endReason says why, for the log; hungUp
+	// guards against hanging up twice.
+	ending    bool
+	endReason string
+	hungUp    bool
 
 	// ProcessFrame-goroutine-owned only.
 	preroll [][]byte
@@ -495,6 +526,11 @@ func (h *Handler) readSTT() {
 				return
 			}
 
+			if r.Signal != stt.NoSignal {
+				h.post(callerSpeechEvent{started: r.Signal == stt.SpeechStarted})
+				continue
+			}
+
 			if !r.Final {
 				continue
 			}
@@ -509,6 +545,13 @@ func (h *Handler) readSTT() {
 }
 
 func (h *Handler) run() {
+	defer h.stopIdleTimer()
+
+	if h.cfg.MaxDuration > 0 {
+		t := time.AfterFunc(h.cfg.MaxDuration, func() { h.post(maxDurationEvent{}) })
+		defer t.Stop()
+	}
+
 	for {
 		select {
 		case <-h.baseCtx.Done():
@@ -540,6 +583,14 @@ func (h *Handler) handleEvent(ev any) {
 	case openingEvent:
 		slog.Info("agent opening (llm speaks first)", "call_id", h.callID)
 		h.startTurn()
+	case callerSpeechEvent:
+		h.handleCallerSpeech(e.started)
+	case idleEvent:
+		h.handleIdle(e.seq)
+	case maxDurationEvent:
+		slog.Info("max call duration reached; ending the call", "call_id", h.callID,
+			"max_duration_s", int(h.cfg.MaxDuration.Seconds()))
+		h.endCall("max_call_duration")
 	case ttsPlaybackDoneEvent:
 		h.finishTurn(h.curGen)
 	case ttsDrainTimeoutEvent:
@@ -549,6 +600,120 @@ func (h *Handler) handleEvent(ev any) {
 		// of the reply actually played before the TTS went silent.
 		h.ttsBuf = nil
 		h.recordReply(true)
+
+		if h.ending {
+			h.hangup()
+		}
+	}
+}
+
+// post hands an event to run() from another goroutine.
+func (h *Handler) post(ev any) {
+	select {
+	case h.events <- ev:
+	case <-h.baseCtx.Done():
+	}
+}
+
+// handleCallerSpeech: the caller started speaking (stop the silence clock;
+// they're here) or stopped. When they stopped without it becoming a turn --
+// their transcript, which Sarvam sends right after, starts one and stops the
+// clock again -- the clock restarts, so noise that never became words can't
+// switch silence detection off for the rest of the call.
+func (h *Handler) handleCallerSpeech(started bool) {
+	if started {
+		h.stopIdleTimer()
+		h.idleCount = 0
+
+		return
+	}
+
+	if h.idleArmed && State(h.state.Load()) == StateListening {
+		h.startIdleTimer()
+	}
+}
+
+// startIdleTimer (re)starts the caller-silence clock.
+func (h *Handler) startIdleTimer() {
+	h.stopIdleTimer()
+
+	if h.cfg.IdleTimeout <= 0 || h.ending {
+		return
+	}
+
+	seq := h.idleSeq
+	h.idleTimer = time.AfterFunc(h.cfg.IdleTimeout, func() { h.post(idleEvent{seq: seq}) })
+}
+
+func (h *Handler) stopIdleTimer() {
+	if h.idleTimer != nil {
+		h.idleTimer.Stop()
+		h.idleTimer = nil
+	}
+
+	h.idleSeq++ // a timer that already fired is now stale
+}
+
+// Dograh's caller-silence instructions (pipecat_engine_callbacks.py), added
+// to the conversation as user messages exactly as Dograh does.
+const (
+	idleFirstPrompt = "The user has been quiet. Politely and briefly ask if they're still there in the language that the user has been speaking so far."
+	idleFinalPrompt = "The user has been quiet. We will be disconnecting the call now. Wish them a good day in the language that the user has been speaking so far."
+)
+
+// handleIdle: the caller has said nothing for IdleTimeout since the agent
+// last spoke. First time, the LLM checks whether they're still there; the
+// second time in a row, it says goodbye and the call ends after that.
+func (h *Handler) handleIdle(seq uint64) {
+	if seq != h.idleSeq || h.ending || State(h.state.Load()) != StateListening {
+		return
+	}
+
+	h.idleTimer = nil
+	h.idleCount++
+
+	prompt := idleFirstPrompt
+	if h.idleCount >= 2 {
+		prompt = idleFinalPrompt
+		h.ending, h.endReason = true, "caller_silent"
+	}
+
+	slog.Info("caller silent", "call_id", h.callID, "times", h.idleCount,
+		"idle_timeout_s", h.cfg.IdleTimeout.Seconds(), "ending_call", h.ending)
+
+	h.history = append(h.history, llm.Message{Role: "user", Content: prompt})
+	h.startTurn()
+}
+
+// endCall ends the call for reason: right away when no reply is in
+// progress, otherwise once the current one has played (finishTurn).
+func (h *Handler) endCall(reason string) {
+	h.ending, h.endReason = true, reason
+	h.stopIdleTimer()
+
+	switch State(h.state.Load()) {
+	case StateListening, StateTranscribing:
+		h.hangup()
+	}
+}
+
+func (h *Handler) hangup() {
+	if h.hungUp {
+		return
+	}
+
+	h.hungUp = true
+
+	reason := h.endReason
+	if reason == "" {
+		reason = "end_call"
+	}
+
+	slog.Info("agent ending call", "call_id", h.callID, "gen", h.curGen, "reason", reason,
+		"node", h.node.Load().Name)
+
+	if h.cfg.Hangup != nil {
+		go h.cfg.Hangup() // ARI REST call; never block the event loop on it
 	}
 }
 
@@ -629,12 +794,15 @@ func (h *Handler) handleFinalTranscript(text string) {
 
 	h.history = append(h.history, llm.Message{Role: "user", Content: text})
 	slog.Info("stt final transcript", "call_id", h.callID, "gen", h.curGen+1, "text", text)
+	h.idleCount = 0
 	h.startTurn()
 }
 
 // startTurn runs one LLM turn over the current history: after the caller
-// spoke, or at call start when the LLM opens the call.
+// spoke, at call start when the LLM opens the call, or when the caller has
+// gone silent.
 func (h *Handler) startTurn() {
+	h.stopIdleTimer() // the agent is about to speak
 	h.state.Store(int32(StateThinking))
 	h.cfg.Sink.TurnStarted()
 
@@ -1268,14 +1436,16 @@ func (h *Handler) finishTurn(gen uint64) {
 	h.recordReply(false)
 	h.ttsBuf = nil
 
-	if h.hangupAfterTurn {
+	if h.hangupAfterTurn || h.ending {
 		h.hangupAfterTurn = false
-		slog.Info("agent ending call", "call_id", h.callID, "gen", gen, "node", h.node.Load().Name)
+		h.hangup()
 
-		if h.cfg.Hangup != nil {
-			go h.cfg.Hangup() // ARI REST call; never block the event loop on it
-		}
+		return
 	}
+
+	// The agent has finished speaking: now the caller-silence clock runs.
+	h.idleArmed = true
+	h.startIdleTimer()
 	// h.tts is deliberately left connected -- it's reused for the next turn
 	// rather than reopened (see tts.Client's doc comment).
 }
@@ -1361,8 +1531,13 @@ func (h *Handler) handleBargeIn() {
 	h.recordReply(true)
 
 	// The caller cut in over a goodbye: they want to keep talking, so don't
-	// hang up on them.
+	// hang up on them -- unless the call is being ended regardless (max
+	// duration, silence), which Dograh doesn't reverse either.
 	h.hangupAfterTurn = false
+
+	if h.ending {
+		h.hangup()
+	}
 
 	if h.tts != nil {
 		if err := h.tts.Cancel(); err != nil {

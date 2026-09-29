@@ -169,12 +169,10 @@ func TestSarvamClient_EmptyTranscriptIgnored(t *testing.T) {
 	}
 }
 
-func TestSarvamClient_VadSignalMessageIsNotDeliveredAsResult(t *testing.T) {
+func TestSarvamClient_VadSignalsArriveInOrderWithTranscript(t *testing.T) {
 	srv := sttServer(t, func(conn *websocket.Conn, r *http.Request) {
-		_ = conn.WriteJSON(map[string]any{
-			"type": "events",
-			"data": map[string]any{"signal_type": "START_SPEECH"},
-		})
+		_ = conn.WriteJSON(map[string]any{"type": "events", "data": map[string]any{"signal_type": "START_SPEECH", "occured_at": 1786013420.1}})
+		_ = conn.WriteJSON(map[string]any{"type": "events", "data": map[string]any{"signal_type": "END_SPEECH", "occured_at": 1786013420.5}})
 		_ = conn.WriteJSON(map[string]any{"type": "data", "data": map[string]any{"transcript": "after vad"}})
 	})
 
@@ -182,11 +180,14 @@ func TestSarvamClient_VadSignalMessageIsNotDeliveredAsResult(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = c.Close() }()
 
-	select {
-	case r := <-c.Results():
-		assert.Equal(t, "after vad", r.Text, "only the transcript message should produce a Result")
-	case <-time.After(time.Second):
-		t.Fatal("no result received")
+	want := []Result{{Signal: SpeechStarted}, {Signal: SpeechEnded}, {Text: "after vad", Final: true}}
+	for _, w := range want {
+		select {
+		case r := <-c.Results():
+			assert.Equal(t, w, r)
+		case <-time.After(time.Second):
+			t.Fatal("no result received")
+		}
 	}
 }
 

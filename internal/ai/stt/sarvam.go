@@ -37,14 +37,16 @@ const sarvamSampleRate = 16000
 //     it. An untouched idle socket survived 75s+ in the same live probe.
 //   - Sarvam reports failures in data.message, not data.error -- both are
 //     logged, since which field is populated is undocumented.
-//   - vad_signals=true is requested so Sarvam's own segmentation is active,
-//     but its START_SPEECH/END_SPEECH signals are not surfaced as Results:
-//     Vaani's barge-in is local (docs/AUDIO_PIPELINE.md), and mixing VAD
-//     signals with transcripts on two different channels is exactly what a
-//     sibling project's ADR-009 found corrupts turn-taking (Go's select
-//     picks among ready channels at random, reordering events Sarvam sent in
-//     sequence). If VAD signals are ever needed here, they must go through
-//     this same Results channel, not a second one.
+//   - vad_signals=true is requested so Sarvam's own segmentation is active.
+//     Its START_SPEECH/END_SPEECH signals
+//     ({"type":"events","data":{"signal_type":"START_SPEECH",...}}, format
+//     from the same project's DECISIONS.md) come out as Signal Results on the
+//     SAME channel as transcripts: Sarvam sends START -> END -> transcript in
+//     order, and a second channel would let Go's select reorder them -- a
+//     sibling project's ADR-009 found that corrupts turn-taking. They drive
+//     the agent's caller-silence timer only; barge-in stays local
+//     (docs/AUDIO_PIPELINE.md), since START_SPEECH also fires on background
+//     conversation.
 //
 // Reconnect is lazy and one-shot, matching the same project's ADR-011: Feed
 // never retries in a loop (a standing retry loop exhausted Sarvam's rate
@@ -237,12 +239,21 @@ func (c *sarvamClient) receiveLoop(ctx context.Context, conn *websocket.Conn) {
 			slog.Warn("stt provider error", "call_id", c.callID, "message", m.Data.Message)
 		}
 
-		if m.Type != "data" || m.Data.Transcript == "" {
+		var r Result
+
+		switch {
+		case m.Type == "events" && m.Data.SignalType == "START_SPEECH":
+			r.Signal = SpeechStarted
+		case m.Type == "events" && m.Data.SignalType == "END_SPEECH":
+			r.Signal = SpeechEnded
+		case m.Type == "data" && m.Data.Transcript != "":
+			r = Result{Text: m.Data.Transcript, Final: true}
+		default:
 			continue
 		}
 
 		select {
-		case c.results <- Result{Text: m.Data.Transcript, Final: true}:
+		case c.results <- r:
 		case <-ctx.Done():
 			return
 		}
@@ -261,6 +272,7 @@ type sttInboundMessage struct {
 	Type string `json:"type"`
 	Data struct {
 		Transcript string `json:"transcript"`
+		SignalType string `json:"signal_type"` // type "events": START_SPEECH / END_SPEECH
 		Error      string `json:"error"`
 		// Sarvam reports failures here, not in Error -- a sibling project's
 		// ADR-010 found reading only Error hid every STT error.
