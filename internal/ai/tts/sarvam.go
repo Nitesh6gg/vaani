@@ -59,7 +59,7 @@ const keepaliveInterval = 20 * time.Second
 //     live when SentenceChunker flushed a lone newline as a "sentence".
 //     Sarvam sends this error INSTEAD OF a "final" for that request, never
 //     both, so onFinal's bookkeeping runs on error too (see receiveLoop);
-//     otherwise that request's pendingGens entry would never clear and its
+//     otherwise that request's pending entry would never clear and its
 //     generation's Done would never fire, wedging the call.
 //   - Sarvam has no "stop synthesizing" message. Once text+flush is sent,
 //     audio keeps arriving until Sarvam is done, regardless of what the
@@ -67,7 +67,7 @@ const keepaliveInterval = 20 * time.Second
 //     end-of-request signal was observed taking up to 9.5s in a live call.
 //     Reusing one connection across turns means a barge-in can leave a stale
 //     request's audio still in flight when a new turn starts on the same
-//     connection; pendingGens (FIFO, one entry per outstanding Speak call, in
+//     connection; pending (FIFO, one entry per outstanding Speak call, in
 //     send order) tags every arriving chunk with the generation of the
 //     oldest still-outstanding request, matching Sarvam's own in-order
 //     delivery. A genuine barge-in instead calls Cancel, which throws the
@@ -80,17 +80,26 @@ type sarvamClient struct {
 
 	writeMu sync.Mutex
 
-	genMu        sync.Mutex
-	pendingGens  []uint64        // FIFO: one entry per outstanding Speak call, in send order
-	pendingTexts []string        // FIFO, lockstep with pendingGens: the text of each outstanding request, for provider-error logs
-	endedGens    map[uint64]bool // EndGeneration has been called for this gen
-	lastGen      uint64          // most recent gen seen, for tagging audio if pendingGens is briefly empty
+	genMu     sync.Mutex
+	pending   []pendingReq    // FIFO: one entry per outstanding Speak call, in send order
+	endedGens map[uint64]bool // EndGeneration has been called for this gen
+	last      pendingReq      // most recent request sent, for tagging audio if pending is briefly empty
+	nextReq   uint64          // Req assigned to the next Speak call; starts at 1 so 0 means "none"
 
 	stateMu sync.Mutex
 	closed  bool // connection already torn down; guards against a double-close
 
 	audio chan Chunk
 	done  chan uint64
+}
+
+// pendingReq is one outstanding Speak call: its generation (for Done
+// bookkeeping), its per-client request number, and its text (for tagging its
+// audio and for naming it in provider-error logs).
+type pendingReq struct {
+	gen  uint64
+	req  uint64
+	text string
 }
 
 // NewSarvamClient dials Sarvam's Bulbul v3 TTS WebSocket, sends the initial
@@ -184,9 +193,9 @@ func (c *sarvamClient) Speak(text string, gen uint64) error {
 	}
 
 	c.genMu.Lock()
-	c.pendingGens = append(c.pendingGens, gen)
-	c.pendingTexts = append(c.pendingTexts, text)
-	c.lastGen = gen
+	c.nextReq++
+	c.last = pendingReq{gen: gen, req: c.nextReq, text: text}
+	c.pending = append(c.pending, c.last)
 	c.genMu.Unlock()
 
 	if err := c.writeJSON(c.conn, map[string]any{
@@ -218,8 +227,8 @@ func (c *sarvamClient) EndGeneration(gen uint64) {
 }
 
 func (c *sarvamClient) genHasPendingLocked(gen uint64) bool {
-	for _, g := range c.pendingGens {
-		if g == gen {
+	for _, p := range c.pending {
+		if p.gen == gen {
 			return true
 		}
 	}
@@ -262,7 +271,7 @@ func (c *sarvamClient) forceClose() {
 	_ = c.conn.Close()
 }
 
-// onFinal pops the oldest outstanding request off pendingGens (Sarvam
+// onFinal pops the oldest outstanding request off pending (Sarvam
 // delivers "final"/error events in send order) and, if that was the last
 // outstanding request for its generation and EndGeneration has already been
 // called for it, emits Done. Also called for a provider error (see
@@ -273,46 +282,39 @@ func (c *sarvamClient) forceClose() {
 // one Sarvam just finished synthesizing or rejected), for error logging.
 func (c *sarvamClient) onFinal() string {
 	c.genMu.Lock()
-	if len(c.pendingGens) == 0 {
+	if len(c.pending) == 0 {
 		c.genMu.Unlock()
 
 		return ""
 	}
 
-	gen := c.pendingGens[0]
-	c.pendingGens = c.pendingGens[1:]
+	popped := c.pending[0]
+	c.pending = c.pending[1:]
 
-	var text string
-
-	if len(c.pendingTexts) > 0 {
-		text = c.pendingTexts[0]
-		c.pendingTexts = c.pendingTexts[1:]
-	}
-
-	pending := c.genHasPendingLocked(gen)
-	ended := c.endedGens[gen]
+	pending := c.genHasPendingLocked(popped.gen)
+	ended := c.endedGens[popped.gen]
 	c.genMu.Unlock()
 
 	if !pending && ended {
-		c.emitDone(gen)
+		c.emitDone(popped.gen)
 	}
 
-	return text
+	return popped.text
 }
 
-// peekGen returns the generation to attribute the next arriving audio chunk
-// to: the oldest outstanding request, or the most recent generation seen if
-// none is currently outstanding (a chunk arriving in the gap between one
-// request's last byte and the next request being sent).
-func (c *sarvamClient) peekGen() uint64 {
+// peekReq returns the request to attribute the next arriving audio chunk to:
+// the oldest outstanding one, or the most recent one sent if none is
+// currently outstanding (a chunk arriving in the gap between one request's
+// last byte and the next request being sent).
+func (c *sarvamClient) peekReq() pendingReq {
 	c.genMu.Lock()
 	defer c.genMu.Unlock()
 
-	if len(c.pendingGens) > 0 {
-		return c.pendingGens[0]
+	if len(c.pending) > 0 {
+		return c.pending[0]
 	}
 
-	return c.lastGen
+	return c.last
 }
 
 func (c *sarvamClient) receiveLoop() {
@@ -363,8 +365,10 @@ func (c *sarvamClient) receiveLoop() {
 				continue
 			}
 
+			p := c.peekReq()
+
 			select {
-			case c.audio <- Chunk{PCM: raw, Gen: c.peekGen()}:
+			case c.audio <- Chunk{PCM: raw, Gen: p.gen, Req: p.req, Text: p.text}:
 			default:
 				slog.Warn("tts audio buffer full, dropping chunk", "call_id", c.callID)
 			}

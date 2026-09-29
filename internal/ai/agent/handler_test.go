@@ -214,7 +214,7 @@ func TestHandler_GreetingIsSpokenWithoutWaitingForCaller(t *testing.T) {
 
 	const gen = 1
 
-	fTTS.audio <- tts.Chunk{PCM: constFrame(loudAmplitude), Gen: gen}
+	fTTS.audio <- tts.Chunk{PCM: constFrame(loudAmplitude), Gen: gen, Req: 1, Text: "Hi, this side Shubh."}
 	require.Eventually(t, func() bool { return h.State() == StateSpeaking }, time.Second, time.Millisecond)
 
 	fTTS.done <- gen
@@ -222,6 +222,99 @@ func TestHandler_GreetingIsSpokenWithoutWaitingForCaller(t *testing.T) {
 
 	assert.Equal(t, []llm.Message{{Role: "assistant", Content: "Hi, this side Shubh."}}, h.history,
 		"the greeting must be recorded so the LLM doesn't redundantly re-greet")
+}
+
+// multiFrame returns n 640-byte frames of constant amplitude joined into one
+// TTS chunk, so a single sentence spans several ProcessFrame ticks.
+func multiFrame(n int, amp int16) []byte {
+	var b []byte
+	for i := 0; i < n; i++ {
+		b = append(b, constFrame(amp)...)
+	}
+
+	return b
+}
+
+// TestHandler_FullyPlayedReplyIsRecordedInHistory is the regression test for
+// the history bug: only the caller's lines and the greeting were ever kept,
+// never the LLM's own answers, so every turn the LLM re-answered from scratch
+// with no memory of what it had said (observed live as long, repetitive
+// replies). A reply that plays out must land in history, whole.
+func TestHandler_FullyPlayedReplyIsRecordedInHistory(t *testing.T) {
+	fSTT := newFakeSTT()
+	fTTS := newFakeTTS()
+	fLLM := &fakeLLM{tokens: []string{"Hello there.", " How are you?"}}
+
+	h := NewHandler(context.Background(), "call1", testConfig(fSTT, fTTS, fLLM, 0, 0))
+
+	fSTT.sendFinal("hi")
+	require.Eventually(t, func() bool { return fTTS.spokenCount() == 2 }, time.Second, time.Millisecond)
+
+	const gen = 1
+
+	fTTS.audio <- tts.Chunk{PCM: constFrame(quietAmplitude), Gen: gen, Req: 1, Text: "Hello there."}
+	fTTS.audio <- tts.Chunk{PCM: constFrame(quietAmplitude), Gen: gen, Req: 2, Text: " How are you?"}
+	fTTS.done <- gen
+
+	drainUntilListening(t, h)
+
+	assert.Equal(t, []llm.Message{
+		{Role: "user", Content: "hi"},
+		{Role: "assistant", Content: "Hello there. How are you?"},
+	}, h.history)
+}
+
+// TestHandler_BargeInRecordsOnlyWhatWasHeard: when the caller cuts in, history
+// must hold only the sentences they actually started hearing -- not the whole
+// generated reply, or the LLM would believe it said things the caller never
+// heard.
+func TestHandler_BargeInRecordsOnlyWhatWasHeard(t *testing.T) {
+	fSTT := newFakeSTT()
+	fTTS := newFakeTTS()
+	fLLM := &fakeLLM{tokens: []string{"First sentence.", " Second sentence."}}
+
+	h := NewHandler(context.Background(), "call1", testConfig(fSTT, fTTS, fLLM, 0, time.Hour))
+
+	fSTT.sendFinal("hi")
+	require.Eventually(t, func() bool { return fTTS.spokenCount() == 2 }, time.Second, time.Millisecond)
+
+	const gen = 1
+
+	// Sentence 1 spans 5 frames, sentence 2 just 1: the barge-in below lands
+	// while sentence 1 is still playing, so sentence 2 is never heard.
+	fTTS.audio <- tts.Chunk{PCM: multiFrame(5, quietAmplitude), Gen: gen, Req: 1, Text: "First sentence."}
+	fTTS.audio <- tts.Chunk{PCM: constFrame(quietAmplitude), Gen: gen, Req: 2, Text: " Second sentence."}
+
+	require.Eventually(t, func() bool { return h.State() == StateSpeaking }, time.Second, time.Millisecond)
+
+	// Wait until both chunks are queued, so the loud ticks below pop sentence
+	// 1's frames rather than finding the queue empty.
+	require.Eventually(t, func() bool { return len(h.outbound) == 6 }, time.Second, time.Millisecond)
+
+	h.ProcessFrame(context.Background(), "call1", constFrame(quietAmplitude)) // plays sentence 1, frame 1
+	h.ProcessFrame(context.Background(), "call1", constFrame(loudAmplitude))  // frame 2
+	h.ProcessFrame(context.Background(), "call1", constFrame(loudAmplitude))  // frame 3
+	h.ProcessFrame(context.Background(), "call1", constFrame(loudAmplitude))  // 3rd loud vote: barge-in
+
+	require.Equal(t, StateTranscribing, h.State(), "barge-in must fire on the third loud frame")
+
+	require.Eventually(t, func() bool { return fTTS.wasCancelled() }, time.Second, time.Millisecond)
+	assert.Equal(t, []llm.Message{
+		{Role: "user", Content: "hi"},
+		{Role: "assistant", Content: "First sentence."},
+	}, h.history, "only the sentence the caller started hearing may be recorded")
+}
+
+// TestHandler_RecordReplyCutBeforePlaybackRecordsNothing: nothing played means
+// nothing heard -- the generated reply must not reach history at all.
+func TestHandler_RecordReplyCutBeforePlaybackRecordsNothing(t *testing.T) {
+	h := &Handler{callID: "call1"}
+	h.turnChunks = []spokenChunk{{req: 1, text: "Never heard."}}
+
+	h.recordReply(true)
+
+	assert.Empty(t, h.history)
+	assert.Empty(t, h.turnChunks, "tracking must be cleared for the next turn")
 }
 
 // drainUntilListening keeps calling ProcessFrame (as CallMedia's releaseLoop

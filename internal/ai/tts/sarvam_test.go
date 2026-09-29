@@ -229,6 +229,50 @@ func TestSarvamClient_AudioEventTaggedWithOutstandingGeneration(t *testing.T) {
 	}
 }
 
+// TestSarvamClient_AudioTaggedWithItsSentence: each chunk must carry the Req
+// and Text of the Speak call (sentence) it belongs to -- in order, across a
+// "final" boundary -- so the handler can tell how far playback got when a
+// reply is cut short and record only what the caller heard.
+func TestSarvamClient_AudioTaggedWithItsSentence(t *testing.T) {
+	audio := func(conn *websocket.Conn) {
+		_ = conn.WriteJSON(map[string]any{
+			"type": "audio",
+			"data": map[string]any{"audio": base64.StdEncoding.EncodeToString([]byte{1, 2})},
+		})
+	}
+
+	srv := ttsServer(t, func(conn *websocket.Conn, r *http.Request) {
+		_, _, _ = conn.ReadMessage() // config
+		for i := 0; i < 4; i++ {
+			_, _, _ = conn.ReadMessage() // text, flush, text, flush
+		}
+		audio(conn)
+		_ = sendFinal(conn)
+		audio(conn)
+	})
+
+	c, err := NewSarvamClient(context.Background(), "call1", Config{WSURL: wsURL(srv.URL), APIKey: "k", Model: "bulbul:v3", Voice: "shubh"})
+	require.NoError(t, err)
+	defer func() { _ = c.Close() }()
+
+	require.NoError(t, c.Speak("first.", 7))
+	require.NoError(t, c.Speak(" second.", 7))
+
+	for _, want := range []struct {
+		req  uint64
+		text string
+	}{{1, "first."}, {2, " second."}} {
+		select {
+		case chunk := <-c.Audio():
+			assert.Equal(t, uint64(7), chunk.Gen)
+			assert.Equal(t, want.req, chunk.Req)
+			assert.Equal(t, want.text, chunk.Text)
+		case <-time.After(time.Second):
+			t.Fatalf("no audio chunk for req %d", want.req)
+		}
+	}
+}
+
 func TestSarvamClient_DoneFiresOnceItsFinalArrives(t *testing.T) {
 	finalNow := make(chan struct{})
 

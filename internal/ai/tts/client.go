@@ -14,9 +14,17 @@ package tts
 // audio left over from an interrupted turn no matter when it arrives --
 // necessary because the connection is reused across many turns (see Client's
 // doc comment) and the provider has no per-request cancel.
+//
+// Req and Text identify which Speak call (one sentence) the audio belongs to:
+// Req is unique per Client and increases with each accepted Speak, Text is
+// that call's text. The caller uses them to know how far playback got, so
+// that after a barge-in only the sentences the caller actually started
+// hearing go into the conversation history.
 type Chunk struct {
-	PCM []byte
-	Gen uint64
+	PCM  []byte
+	Gen  uint64
+	Req  uint64
+	Text string
 }
 
 // Client streams text in and receives synthesized 16kHz LE PCM16 audio back.

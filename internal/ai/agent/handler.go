@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -135,8 +136,25 @@ type Config struct {
 type finalTranscriptEvent struct{ text string }
 type llmDoneEvent struct{ err error }
 type ttsAudioEvent struct {
+	pcm  []byte
+	gen  uint64
+	req  uint64
+	text string
+}
+
+// outFrame is one 640B frame of agent audio waiting in outbound, tagged with
+// the TTS request (sentence) it came from, so ProcessFrame can record how far
+// playback has got.
+type outFrame struct {
 	pcm []byte
-	gen uint64
+	req uint64
+}
+
+// spokenChunk is one sentence of the current reply whose audio has started
+// arriving, in playback order.
+type spokenChunk struct {
+	req  uint64
+	text string
 }
 type ttsDoneEvent struct{ gen uint64 }
 type bargeInEvent struct{}
@@ -151,9 +169,9 @@ type ttsDrainTimeoutEvent struct{}
 // Concurrency design: every field below has exactly one owning goroutine, so
 // there is no lock in the hot path and nothing to get wrong under -race (which
 // this project's toolchain can't run locally -- see CLAUDE.md conventions):
-//   - state/speakingSince/silenceUntil/ttsDeliveryDone: atomics, written by
-//     whichever goroutine reaches the transition, read by any.
-//   - tts/turnCancel/history: touched only by run()'s goroutine.
+//   - state/speakingSince/silenceUntil/ttsDeliveryDone/playingReq: atomics,
+//     written by whichever goroutine reaches the transition, read by any.
+//   - tts/turnCancel/history/turnChunks: touched only by run()'s goroutine.
 //   - preroll/emptyTicks: touched only by ProcessFrame's goroutine.
 //   - per-turn chunker: a local variable inside runLLMTurn, never shared.
 //   - outbound: a channel (safe for concurrent send/receive by construction).
@@ -172,6 +190,11 @@ type Handler struct {
 	// this and only ends the turn once outbound has also fully drained, so a
 	// reply is never cut off before the caller has actually heard all of it.
 	ttsDeliveryDone atomic.Bool
+	// playingReq is the TTS request (sentence) whose audio ProcessFrame most
+	// recently handed to the caller; 0 means nothing of the current reply has
+	// played yet. Written by ProcessFrame's goroutine, read by run() to decide
+	// what the caller actually heard when a reply is cut short.
+	playingReq atomic.Uint64
 
 	events chan any
 
@@ -200,6 +223,13 @@ type Handler struct {
 	// live, a single long reply produced over 2000 individual WARN lines in
 	// under a second. Sink.Error still counts every drop for metrics.
 	dropWarnedGen uint64
+	// turnChunks lists the current reply's sentences in the order their audio
+	// started arriving; recordReply turns them into the assistant message in
+	// history -- all of them when the reply plays out, only those up to
+	// playingReq when it's cut short. Without this the LLM never saw its own
+	// previous answers (only the caller's lines were kept), so every turn it
+	// re-answered from scratch -- observed live as long, repetitive replies.
+	turnChunks []spokenChunk
 
 	// ProcessFrame-goroutine-owned only.
 	preroll [][]byte
@@ -214,7 +244,7 @@ type Handler struct {
 	// TTS PCM re-sliced to 640B frames, drained by ProcessFrame at real-time
 	// pace. See outboundBufferFrames for why this is sized in seconds, not
 	// CallMedia's 5-frame jitter margin.
-	outbound chan []byte
+	outbound chan outFrame
 }
 
 // NewHandler creates a Handler and starts its background goroutines (STT
@@ -230,7 +260,7 @@ func NewHandler(ctx context.Context, callID string, cfg Config) *Handler {
 		cfg:      cfg,
 		baseCtx:  ctx,
 		events:   make(chan any, 8),
-		outbound: make(chan []byte, outboundBufferFrames),
+		outbound: make(chan outFrame, outboundBufferFrames),
 	}
 	h.state.Store(int32(StateListening))
 
@@ -321,8 +351,9 @@ func (h *Handler) processSpeakingFrame(pcm []byte) [][]byte {
 	select {
 	case frame := <-h.outbound:
 		h.emptyTicks = 0
+		h.playingReq.Store(frame.req)
 
-		return [][]byte{frame}
+		return [][]byte{frame.pcm}
 	default:
 	}
 
@@ -435,7 +466,7 @@ func (h *Handler) handleEvent(ev any) {
 	case llmDoneEvent:
 		h.handleLLMDone(e.err)
 	case ttsAudioEvent:
-		h.handleTTSAudio(e.pcm, e.gen)
+		h.handleTTSAudio(e.pcm, e.gen, e.req, e.text)
 	case ttsDoneEvent:
 		h.handleTTSDone(e.gen)
 	case bargeInEvent:
@@ -447,8 +478,10 @@ func (h *Handler) handleEvent(ev any) {
 	case ttsDrainTimeoutEvent:
 		// State was already flipped by processSpeakingFrame; this only clears
 		// run()-owned turn state so a dead turn's <640B ttsBuf tail can't leak
-		// into the front of the next turn's audio.
+		// into the front of the next turn's audio, and records whatever part
+		// of the reply actually played before the TTS went silent.
 		h.ttsBuf = nil
+		h.recordReply(true)
 	}
 }
 
@@ -486,6 +519,7 @@ func (h *Handler) handleGreeting() {
 	h.curGen++
 	gen := h.curGen
 	h.turnStartedAt = time.Now()
+	h.startTurnChunks()
 
 	slog.Info("agent greeting", "call_id", h.callID, "gen", gen, "text", h.cfg.Greeting)
 
@@ -493,8 +527,9 @@ func (h *Handler) handleGreeting() {
 		return
 	}
 
-	h.history = append(h.history, llm.Message{Role: "assistant", Content: h.cfg.Greeting})
-
+	// The greeting reaches history the same way LLM replies do (recordReply,
+	// once it has played -- or only the heard part if cut off), so the LLM
+	// knows it already greeted and doesn't do it again.
 	chunker := &SentenceChunker{}
 	for _, chunk := range chunker.Feed(h.cfg.Greeting) {
 		if gen != h.curGen {
@@ -532,6 +567,7 @@ func (h *Handler) handleFinalTranscript(text string) {
 	h.curGen++
 	gen := h.curGen
 	h.turnStartedAt = time.Now()
+	h.startTurnChunks()
 
 	slog.Info("stt final transcript", "call_id", h.callID, "gen", gen, "text", text)
 
@@ -672,7 +708,7 @@ func (h *Handler) readTTS(ttsClient tts.Client) {
 			}
 
 			select {
-			case h.events <- ttsAudioEvent{pcm: chunk.PCM, gen: chunk.Gen}:
+			case h.events <- ttsAudioEvent{pcm: chunk.PCM, gen: chunk.Gen, req: chunk.Req, text: chunk.Text}:
 			case <-h.baseCtx.Done():
 				return
 			}
@@ -692,7 +728,7 @@ func (h *Handler) readTTS(ttsClient tts.Client) {
 			}
 
 			select {
-			case h.events <- ttsAudioEvent{pcm: chunk.PCM, gen: chunk.Gen}:
+			case h.events <- ttsAudioEvent{pcm: chunk.PCM, gen: chunk.Gen, req: chunk.Req, text: chunk.Text}:
 			case <-h.baseCtx.Done():
 				return
 			}
@@ -722,9 +758,13 @@ func (h *Handler) readTTS(ttsClient tts.Client) {
 // less frequent), and CallMedia's own releaseLoop copies whatever ProcessFrame
 // returns into a pooled buffer anyway. Move to the pool if profiling ever
 // shows this matters.
-func (h *Handler) handleTTSAudio(pcm []byte, gen uint64) {
+func (h *Handler) handleTTSAudio(pcm []byte, gen, req uint64, text string) {
 	if gen != h.curGen {
 		return // stale generation from an interrupted turn -- drop it
+	}
+
+	if text != "" && (len(h.turnChunks) == 0 || h.turnChunks[len(h.turnChunks)-1].req != req) {
+		h.turnChunks = append(h.turnChunks, spokenChunk{req: req, text: text})
 	}
 
 	if h.ttfaLoggedGen != gen {
@@ -759,7 +799,7 @@ func (h *Handler) handleTTSAudio(pcm []byte, gen uint64) {
 		h.ttsBuf = h.ttsBuf[media.FrameSize:]
 
 		select {
-		case h.outbound <- frame:
+		case h.outbound <- outFrame{pcm: frame, req: req}:
 		default:
 			h.cfg.Sink.Error("tts_outbound_full")
 
@@ -819,9 +859,51 @@ func (h *Handler) finishTurn(gen uint64) {
 	slog.Info("turn complete", "call_id", h.callID, "gen", gen,
 		"total_latency_ms", time.Since(h.turnStartedAt).Milliseconds())
 
+	h.recordReply(false)
 	h.ttsBuf = nil
 	// h.tts is deliberately left connected -- it's reused for the next turn
 	// rather than reopened (see tts.Client's doc comment).
+}
+
+// recordReply appends the current reply to history as the agent's own turn
+// and clears turnChunks. When the reply played out in full (cut=false) every
+// sentence goes in; when it was cut short (barge-in, dead TTS) only the
+// sentences up to the one playing at the moment of the cut -- what the caller
+// actually started hearing -- so the LLM's memory matches the conversation
+// the caller had, not the reply it merely generated. Sentences Sarvam
+// rejected never produced audio, so they never enter turnChunks at all.
+//
+// No "(interrupted)" marker is added to the text: the LLM tends to imitate
+// markers it sees in its own past turns, and anything it writes gets spoken.
+func (h *Handler) recordReply(cut bool) {
+	played := h.playingReq.Load()
+
+	var b strings.Builder
+
+	for _, c := range h.turnChunks {
+		if cut && (played == 0 || c.req > played) {
+			break
+		}
+
+		b.WriteString(c.text)
+	}
+
+	h.turnChunks = nil
+
+	text := strings.TrimSpace(b.String())
+	if text == "" {
+		return
+	}
+
+	h.history = append(h.history, llm.Message{Role: "assistant", Content: text})
+	slog.Info("agent reply recorded", "call_id", h.callID, "gen", h.curGen,
+		"cut", cut, "chars", len([]rune(text)))
+}
+
+// startTurnChunks resets reply tracking at the start of a new turn.
+func (h *Handler) startTurnChunks() {
+	h.turnChunks = nil
+	h.playingReq.Store(0)
 }
 
 func (h *Handler) handleLLMDone(err error) {
@@ -842,6 +924,11 @@ func (h *Handler) handleBargeIn() {
 	}
 
 	h.curGen++ // invalidate the interrupted turn's in-flight audio/done events
+
+	// Keep only what the caller heard before cutting in. Safe to read
+	// playingReq here: processSpeakingFrame flipped state to Transcribing
+	// before sending bargeInEvent, so it has stopped popping frames.
+	h.recordReply(true)
 
 	if h.tts != nil {
 		if err := h.tts.Cancel(); err != nil {
