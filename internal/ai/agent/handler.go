@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync/atomic"
@@ -74,7 +76,7 @@ const speakingDrainTimeoutTicks = 500
 // llmStreamer is the subset of *llm.Client that Handler needs, as an
 // interface so tests can inject a fake without a live LLM endpoint.
 type llmStreamer interface {
-	Stream(ctx context.Context, messages []llm.Message, onToken func(string)) error
+	Stream(ctx context.Context, messages []llm.Message, tools []llm.Tool, onToken func(string)) ([]llm.ToolCall, error)
 }
 
 // Sink receives Handler observability events, adapted to Prometheus metrics at
@@ -111,6 +113,22 @@ type Config struct {
 	// generated) and is recorded into history as the agent's own turn so the
 	// LLM doesn't redundantly re-greet on the caller's first real reply.
 	Greeting string
+	// Tools are the functions the LLM may call during a turn (see tools.go).
+	Tools []Tool
+	// Hangup ends the call; used after a ToolEndCall has run and the agent's
+	// last words have finished playing. Nil disables hanging up.
+	Hangup func()
+	// Transfer dials destination (an Asterisk dial string) and blocks until
+	// it answers (returning connect) or fails, times out, or ctx ends
+	// (returning an error). Calling connect hands the caller over to the
+	// destination and removes the agent from the call. Nil makes transfer
+	// tools report failure.
+	Transfer func(ctx context.Context, destination string, timeout time.Duration) (connect func() error, err error)
+	// HoldAudio loops to the caller while a transfer rings; BeepAudio plays
+	// once when it answers, just before the handover. Both 16kHz LE PCM16;
+	// empty means silence.
+	HoldAudio []byte
+	BeepAudio []byte
 
 	BargeIn BargeInDetector
 	// BargeInObserveOnly, when true, runs the detector for observability but
@@ -134,7 +152,14 @@ type Config struct {
 }
 
 type finalTranscriptEvent struct{ text string }
-type llmDoneEvent struct{ err error }
+type llmDoneEvent struct {
+	gen uint64
+	err error
+	// toolMsgs is the turn's tool exchange (assistant tool calls + tool
+	// results), for history; endCall is set when an EndsCall tool ran.
+	toolMsgs []llm.Message
+	endCall  bool
+}
 type ttsAudioEvent struct {
 	pcm  []byte
 	gen  uint64
@@ -195,8 +220,24 @@ type Handler struct {
 	// played yet. Written by ProcessFrame's goroutine, read by run() to decide
 	// what the caller actually heard when a reply is cut short.
 	playingReq atomic.Uint64
+	// toolRunning is set while a tool executes (runLLMTurn's goroutine).
+	// processSpeakingFrame pauses its dead-TTS drain timeout meanwhile: an
+	// empty queue is expected while the caller waits on a slow API after a
+	// short "let me check" has finished playing.
+	toolRunning atomic.Bool
+	// hold, when set, takes over ProcessFrame during a transfer: queued agent
+	// speech plays first, then the hold loop (or the one-shot beep); no STT,
+	// no barge-in -- the caller is waiting, not in conversation. Set and
+	// cleared by the tool goroutine; the player's position is advanced only
+	// by ProcessFrame's goroutine.
+	hold atomic.Pointer[holdPlayer]
 
 	events chan any
+
+	// Set once in NewHandler and never modified: the tools by name, and
+	// their definitions as sent to the LLM.
+	tools    map[string]Tool
+	toolDefs []llm.Tool
 
 	// run()-owned only.
 	tts        tts.Client
@@ -230,6 +271,12 @@ type Handler struct {
 	// previous answers (only the caller's lines were kept), so every turn it
 	// re-answered from scratch -- observed live as long, repetitive replies.
 	turnChunks []spokenChunk
+	// turnToolMsgs is the current turn's tool exchange, delivered by
+	// llmDoneEvent and written to history by recordReply ahead of the spoken
+	// reply. hangupAfterTurn is set when an EndsCall tool ran: finishTurn
+	// hangs up once the reply has played out.
+	turnToolMsgs    []llm.Message
+	hangupAfterTurn bool
 
 	// ProcessFrame-goroutine-owned only.
 	preroll [][]byte
@@ -264,6 +311,12 @@ func NewHandler(ctx context.Context, callID string, cfg Config) *Handler {
 	}
 	h.state.Store(int32(StateListening))
 
+	h.tools = make(map[string]Tool, len(cfg.Tools))
+	for _, t := range cfg.Tools {
+		h.tools[t.Def.Name] = t
+		h.toolDefs = append(h.toolDefs, llm.Tool{Type: "function", Function: t.Def})
+	}
+
 	if cfg.SystemPrompt != "" {
 		h.history = append(h.history, llm.Message{Role: "system", Content: cfg.SystemPrompt})
 	}
@@ -291,6 +344,10 @@ func (h *Handler) Close() error {
 // ProcessFrame implements media.Handler. Never blocks, never allocates beyond
 // a pooled-size copy for the pre-roll buffer during SPEAKING.
 func (h *Handler) ProcessFrame(_ context.Context, _ string, pcm []byte) [][]byte {
+	if hp := h.hold.Load(); hp != nil {
+		return h.processHoldFrame(hp)
+	}
+
 	switch State(h.state.Load()) {
 	case StateListening, StateTranscribing:
 		if err := h.cfg.STT.Feed(pcm); err != nil {
@@ -379,6 +436,12 @@ func (h *Handler) processSpeakingFrame(pcm []byte) [][]byte {
 	// right here (this goroutine) so the very next tick resumes feeding STT,
 	// and an event tells run() to clear its turn state; the guard means this
 	// can't stomp on a barge-in that already advanced us to Transcribing.
+	if h.toolRunning.Load() {
+		// Waiting on a tool, not a dead TTS connection -- see toolRunning.
+		h.emptyTicks = 0
+		return nil
+	}
+
 	h.emptyTicks++
 	if h.emptyTicks >= speakingDrainTimeoutTicks {
 		h.emptyTicks = 0
@@ -464,7 +527,7 @@ func (h *Handler) handleEvent(ev any) {
 	case finalTranscriptEvent:
 		h.handleFinalTranscript(e.text)
 	case llmDoneEvent:
-		h.handleLLMDone(e.err)
+		h.handleLLMDone(e)
 	case ttsAudioEvent:
 		h.handleTTSAudio(e.pcm, e.gen, e.req, e.text)
 	case ttsDoneEvent:
@@ -583,38 +646,104 @@ func (h *Handler) handleFinalTranscript(text string) {
 	go h.runLLMTurn(ctx, history, h.tts, gen, h.turnStartedAt)
 }
 
+// runLLMTurn streams the LLM's reply for one turn, speaking it sentence by
+// sentence as it arrives. When the model calls tools, any text it wrote first
+// ("ek second, main check kar raha hoon") is spoken immediately, the tools
+// run, their results go back to the model, and it streams again -- up to
+// maxToolRounds times. An EndsCall tool stops the loop: the model isn't asked
+// again, and the call hangs up once the reply has played out.
 func (h *Handler) runLLMTurn(ctx context.Context, history []llm.Message, ttsClient tts.Client, gen uint64, turnStartedAt time.Time) {
 	chunker := &SentenceChunker{}
 
-	var firstTokenAt time.Time
+	var (
+		firstTokenAt time.Time
+		toolMsgs     []llm.Message
+		endCall      bool
+		transferred  bool
+		err          error
+	)
 
-	err := h.cfg.LLM.Stream(ctx, history, func(tok string) {
-		if firstTokenAt.IsZero() {
-			firstTokenAt = time.Now()
-			slog.Info("llm first token", "call_id", h.callID, "gen", gen,
-				"latency_ms", firstTokenAt.Sub(turnStartedAt).Milliseconds())
+	for round := 0; round < maxToolRounds; round++ {
+		var (
+			calls []llm.ToolCall
+			said  strings.Builder
+		)
+
+		calls, err = h.cfg.LLM.Stream(ctx, history, h.toolDefs, func(tok string) {
+			if firstTokenAt.IsZero() {
+				firstTokenAt = time.Now()
+				slog.Info("llm first token", "call_id", h.callID, "gen", gen,
+					"latency_ms", firstTokenAt.Sub(turnStartedAt).Milliseconds())
+			}
+
+			said.WriteString(tok)
+
+			for _, chunk := range chunker.Feed(tok) {
+				h.sendToTTS(ctx, ttsClient, chunk, gen)
+			}
+		})
+
+		if ctx.Err() != nil {
+			// Cancelled by barge-in or call teardown; a barge-in already
+			// called Cancel on this exact ttsClient, so no further Speak calls
+			// for gen are possible and there's nothing to end.
+			slog.Info("llm turn cancelled", "call_id", h.callID, "gen", gen,
+				"duration_ms", time.Since(turnStartedAt).Milliseconds())
+
+			return
 		}
 
-		for _, chunk := range chunker.Feed(tok) {
-			h.sendToTTS(ctx, ttsClient, chunk, gen)
+		if err != nil {
+			break
 		}
-	})
 
-	if ctx.Err() != nil {
-		// Cancelled by barge-in or call teardown; a barge-in already called
-		// Cancel on this exact ttsClient, so no further Speak calls for gen
-		// are possible and there's nothing to end.
-		slog.Info("llm turn cancelled", "call_id", h.callID, "gen", gen,
-			"duration_ms", time.Since(turnStartedAt).Milliseconds())
-
-		return
-	}
-
-	if err == nil {
+		// Speak the tail now -- before any tool runs -- so the caller isn't
+		// left in silence while it does.
 		if remainder := chunker.Flush(); remainder != "" {
 			h.sendToTTS(ctx, ttsClient, remainder, gen)
 		}
 
+		if len(calls) == 0 {
+			break
+		}
+
+		if round == maxToolRounds-1 {
+			slog.Warn("llm tool round limit reached; ending turn", "call_id", h.callID, "gen", gen,
+				"rounds", maxToolRounds)
+
+			break
+		}
+
+		// Within this turn the model sees what it said alongside its calls.
+		// The copy kept for long-term history drops that text: recordReply
+		// records everything actually spoken as one message, so keeping it
+		// here too would duplicate it.
+		history = append(history, llm.Message{Role: "assistant", Content: said.String(), ToolCalls: calls})
+		toolMsgs = append(toolMsgs, llm.Message{Role: "assistant", ToolCalls: calls})
+
+		for _, call := range calls {
+			result, action := h.runTool(ctx, ttsClient, call, gen)
+
+			msg := llm.Message{Role: "tool", ToolCallID: call.ID, Content: result}
+			history = append(history, msg)
+			toolMsgs = append(toolMsgs, msg)
+			endCall = endCall || action == actionEndCall
+			transferred = transferred || action == actionTransferred
+		}
+
+		if ctx.Err() != nil {
+			slog.Info("llm turn cancelled during tool call", "call_id", h.callID, "gen", gen)
+			return
+		}
+
+		// Neither needs another LLM round: end_call's goodbye has been said,
+		// and after a transfer the caller is talking to a person.
+		if endCall || transferred {
+			break
+		}
+	}
+
+	if err == nil {
 		slog.Info("llm turn complete", "call_id", h.callID, "gen", gen,
 			"duration_ms", time.Since(turnStartedAt).Milliseconds())
 	} else {
@@ -622,14 +751,231 @@ func (h *Handler) runLLMTurn(ctx context.Context, history []llm.Message, ttsClie
 			"duration_ms", time.Since(turnStartedAt).Milliseconds(), "error", err)
 	}
 
+	// Sent BEFORE EndGeneration: EndGeneration can emit Done immediately (no
+	// audio pending), and run() must already know about endCall/toolMsgs when
+	// that Done ends the turn. Both travel on h.events, so order is kept.
+	select {
+	case h.events <- llmDoneEvent{gen: gen, err: err, toolMsgs: toolMsgs, endCall: endCall}:
+	case <-h.baseCtx.Done():
+		return
+	}
+
 	// No further Speak(gen) calls are coming. ttsClient.Done() will yield gen
 	// once its audio (if any was sent at all) has fully arrived.
 	ttsClient.EndGeneration(gen)
+}
 
-	select {
-	case h.events <- llmDoneEvent{err: err}:
-	case <-h.baseCtx.Done():
+// toolAction is what a tool call means for the rest of the turn.
+type toolAction int
+
+const (
+	actionNone        toolAction = iota
+	actionEndCall                // hang up once the reply has played
+	actionTransferred            // the caller is now with the transfer destination
+)
+
+// runTool executes one tool call, returning the result for the LLM and what
+// it means for the turn. The tool's Message (Dograh's customMessage) is
+// spoken first. Unknown tools and failures become error results the LLM can
+// react to.
+func (h *Handler) runTool(ctx context.Context, ttsClient tts.Client, call llm.ToolCall, gen uint64) (string, toolAction) {
+	t, ok := h.tools[call.Function.Name]
+	if !ok {
+		slog.Warn("llm called an unknown tool", "call_id", h.callID, "gen", gen, "tool", call.Function.Name)
+		return toolErrorResult(fmt.Errorf("unknown tool %q", call.Function.Name)), actionNone
 	}
+
+	slog.Info("tool call", "call_id", h.callID, "gen", gen, "tool", call.Function.Name,
+		"args", truncate(call.Function.Arguments, 200))
+
+	if t.Message != "" {
+		h.sendToTTS(ctx, ttsClient, t.Message, gen)
+	}
+
+	h.toolRunning.Store(true)
+	defer h.toolRunning.Store(false)
+
+	switch t.Kind {
+	case ToolEndCall:
+		var args struct {
+			Reason string `json:"reason"`
+		}
+
+		_ = json.Unmarshal([]byte(call.Function.Arguments), &args)
+		slog.Info("end call requested", "call_id", h.callID, "gen", gen, "reason", args.Reason)
+
+		return `{"status":"success","action":"ending_call"}`, actionEndCall
+	case ToolTransfer:
+		return h.transfer(ctx, t, gen)
+	}
+
+	if t.Run == nil {
+		return toolErrorResult(fmt.Errorf("tool %q has no implementation", t.Def.Name)), actionNone
+	}
+
+	tctx, cancel := context.WithTimeout(ctx, toolTimeout)
+	defer cancel()
+
+	start := time.Now()
+
+	result, err := t.Run(tctx, json.RawMessage(call.Function.Arguments))
+	if err != nil {
+		slog.Warn("tool failed", "call_id", h.callID, "gen", gen, "tool", call.Function.Name,
+			"duration_ms", time.Since(start).Milliseconds(), "error", err)
+
+		return toolErrorResult(err), actionNone
+	}
+
+	slog.Info("tool result", "call_id", h.callID, "gen", gen, "tool", call.Function.Name,
+		"duration_ms", time.Since(start).Milliseconds(), "result", truncate(result, 200))
+
+	return result, actionNone
+}
+
+// holdMessageWaitTicks is how long (in 20ms ticks) hold music waits for the
+// transfer's spoken message to start arriving from TTS before starting
+// anyway -- so the ring doesn't start and then get interrupted by the message.
+const holdMessageWaitTicks = 150
+
+// transfer runs a ToolTransfer: ring the destination with hold music playing
+// to the caller; on answer play the beep, then hand over. Mirrors Dograh's
+// transfer flow (hold loop while waiting, beep, then bridge swap).
+func (h *Handler) transfer(ctx context.Context, t Tool, gen uint64) (string, toolAction) {
+	if h.cfg.Transfer == nil {
+		return transferFailed("call transfer is not available"), actionNone
+	}
+
+	timeout := t.Timeout
+	if timeout <= 0 {
+		timeout = defaultTransferTimeout
+	}
+
+	slog.Info("transfer dialing", "call_id", h.callID, "gen", gen,
+		"destination", t.Destination, "timeout_s", int(timeout.Seconds()))
+
+	h.hold.Store(&holdPlayer{pcm: h.cfg.HoldAudio, loop: true, waitForMessage: t.Message != ""})
+
+	start := time.Now()
+
+	connect, err := h.cfg.Transfer(ctx, t.Destination, timeout)
+	if err != nil {
+		h.hold.Store(nil)
+		slog.Warn("transfer failed", "call_id", h.callID, "gen", gen, "destination", t.Destination,
+			"after_ms", time.Since(start).Milliseconds(), "error", err)
+
+		return transferFailed(err.Error()), actionNone
+	}
+
+	slog.Info("transfer answered", "call_id", h.callID, "gen", gen, "destination", t.Destination,
+		"after_ms", time.Since(start).Milliseconds())
+
+	// Beep, and let it finish playing before the handover cuts this leg off.
+	beep := &holdPlayer{pcm: h.cfg.BeepAudio}
+	h.hold.Store(beep)
+	waitUntil(ctx, 2*time.Second, beep.done.Load)
+
+	if err := connect(); err != nil {
+		h.hold.Store(nil)
+		slog.Warn("transfer handover failed", "call_id", h.callID, "gen", gen, "error", err)
+
+		return transferFailed(err.Error()), actionNone
+	}
+
+	slog.Info("call transferred", "call_id", h.callID, "gen", gen, "destination", t.Destination)
+
+	return `{"status":"success","action":"transferred"}`, actionTransferred
+}
+
+func transferFailed(reason string) string {
+	b, _ := json.Marshal(map[string]string{"status": "failed", "reason": reason})
+	return string(b)
+}
+
+// waitUntil polls cond every 20ms until it's true, max elapses, or ctx ends.
+func waitUntil(ctx context.Context, max time.Duration, cond func() bool) {
+	deadline := time.NewTimer(max)
+	defer deadline.Stop()
+
+	tick := time.NewTicker(media.FrameInterval)
+	defer tick.Stop()
+
+	for !cond() {
+		select {
+		case <-ctx.Done():
+			return
+		case <-deadline.C:
+			return
+		case <-tick.C:
+		}
+	}
+}
+
+// holdPlayer feeds canned audio (hold loop or beep) to the caller frame by
+// frame. pos/waited/sawMessage belong to ProcessFrame's goroutine; done is
+// read by the tool goroutine.
+type holdPlayer struct {
+	pcm            []byte
+	loop           bool
+	waitForMessage bool
+
+	pos        int
+	waited     int
+	sawMessage bool
+
+	done atomic.Bool
+}
+
+// next returns the player's next 20ms frame, or nil once a one-shot player
+// has finished (or there's nothing to play).
+func (p *holdPlayer) next() []byte {
+	if p.pos+media.FrameSize > len(p.pcm) {
+		if !p.loop || len(p.pcm) < media.FrameSize {
+			p.done.Store(true)
+			return nil
+		}
+
+		p.pos = 0
+	}
+
+	f := p.pcm[p.pos : p.pos+media.FrameSize]
+	p.pos += media.FrameSize
+
+	return f
+}
+
+// processHoldFrame is ProcessFrame during a transfer: already-queued agent
+// speech (the "please stay on the line" message) plays first, then the hold
+// audio. Nothing reaches STT and barge-in is off -- the caller is waiting.
+func (h *Handler) processHoldFrame(p *holdPlayer) [][]byte {
+	select {
+	case f := <-h.outbound:
+		p.sawMessage = true
+		h.playingReq.Store(f.req)
+
+		return [][]byte{f.pcm}
+	default:
+	}
+
+	if p.waitForMessage && !p.sawMessage && p.waited < holdMessageWaitTicks {
+		p.waited++
+		return nil
+	}
+
+	if f := p.next(); f != nil {
+		return [][]byte{f}
+	}
+
+	return nil
+}
+
+// truncate caps s at max runes for logging.
+func truncate(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+
+	return string(r[:max]) + "…"
 }
 
 // sendToTTS sends one text chunk for synthesis. ctx is the owning turn's
@@ -861,6 +1207,15 @@ func (h *Handler) finishTurn(gen uint64) {
 
 	h.recordReply(false)
 	h.ttsBuf = nil
+
+	if h.hangupAfterTurn {
+		h.hangupAfterTurn = false
+		slog.Info("agent ending call (end_call tool)", "call_id", h.callID, "gen", gen)
+
+		if h.cfg.Hangup != nil {
+			go h.cfg.Hangup() // ARI REST call; never block the event loop on it
+		}
+	}
 	// h.tts is deliberately left connected -- it's reused for the next turn
 	// rather than reopened (see tts.Client's doc comment).
 }
@@ -890,6 +1245,11 @@ func (h *Handler) recordReply(cut bool) {
 
 	h.turnChunks = nil
 
+	// Tool calls and results go in first, even when the reply was cut: the
+	// tools really ran, and the LLM should know what they returned.
+	h.history = append(h.history, h.turnToolMsgs...)
+	h.turnToolMsgs = nil
+
 	text := strings.TrimSpace(b.String())
 	if text == "" {
 		return
@@ -903,16 +1263,26 @@ func (h *Handler) recordReply(cut bool) {
 // startTurnChunks resets reply tracking at the start of a new turn.
 func (h *Handler) startTurnChunks() {
 	h.turnChunks = nil
+	h.turnToolMsgs = nil
+	h.hangupAfterTurn = false
 	h.playingReq.Store(0)
 }
 
-func (h *Handler) handleLLMDone(err error) {
-	if err != nil {
+func (h *Handler) handleLLMDone(e llmDoneEvent) {
+	if e.err != nil {
 		h.cfg.Sink.Error("llm")
 	}
+
+	if e.gen != h.curGen {
+		return // a barge-in already moved on; that turn's tools don't matter now
+	}
+
+	h.turnToolMsgs = e.toolMsgs
+	h.hangupAfterTurn = e.endCall
+
 	// The Listening transition happens via handleTTSDone once ttsClient.Done
 	// yields this turn's generation -- EndGeneration (called by runLLMTurn
-	// right before this event is sent) fires that immediately when the LLM
+	// right after this event is sent) fires that immediately when the LLM
 	// produced no output at all, so there's no separate "nothing was spoken"
 	// case to handle here.
 }
@@ -929,6 +1299,10 @@ func (h *Handler) handleBargeIn() {
 	// playingReq here: processSpeakingFrame flipped state to Transcribing
 	// before sending bargeInEvent, so it has stopped popping frames.
 	h.recordReply(true)
+
+	// The caller cut in over a goodbye: they want to keep talking, so don't
+	// hang up on them.
+	h.hangupAfterTurn = false
 
 	if h.tts != nil {
 		if err := h.tts.Cancel(); err != nil {

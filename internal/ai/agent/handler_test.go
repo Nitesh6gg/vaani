@@ -3,9 +3,12 @@ package agent
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -164,24 +167,61 @@ func (f *fakeTTS) spokenCount() int {
 	return len(f.spoken)
 }
 
-// fakeLLM streams a fixed token list, respecting context cancellation.
+// fakeLLM streams a fixed token list, respecting context cancellation. With
+// rounds set, each successive Stream call plays the next round instead
+// (tokens then tool calls), so a test can script LLM -> tool -> LLM.
 type fakeLLM struct {
 	tokens []string
 	err    error
+
+	rounds []fakeRound
+
+	mu    sync.Mutex
+	calls int
+	seen  [][]llm.Message // messages received by each Stream call
+	tools [][]llm.Tool    // tools received by each Stream call
 }
 
-func (f *fakeLLM) Stream(ctx context.Context, _ []llm.Message, onToken func(string)) error {
-	for _, tok := range f.tokens {
+type fakeRound struct {
+	tokens    []string
+	toolCalls []llm.ToolCall
+}
+
+func (f *fakeLLM) Stream(ctx context.Context, msgs []llm.Message, tools []llm.Tool, onToken func(string)) ([]llm.ToolCall, error) {
+	f.mu.Lock()
+	n := f.calls
+	f.calls++
+	f.seen = append(f.seen, append([]llm.Message(nil), msgs...))
+	f.tools = append(f.tools, tools)
+	f.mu.Unlock()
+
+	round := fakeRound{tokens: f.tokens}
+	if f.rounds != nil {
+		if n >= len(f.rounds) {
+			return nil, nil
+		}
+
+		round = f.rounds[n]
+	}
+
+	for _, tok := range round.tokens {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return nil, ctx.Err()
 		default:
 		}
 
 		onToken(tok)
 	}
 
-	return f.err
+	return round.toolCalls, f.err
+}
+
+func (f *fakeLLM) streamCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.calls
 }
 
 func testConfig(sttClient stt.Client, ttsClient tts.Client, llmClient llmStreamer, guard, postCut time.Duration) Config {
@@ -634,4 +674,289 @@ func TestHandler_OutboundBufferFullWarningLoggedOncePerGeneration(t *testing.T) 
 
 	assert.Equal(t, 1, strings.Count(getLog().String(), "tts outbound buffer full"),
 		"must log once per generation, not once per dropped frame")
+}
+
+// echoTool returns a fixed result and records that it ran.
+func echoTool(name, result string, ran *atomic.Int32) Tool {
+	return Tool{
+		Def: llm.FunctionDef{Name: name, Description: "test tool"},
+		Run: func(context.Context, json.RawMessage) (string, error) {
+			ran.Add(1)
+			return result, nil
+		},
+	}
+}
+
+// playTurn pushes one audio chunk per spoken sentence for gen, signals Done,
+// and drives ProcessFrame until the turn ends.
+func playTurn(t *testing.T, h *Handler, fTTS *fakeTTS, gen uint64, sentences ...string) {
+	t.Helper()
+
+	for i, s := range sentences {
+		fTTS.audio <- tts.Chunk{PCM: constFrame(quietAmplitude), Gen: gen, Req: uint64(i + 1), Text: s}
+	}
+
+	fTTS.done <- gen
+	drainUntilListening(t, h)
+}
+
+// TestHandler_ToolRoundTrip: text before a tool call is spoken right away,
+// the tool runs, its result goes back to the LLM (with the assistant's call
+// message before it), the LLM's follow-up is spoken, and history ends up
+// with the tool exchange followed by everything actually said.
+func TestHandler_ToolRoundTrip(t *testing.T) {
+	fSTT := newFakeSTT()
+	fTTS := newFakeTTS()
+
+	var ran atomic.Int32
+
+	call := llm.ToolCall{ID: "c1", Type: "function", Function: llm.FunctionCall{Name: "lookup", Arguments: `{"pin":"1"}`}}
+	fLLM := &fakeLLM{rounds: []fakeRound{
+		{tokens: []string{"Let me check."}, toolCalls: []llm.ToolCall{call}},
+		{tokens: []string{" It is done."}},
+	}}
+
+	cfg := testConfig(fSTT, fTTS, fLLM, 0, 0)
+	cfg.Tools = []Tool{echoTool("lookup", `{"ok":true}`, &ran)}
+	h := NewHandler(context.Background(), "call1", cfg)
+
+	fSTT.sendFinal("check my pin")
+	require.Eventually(t, func() bool { return fTTS.spokenCount() == 2 }, time.Second, time.Millisecond)
+
+	assert.Equal(t, int32(1), ran.Load())
+	assert.Equal(t, []string{"Let me check.", " It is done."}, fTTS.spoken,
+		"the pre-tool sentence must be sent to TTS before the tool result comes back")
+
+	require.Equal(t, 2, fLLM.streamCalls())
+	assert.Equal(t, "lookup", fLLM.tools[0][0].Function.Name, "tools must be offered to the LLM")
+
+	second := fLLM.seen[1]
+	require.Len(t, second, 3)
+	assert.Equal(t, llm.Message{Role: "assistant", Content: "Let me check.", ToolCalls: []llm.ToolCall{call}}, second[1])
+	assert.Equal(t, llm.Message{Role: "tool", ToolCallID: "c1", Content: `{"ok":true}`}, second[2])
+
+	playTurn(t, h, fTTS, 1, "Let me check.", " It is done.")
+
+	assert.Equal(t, []llm.Message{
+		{Role: "user", Content: "check my pin"},
+		{Role: "assistant", ToolCalls: []llm.ToolCall{call}},
+		{Role: "tool", ToolCallID: "c1", Content: `{"ok":true}`},
+		{Role: "assistant", Content: "Let me check. It is done."},
+	}, h.history)
+}
+
+// TestHandler_EndCallHangsUpAfterGoodbyePlays: the LLM isn't asked again
+// after end_call, and the call hangs up only once the goodbye has played.
+func TestHandler_EndCallHangsUpAfterGoodbyePlays(t *testing.T) {
+	fSTT := newFakeSTT()
+	fTTS := newFakeTTS()
+
+	call := llm.ToolCall{ID: "e1", Type: "function", Function: llm.FunctionCall{Name: "end_call", Arguments: "{}"}}
+	fLLM := &fakeLLM{rounds: []fakeRound{{tokens: []string{"Goodbye."}, toolCalls: []llm.ToolCall{call}}}}
+
+	var hangups atomic.Int32
+
+	cfg := testConfig(fSTT, fTTS, fLLM, 0, 0)
+	cfg.Tools = []Tool{{Def: llm.FunctionDef{Name: "end_call"}, Kind: ToolEndCall}}
+	cfg.Hangup = func() { hangups.Add(1) }
+	h := NewHandler(context.Background(), "call1", cfg)
+
+	fSTT.sendFinal("bye")
+	require.Eventually(t, func() bool { return fTTS.spokenCount() == 1 }, time.Second, time.Millisecond)
+
+	fTTS.audio <- tts.Chunk{PCM: constFrame(quietAmplitude), Gen: 1, Req: 1, Text: "Goodbye."}
+	require.Eventually(t, func() bool { return h.State() == StateSpeaking }, time.Second, time.Millisecond)
+	assert.Zero(t, hangups.Load(), "must not hang up while the goodbye is still playing")
+
+	fTTS.done <- 1
+	drainUntilListening(t, h)
+
+	require.Eventually(t, func() bool { return hangups.Load() == 1 }, time.Second, time.Millisecond)
+	assert.Equal(t, 1, fLLM.streamCalls(), "the LLM must not be asked again after end_call")
+}
+
+// TestHandler_UnknownToolReturnsErrorToLLM: a hallucinated tool name must not
+// break the turn -- the LLM gets an error result and carries on.
+func TestHandler_UnknownToolReturnsErrorToLLM(t *testing.T) {
+	fSTT := newFakeSTT()
+	fTTS := newFakeTTS()
+
+	call := llm.ToolCall{ID: "x", Type: "function", Function: llm.FunctionCall{Name: "nope", Arguments: "{}"}}
+	fLLM := &fakeLLM{rounds: []fakeRound{{toolCalls: []llm.ToolCall{call}}, {tokens: []string{"Sorry."}}}}
+
+	NewHandler(context.Background(), "call1", testConfig(fSTT, fTTS, fLLM, 0, 0))
+
+	fSTT.sendFinal("hi")
+	require.Eventually(t, func() bool { return fTTS.spokenCount() == 1 }, time.Second, time.Millisecond)
+
+	result := fLLM.seen[1][2]
+	assert.Equal(t, "tool", result.Role)
+	assert.Contains(t, result.Content, `"status":"error"`)
+	assert.Contains(t, result.Content, "nope")
+}
+
+// TestHandler_DrainTimeoutPausedWhileToolRuns: once "let me check" finishes
+// playing, the queue sits empty while a slow tool runs. That is not a dead
+// TTS connection, so the 10s drain safeguard must not end the turn.
+func TestHandler_DrainTimeoutPausedWhileToolRuns(t *testing.T) {
+	fSTT := newFakeSTT()
+	fTTS := newFakeTTS()
+
+	release := make(chan struct{})
+	slow := Tool{
+		Def: llm.FunctionDef{Name: "slow"},
+		Run: func(ctx context.Context, _ json.RawMessage) (string, error) {
+			<-release
+			return `{}`, nil
+		},
+	}
+
+	call := llm.ToolCall{ID: "s", Type: "function", Function: llm.FunctionCall{Name: "slow", Arguments: "{}"}}
+	fLLM := &fakeLLM{rounds: []fakeRound{{tokens: []string{"One moment."}, toolCalls: []llm.ToolCall{call}}}}
+
+	cfg := testConfig(fSTT, fTTS, fLLM, time.Hour, 0)
+	cfg.Tools = []Tool{slow}
+	h := NewHandler(context.Background(), "call1", cfg)
+
+	fSTT.sendFinal("hi")
+	require.Eventually(t, func() bool { return fTTS.spokenCount() == 1 }, time.Second, time.Millisecond)
+
+	fTTS.audio <- tts.Chunk{PCM: constFrame(quietAmplitude), Gen: 1, Req: 1, Text: "One moment."}
+	require.Eventually(t, func() bool { return h.State() == StateSpeaking && h.toolRunning.Load() }, time.Second, time.Millisecond)
+
+	for i := 0; i < speakingDrainTimeoutTicks+50; i++ {
+		h.ProcessFrame(context.Background(), "call1", constFrame(quietAmplitude))
+	}
+
+	assert.Equal(t, StateSpeaking, h.State(), "drain timeout must not fire while a tool is running")
+
+	// Let the tool and the rest of the turn finish before returning, so their
+	// log lines can't land in a later test that captures slog output.
+	close(release)
+	require.Eventually(t, func() bool { return fLLM.streamCalls() == 2 }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return !h.toolRunning.Load() && len(h.turnToolMsgs) > 0 }, time.Second, time.Millisecond)
+}
+
+// firstSample identifies which canned sound a frame came from in the
+// transfer tests (each uses a different constant amplitude).
+func firstSample(t *testing.T, frames [][]byte) int16 {
+	t.Helper()
+	require.Len(t, frames, 1)
+
+	return int16(frames[0][0]) | int16(frames[0][1])<<8
+}
+
+const (
+	msgAmp  = 100
+	holdAmp = 200
+	beepAmp = 300
+)
+
+func transferTool() Tool {
+	return Tool{
+		Def:         llm.FunctionDef{Name: "transfer_to_support"},
+		Kind:        ToolTransfer,
+		Destination: "SIP/100@pbx",
+		Message:     "Please hold.",
+	}
+}
+
+// TestHandler_TransferHoldBeepThenConnect: the "please hold" message plays
+// first, then hold audio loops while the destination rings; on answer the
+// beep plays in full before connect() hands the caller over. The LLM is not
+// asked again afterwards.
+func TestHandler_TransferHoldBeepThenConnect(t *testing.T) {
+	fSTT := newFakeSTT()
+	fTTS := newFakeTTS()
+
+	call := llm.ToolCall{ID: "t1", Type: "function", Function: llm.FunctionCall{Name: "transfer_to_support", Arguments: "{}"}}
+	fLLM := &fakeLLM{rounds: []fakeRound{{toolCalls: []llm.ToolCall{call}}}}
+
+	answer := make(chan struct{})
+
+	var (
+		connects    atomic.Int32
+		gotDest     string
+		gotTimeout  time.Duration
+		dialStarted = make(chan struct{})
+	)
+
+	cfg := testConfig(fSTT, fTTS, fLLM, time.Hour, 0)
+	cfg.Tools = []Tool{transferTool()}
+	cfg.HoldAudio = constFrame(holdAmp)
+	cfg.BeepAudio = constFrame(beepAmp)
+	cfg.Transfer = func(ctx context.Context, dest string, timeout time.Duration) (func() error, error) {
+		gotDest, gotTimeout = dest, timeout
+		close(dialStarted)
+		<-answer
+
+		return func() error { connects.Add(1); return nil }, nil
+	}
+	h := NewHandler(context.Background(), "call1", cfg)
+
+	fSTT.sendFinal("connect me to support")
+	<-dialStarted
+	assert.Equal(t, "SIP/100@pbx", gotDest)
+	assert.Equal(t, defaultTransferTimeout, gotTimeout, "no configured timeout -> default")
+	require.Eventually(t, func() bool { return fTTS.spokenCount() == 1 }, time.Second, time.Millisecond)
+
+	fTTS.audio <- tts.Chunk{PCM: constFrame(msgAmp), Gen: 1, Req: 1, Text: "Please hold."}
+	require.Eventually(t, func() bool { return len(h.outbound) == 1 }, time.Second, time.Millisecond)
+
+	assert.Equal(t, int16(msgAmp), firstSample(t, h.ProcessFrame(context.Background(), "call1", constFrame(quietAmplitude))),
+		"the hold message plays before the hold audio")
+
+	for i := 0; i < 3; i++ { // one frame of hold audio, looping
+		assert.Equal(t, int16(holdAmp), firstSample(t, h.ProcessFrame(context.Background(), "call1", constFrame(quietAmplitude))))
+	}
+
+	assert.Zero(t, fSTT.fedCount(), "caller audio must not reach STT while on hold")
+
+	close(answer)
+	require.Eventually(t, func() bool {
+		hp := h.hold.Load()
+		return hp != nil && !hp.loop
+	}, time.Second, time.Millisecond)
+	assert.Zero(t, connects.Load(), "must not connect before the beep has played")
+
+	assert.Equal(t, int16(beepAmp), firstSample(t, h.ProcessFrame(context.Background(), "call1", constFrame(quietAmplitude))))
+
+	require.Eventually(t, func() bool {
+		h.ProcessFrame(context.Background(), "call1", constFrame(quietAmplitude))
+		return connects.Load() == 1
+	}, time.Second, time.Millisecond)
+
+	time.Sleep(50 * time.Millisecond)
+	assert.Equal(t, 1, fLLM.streamCalls(), "the LLM must not be asked again after a transfer")
+}
+
+// TestHandler_TransferFailureGoesBackToLLM: a destination that doesn't answer
+// stops the hold audio and hands the reason to the LLM, which carries on.
+func TestHandler_TransferFailureGoesBackToLLM(t *testing.T) {
+	fSTT := newFakeSTT()
+	fTTS := newFakeTTS()
+
+	call := llm.ToolCall{ID: "t1", Type: "function", Function: llm.FunctionCall{Name: "transfer_to_support", Arguments: "{}"}}
+	fLLM := &fakeLLM{rounds: []fakeRound{
+		{toolCalls: []llm.ToolCall{call}},
+		{tokens: []string{"Nobody is free right now."}},
+	}}
+
+	cfg := testConfig(fSTT, fTTS, fLLM, time.Hour, 0)
+	cfg.Tools = []Tool{transferTool()}
+	cfg.HoldAudio = constFrame(holdAmp)
+	cfg.Transfer = func(context.Context, string, time.Duration) (func() error, error) {
+		return nil, errors.New("transfer destination did not answer (User busy, cause 17)")
+	}
+	h := NewHandler(context.Background(), "call1", cfg)
+
+	fSTT.sendFinal("connect me to support")
+	require.Eventually(t, func() bool { return fTTS.spokenCount() == 2 }, time.Second, time.Millisecond)
+
+	assert.Nil(t, h.hold.Load(), "hold audio must stop when the transfer fails")
+
+	result := fLLM.seen[1][2]
+	assert.Equal(t, "tool", result.Role)
+	assert.JSONEq(t, `{"status":"failed","reason":"transfer destination did not answer (User busy, cause 17)"}`, result.Content)
+	assert.Equal(t, "Nobody is free right now.", fTTS.spoken[1])
 }

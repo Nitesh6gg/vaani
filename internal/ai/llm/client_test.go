@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -39,7 +40,7 @@ func TestClient_Stream_DeliversTokensInOrder(t *testing.T) {
 	c := NewClient(srv.URL, "test-key", "test-model")
 
 	var got []string
-	err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, func(tok string) {
+	_, err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, func(tok string) {
 		got = append(got, tok)
 	})
 
@@ -59,7 +60,7 @@ func TestClient_Stream_SkipsMalformedLinesWithoutFailing(t *testing.T) {
 	c := NewClient(srv.URL, "test-key", "test-model")
 
 	var got []string
-	err := c.Stream(context.Background(), nil, func(tok string) { got = append(got, tok) })
+	_, err := c.Stream(context.Background(), nil, nil, func(tok string) { got = append(got, tok) })
 
 	require.NoError(t, err)
 	assert.Equal(t, []string{"ok"}, got)
@@ -74,7 +75,7 @@ func TestClient_Stream_NonTwoXXReturnsError(t *testing.T) {
 
 	c := NewClient(srv.URL, "bad-key", "test-model")
 
-	err := c.Stream(context.Background(), nil, func(string) {})
+	_, err := c.Stream(context.Background(), nil, nil, func(string) {})
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "401")
@@ -101,10 +102,11 @@ func TestClient_Stream_ContextCancelStopsPromptly(t *testing.T) {
 	done := make(chan error, 1)
 
 	go func() {
-		done <- c.Stream(ctx, nil, func(tok string) {
+		_, err := c.Stream(ctx, nil, nil, func(tok string) {
 			got = append(got, tok)
 			cancel() // simulate barge-in firing right after the first token
 		})
+		done <- err
 	}()
 
 	err := <-done
@@ -120,6 +122,91 @@ func TestClient_Stream_ContextCancelStopsPromptly(t *testing.T) {
 	}
 }
 
+// TestClient_Stream_AssemblesFragmentedToolCall covers OpenAI-style
+// streaming: one call's id/name arrive first, its arguments JSON in pieces
+// across later deltas, all matched by index. Text before the call must reach
+// onToken so it can be spoken while the tool runs.
+func TestClient_Stream_AssemblesFragmentedToolCall(t *testing.T) {
+	srv := sseServer(t, []string{
+		`data: {"choices":[{"delta":{"content":"Let me check."}}]}`,
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"lookup_pin","arguments":""}}]}}]}`,
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"pin\":"}}]}}]}`,
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"120205\"}"}}]}}]}`,
+		`data: [DONE]`,
+	})
+	defer srv.Close()
+
+	var got []string
+
+	calls, err := NewClient(srv.URL, "k", "m").Stream(context.Background(), nil, nil, func(tok string) {
+		got = append(got, tok)
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"Let me check."}, got)
+	require.Len(t, calls, 1)
+	assert.Equal(t, "call_1", calls[0].ID)
+	assert.Equal(t, "lookup_pin", calls[0].Function.Name)
+	assert.JSONEq(t, `{"pin":"120205"}`, calls[0].Function.Arguments)
+}
+
+// TestClient_Stream_GeminiWholeCallsKeepThoughtSignature covers Gemini's
+// OpenAI-compatible style: each call arrives whole in one delta, a second
+// parallel call reuses index 0, and each carries extra_content (the thought
+// signature) that must be kept byte-for-byte and sent back on the next
+// request -- Gemini 3 rejects the follow-up otherwise.
+func TestClient_Stream_GeminiWholeCallsKeepThoughtSignature(t *testing.T) {
+	srv := sseServer(t, []string{
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","type":"function","function":{"name":"one","arguments":"{}"},"extra_content":{"google":{"thought_signature":"sigA"}}}]}}]}`,
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"b","type":"function","function":{"name":"two","arguments":"{\"x\":1}"}}]}}]}`,
+		`data: [DONE]`,
+	})
+	defer srv.Close()
+
+	calls, err := NewClient(srv.URL, "k", "m").Stream(context.Background(), nil, nil, func(string) {})
+
+	require.NoError(t, err)
+	require.Len(t, calls, 2, "a reused index with a different id is a new call, not a continuation")
+	assert.Equal(t, "one", calls[0].Function.Name)
+	assert.JSONEq(t, `{"google":{"thought_signature":"sigA"}}`, string(calls[0].ExtraContent))
+	assert.Equal(t, "two", calls[1].Function.Name)
+	assert.JSONEq(t, `{"x":1}`, calls[1].Function.Arguments)
+
+	// Round-trip: the assistant message carrying these calls must serialize
+	// the signature back exactly where Gemini expects it.
+	raw, err := json.Marshal(Message{Role: "assistant", ToolCalls: calls[:1]})
+	require.NoError(t, err)
+	assert.JSONEq(t,
+		`{"role":"assistant","tool_calls":[{"id":"a","type":"function","function":{"name":"one","arguments":"{}"},"extra_content":{"google":{"thought_signature":"sigA"}}}]}`,
+		string(raw))
+}
+
+func TestClient_Stream_SendsToolsWithDefaultParameters(t *testing.T) {
+	var body map[string]any
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		_, _ = fmt.Fprintln(w, `data: [DONE]`)
+	}))
+	defer srv.Close()
+
+	_, err := NewClient(srv.URL, "k", "m").Stream(context.Background(), nil,
+		[]Tool{{Function: FunctionDef{Name: "end_call", Description: "End the call."}}}, func(string) {})
+	require.NoError(t, err)
+
+	tools, ok := body["tools"].([]any)
+	require.True(t, ok, "tools must be sent when provided")
+	require.Len(t, tools, 1)
+
+	tool := tools[0].(map[string]any)
+	assert.Equal(t, "function", tool["type"])
+
+	fn := tool["function"].(map[string]any)
+	assert.Equal(t, "end_call", fn["name"])
+	assert.Equal(t, map[string]any{"type": "object", "properties": map[string]any{}}, fn["parameters"],
+		"a no-argument tool still needs a parameters object for some providers")
+}
+
 func TestClient_Stream_TrimsTrailingSlashFromBaseURL(t *testing.T) {
 	var gotPath string
 
@@ -130,7 +217,8 @@ func TestClient_Stream_TrimsTrailingSlashFromBaseURL(t *testing.T) {
 	defer srv.Close()
 
 	c := NewClient(srv.URL+"/", "k", "m")
-	require.NoError(t, c.Stream(context.Background(), nil, func(string) {}))
+	_, err := c.Stream(context.Background(), nil, nil, func(string) {})
+	require.NoError(t, err)
 
 	assert.Equal(t, "/chat/completions", gotPath)
 	assert.False(t, strings.HasSuffix(c.baseURL, "/"))

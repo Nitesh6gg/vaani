@@ -11,12 +11,14 @@ import (
 	"github.com/CyCoreSystems/ari/v5"
 	"github.com/CyCoreSystems/ari/v5/rid"
 
+	"github.com/nitesh/vaani/assets"
 	"github.com/nitesh/vaani/internal/ai/agent"
 	"github.com/nitesh/vaani/internal/ai/agent/tenvad"
 	"github.com/nitesh/vaani/internal/ai/llm"
 	"github.com/nitesh/vaani/internal/ai/stt"
 	"github.com/nitesh/vaani/internal/ai/tts"
 	"github.com/nitesh/vaani/internal/config"
+	"github.com/nitesh/vaani/internal/dograh"
 	"github.com/nitesh/vaani/internal/media"
 	"github.com/nitesh/vaani/internal/metrics"
 	"github.com/nitesh/vaani/internal/session"
@@ -96,6 +98,17 @@ type call struct {
 	cm     *media.CallMedia            // set once the RTP media plane starts
 	asm    *media.AudioSocketCallMedia // set once the AudioSocket media plane starts
 
+	// mediaCtx scopes the media plane and the agent (a child of Call.Ctx,
+	// created in completeBridge). A transfer cancels it to take the agent out
+	// of a call that carries on without it; teardown cancels it via Call.Ctx.
+	mediaCtx    context.Context
+	mediaCancel context.CancelFunc
+
+	// transferChannel is the transfer destination's channel once a transfer
+	// has connected (written under Manager.mu): from then on the call is
+	// caller <-> destination, and teardown hangs that channel up too.
+	transferChannel string
+
 	// maxDur, when MAX_CALL_DURATION_SECONDS is set, hangs the call up when the
 	// cap is reached however healthy it looks -- a backstop against a wedged
 	// call burning billable telephony time forever. Stopped inside teardown.
@@ -148,21 +161,44 @@ type Manager struct {
 	cl    ari.Client
 	cfg   config.Config
 	ports *media.PortAllocator
+	// store reads agent tools from Dograh's database; nil when DOGRAH_DB_URL
+	// isn't set (the agent then runs without tools).
+	store *dograh.Store
 
-	mu      sync.Mutex
-	pending map[string]*call // keyed by the externalMedia channel ID, awaiting its StasisStart
-	active  map[string]*call // keyed by both callerID and externalID once bridged
+	// holdAudio/beepAudio are the transfer sounds (see assets), 16kHz PCM.
+	holdAudio []byte
+	beepAudio []byte
+
+	mu        sync.Mutex
+	pending   map[string]*call            // keyed by the externalMedia channel ID, awaiting its StasisStart
+	active    map[string]*call            // keyed by callerID and externalID once bridged (plus transferChannel after a transfer)
+	transfers map[string]*pendingTransfer // keyed by the ringing transfer destination's channel ID
 }
 
-// NewManager creates a call Manager bound to cl.
-func NewManager(cl ari.Client, cfg config.Config, ports *media.PortAllocator) *Manager {
-	return &Manager{
-		cl:      cl,
-		cfg:     cfg,
-		ports:   ports,
-		pending: make(map[string]*call),
-		active:  make(map[string]*call),
+// NewManager creates a call Manager bound to cl. store may be nil.
+func NewManager(cl ari.Client, cfg config.Config, ports *media.PortAllocator, store *dograh.Store) *Manager {
+	m := &Manager{
+		cl:        cl,
+		cfg:       cfg,
+		ports:     ports,
+		store:     store,
+		pending:   make(map[string]*call),
+		active:    make(map[string]*call),
+		transfers: make(map[string]*pendingTransfer),
 	}
+
+	// Embedded files: an error here means a broken build, but a transfer
+	// still works without them (the caller just hears silence), so warn.
+	var err error
+	if m.holdAudio, err = assets.TransferHoldRing(); err != nil {
+		slog.Warn("transfer hold audio unavailable; callers will hear silence while a transfer rings", "error", err)
+	}
+
+	if m.beepAudio, err = assets.Beep(); err != nil {
+		slog.Warn("transfer beep unavailable", "error", err)
+	}
+
+	return m
 }
 
 // Run subscribes to the Stasis events this app cares about and dispatches them
@@ -200,6 +236,7 @@ func (m *Manager) Run(ctx context.Context) {
 				slog.Info("channel destroyed",
 					"call_id", e.Channel.ID,
 					"cause", e.Cause, "cause_txt", e.CauseTxt)
+				m.onTransferLegDestroyed(e)
 			}
 		}
 	}
@@ -244,6 +281,14 @@ func (m *Manager) hasCalls() bool {
 
 func (m *Manager) onStasisStart(ctx context.Context, e *ari.StasisStart) {
 	id := e.Channel.ID
+
+	// A transfer destination we dialed has answered (see transfer.go). It
+	// enters this same Stasis app, so it must not be mistaken for a new
+	// inbound call.
+	if len(e.Args) > 0 && e.Args[0] == transferAppArg {
+		m.onTransferLegAnswered(id)
+		return
+	}
 
 	m.mu.Lock()
 	pc, found := m.pending[id]
@@ -430,6 +475,7 @@ func (m *Manager) completeBridge(c *call) {
 	}
 
 	c.bridge = bh
+	c.mediaCtx, c.mediaCancel = context.WithCancel(c.Ctx)
 	c.SetState(session.StateBridged)
 
 	// Added to active (and CallsActive incremented) here, before the media plane
@@ -462,12 +508,12 @@ func (m *Manager) completeBridge(c *call) {
 // "agent"; otherwise nil (CallMedia/AudioSocketCallMedia both default that to
 // LoopbackHandler, which is what AppMode "loopback" relies on for
 // telephony-only testing, e.g. SIPp load tests, with no AI dependency at all).
-// ctx is the call's own context (session.Call.Ctx): agent.NewHandler's
-// background goroutines and its STT/TTS connections all stop when it's
-// cancelled at hangup, so there is nothing further to close here.
-func (m *Manager) mediaHandler(ctx context.Context, callID string) media.Handler {
+// The agent runs on c.mediaCtx: its background goroutines and STT/TTS
+// connections all stop when that's cancelled -- at hangup, or when a
+// transfer hands the caller over -- so there is nothing further to close here.
+func (m *Manager) mediaHandler(c *call) media.Handler {
 	if m.cfg.TestSilentHandler {
-		slog.Warn("TEST_SILENT_HANDLER=1: this call will carry no audio", "call_id", callID)
+		slog.Warn("TEST_SILENT_HANDLER=1: this call will carry no audio", "call_id", c.ID)
 		return media.SilentHandler{}
 	}
 
@@ -475,7 +521,51 @@ func (m *Manager) mediaHandler(ctx context.Context, callID string) media.Handler
 		return nil
 	}
 
-	return m.newAgentHandler(ctx, callID)
+	return m.newAgentHandler(c)
+}
+
+// loadTools reads this call's tools from the nodes of Dograh workflow
+// DOGRAH_WORKFLOW_ID, fresh on every call so edits in Dograh's editor apply
+// to the next call. Any failure leaves the call running without tools rather
+// than failing it.
+func (m *Manager) loadTools(ctx context.Context, callID string) []agent.Tool {
+	if m.store == nil || m.cfg.DograhWorkflowID == 0 {
+		return nil
+	}
+
+	qctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	rows, listed, err := m.store.WorkflowTools(qctx, m.cfg.DograhWorkflowID)
+	if err != nil {
+		slog.Error("agent: loading tools from dograh failed; running without tools", "call_id", callID, "error", err)
+		return nil
+	}
+
+	tools, unsupported, err := dograh.BuildTools(rows)
+	if err != nil {
+		slog.Error("agent: invalid dograh tool; running without tools", "call_id", callID, "error", err)
+		return nil
+	}
+
+	for _, u := range unsupported {
+		slog.Warn("agent: dograh tool category not supported yet; skipped",
+			"call_id", callID, "tool", u.Name, "category", u.Category)
+	}
+
+	if len(rows) < listed {
+		slog.Warn("agent: some workflow tools not found or not active in dograh",
+			"call_id", callID, "workflow_id", m.cfg.DograhWorkflowID, "listed", listed, "found", len(rows))
+	}
+
+	names := make([]string, len(tools))
+	for i, t := range tools {
+		names[i] = t.Def.Name
+	}
+
+	slog.Info("agent tools loaded", "call_id", callID, "tools", names)
+
+	return tools
 }
 
 // newAgentHandler wires internal/ai/{stt,tts,llm,agent} together for one
@@ -485,7 +575,9 @@ func (m *Manager) mediaHandler(ctx context.Context, callID string) media.Handler
 // LoopbackHandler (nil) rather than failing the call outright -- logged
 // loudly since a caller in agent mode getting loopback behavior instead is a
 // real, visible degradation, not a silent one.
-func (m *Manager) newAgentHandler(ctx context.Context, callID string) media.Handler {
+func (m *Manager) newAgentHandler(c *call) media.Handler {
+	ctx, callID := c.mediaCtx, c.ID
+
 	sttClient, err := dialWithRetry(ctx, callID, "stt connect", func() (stt.Client, error) {
 		return stt.NewSarvamClient(ctx, callID, stt.Config{
 			APIKey:   m.cfg.SarvamAPIKey,
@@ -504,6 +596,8 @@ func (m *Manager) newAgentHandler(ctx context.Context, callID string) media.Hand
 	// verdict is allowed to cut playback (see agent.Config.BargeInObserveOnly).
 	bargeIn := m.newBargeInDetector(callID)
 
+	tools := m.loadTools(ctx, callID)
+
 	return agent.NewHandler(ctx, callID, agent.Config{
 		STT: sttClient,
 		NewTTS: func() (tts.Client, error) {
@@ -516,9 +610,18 @@ func (m *Manager) newAgentHandler(ctx context.Context, callID string) media.Hand
 				})
 			})
 		},
-		LLM:                llm.NewClient(m.cfg.LLMBaseURL, m.cfg.LLMAPIKey, m.cfg.LLMModel),
-		SystemPrompt:       m.cfg.AgentSystemPrompt,
-		Greeting:           m.cfg.AgentGreeting,
+		LLM:          llm.NewClient(m.cfg.LLMBaseURL, m.cfg.LLMAPIKey, m.cfg.LLMModel),
+		SystemPrompt: m.cfg.AgentSystemPrompt,
+		Greeting:     m.cfg.AgentGreeting,
+		Tools:        tools,
+		// Hanging up the caller's channel fires StasisEnd, which runs the
+		// normal teardown (media plane, bridge, externalMedia channel).
+		Hangup: func() { hangupChannel(m.cl, callID, callID) },
+		Transfer: func(ctx context.Context, destination string, timeout time.Duration) (func() error, error) {
+			return m.transfer(ctx, c, destination, timeout)
+		},
+		HoldAudio:          m.holdAudio,
+		BeepAudio:          m.beepAudio,
 		BargeIn:            bargeIn,
 		BargeInObserveOnly: !m.cfg.BargeInEnabled,
 		BargeInGuard:       m.cfg.BargeInGuard,
@@ -581,7 +684,7 @@ func (m *Manager) startRTPMedia(c *call) {
 		// the caller hears byte-swapped noise while the WAV sounds fine.
 		ToWire:           fromWire,
 		RecordDir:        m.cfg.RecordDir,
-		Handler:          m.mediaHandler(c.Ctx, c.ID),
+		Handler:          m.mediaHandler(c),
 		DebugAudio:       m.cfg.DebugAudio,
 		MediaDeadTimeout: m.cfg.MediaDeadTimeout,
 	})
@@ -590,7 +693,7 @@ func (m *Manager) startRTPMedia(c *call) {
 	slog.Info("rtp media plane running", "call_id", c.ID, "port", c.Port)
 
 	go m.watchMediaDead(c, c.cm.Dead())
-	go c.cm.Run(c.Ctx)
+	go c.cm.Run(c.mediaCtx)
 }
 
 // watchMediaDead hangs a call up as soon as its media plane declares itself
@@ -605,7 +708,7 @@ func (m *Manager) watchMediaDead(c *call, dead <-chan struct{}) {
 	case <-dead:
 		slog.Warn("hanging up call: media dead, no inbound audio past MEDIA_DEAD_TIMEOUT_SECONDS", "call_id", c.ID)
 		m.teardown(c)
-	case <-c.Ctx.Done():
+	case <-c.mediaCtx.Done(): // hangup, or the media plane was stopped by a transfer
 	}
 }
 
@@ -643,7 +746,7 @@ func (m *Manager) startAudioSocketMedia(c *call) {
 	m.mu.Lock()
 	c.asm = media.NewAudioSocketCallMedia(c.ID, conn, metrics.AudioSocketSink{}, media.AudioSocketConfig{
 		RecordDir:        m.cfg.RecordDir,
-		Handler:          m.mediaHandler(c.Ctx, c.ID),
+		Handler:          m.mediaHandler(c),
 		ToWire:           media.LittleEndian, // AudioSocket payload is LE by protocol; see AudioSocketConfig.ToWire
 		DebugAudio:       m.cfg.DebugAudio,
 		MediaDeadTimeout: m.cfg.MediaDeadTimeout,
@@ -654,7 +757,7 @@ func (m *Manager) startAudioSocketMedia(c *call) {
 	slog.Info("audiosocket connected, media plane running", "call_id", c.ID, "port", c.Port)
 
 	go m.watchMediaDead(c, c.asm.Dead())
-	c.asm.Run(c.Ctx) // blocking is fine: already running in its own goroutine
+	c.asm.Run(c.mediaCtx) // blocking is fine: already running in its own goroutine
 }
 
 // abort releases a call's port when bridging fails before the media plane starts.
@@ -744,7 +847,17 @@ func (m *Manager) teardown(c *call) {
 		delete(m.active, c.ExternalID)
 		delete(m.pending, c.ID)
 		delete(m.pending, c.ExternalID)
+		transferChannel := c.transferChannel
+		if transferChannel != "" {
+			delete(m.active, transferChannel)
+		}
 		m.mu.Unlock()
+
+		// After a transfer the call is caller <-> destination: whichever side
+		// hung up, the other goes too.
+		if transferChannel != "" {
+			hangupChannel(m.cl, c.ID, transferChannel)
+		}
 
 		// Snapshot the media-plane fields under m.mu: c.asm in particular is
 		// written by the AudioSocket accept goroutine (see startAudioSocketMedia),

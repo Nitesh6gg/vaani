@@ -111,6 +111,13 @@ type Config struct {
 	// internal/ai/agent.Config.Greeting). Empty by default -- the agent stays
 	// silent until the caller speaks first.
 	AgentGreeting string
+	// DograhDBURL is the Postgres connection string of a self-hosted Dograh
+	// deployment (DOGRAH_DB_URL). Vaani reads agent configuration -- tools,
+	// and later whole workflows -- straight from it. Empty disables that.
+	DograhDBURL string
+	// DograhWorkflowID is the Dograh workflow (workflows.id) this agent runs
+	// (DOGRAH_WORKFLOW_ID). For now only its nodes' tools are used; 0 = none.
+	DograhWorkflowID int
 
 	// SarvamAPIKey authenticates both Sarvam STT and TTS (internal/ai/stt,
 	// internal/ai/tts) -- one key per Sarvam account covers both products.
@@ -185,6 +192,7 @@ func Load() (Config, error) {
 		LLMModel:            getEnv("LLM_MODEL", ""),
 		AgentSystemPrompt:   getEnv("AGENT_SYSTEM_PROMPT", ""),
 		AgentGreeting:       getEnv("AGENT_GREETING", ""),
+		DograhDBURL:         getEnv("DOGRAH_DB_URL", ""),
 		SarvamAPIKey:        getEnv("SARVAM_API_KEY", ""),
 		SarvamSTTModel:      getEnv("SARVAM_STT_MODEL", "saaras:v4"),
 		SarvamSTTLanguage:   getEnv("SARVAM_STT_LANGUAGE", "unknown"),
@@ -202,6 +210,10 @@ func Load() (Config, error) {
 	}
 
 	if cfg.MediaPortCount, err = getEnvInt("MEDIA_PORT_COUNT", cfg.MediaPortCount); err != nil {
+		return Config{}, err
+	}
+
+	if cfg.DograhWorkflowID, err = getEnvInt("DOGRAH_WORKFLOW_ID", 0); err != nil {
 		return Config{}, err
 	}
 
@@ -326,6 +338,10 @@ func Load() (Config, error) {
 				return Config{}, fmt.Errorf("config: %s must be set when APP_MODE=agent", r.name)
 			}
 		}
+	}
+
+	if cfg.DograhWorkflowID != 0 && cfg.DograhDBURL == "" {
+		return Config{}, fmt.Errorf("config: DOGRAH_WORKFLOW_ID needs DOGRAH_DB_URL (the workflow is read from Dograh's database)")
 	}
 
 	// getEnv treats an explicitly-empty env var as unset, so these dev defaults

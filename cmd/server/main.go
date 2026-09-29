@@ -12,8 +12,10 @@ import (
 	"time"
 
 	"github.com/CyCoreSystems/ari/v5"
+
 	vaaniari "github.com/nitesh/vaani/internal/ari"
 	"github.com/nitesh/vaani/internal/config"
+	"github.com/nitesh/vaani/internal/dograh"
 	"github.com/nitesh/vaani/internal/media"
 	"github.com/nitesh/vaani/internal/metrics"
 )
@@ -71,8 +73,26 @@ func run() error {
 
 	slog.Info("connected to ARI")
 
+	// Dograh's database is where agent tools (and later workflows) are
+	// configured. Failing to reach it is fatal at startup: running without the
+	// tools the agent was built around would only fail confusingly mid-call.
+	var store *dograh.Store
+
+	if cfg.DograhDBURL != "" {
+		pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		store, err = dograh.Open(pingCtx, cfg.DograhDBURL)
+		cancel()
+
+		if err != nil {
+			return err
+		}
+		defer store.Close()
+
+		slog.Info("connected to dograh database", "workflow_id", cfg.DograhWorkflowID)
+	}
+
 	ports := media.NewPortAllocator(cfg.MediaPortBase, cfg.MediaPortCount)
-	mgr := vaaniari.NewManager(cl, cfg, ports)
+	mgr := vaaniari.NewManager(cl, cfg, ports, store)
 
 	slog.Info("vaani running", "metrics_addr", cfg.MetricsAddr, "media_ip", cfg.MediaIP, "app_mode", cfg.AppMode)
 
