@@ -133,7 +133,7 @@ func TestLoad_BargeIn_RejectsNegativeRMSFloor(t *testing.T) {
 	assert.Contains(t, err.Error(), "BARGE_IN_RMS_FLOOR")
 }
 
-func TestLoad_AgentMode_RequiresLLMAndSarvamSettings(t *testing.T) {
+func TestLoad_AgentMode_RequiresDograhSettings(t *testing.T) {
 	restoreWD := chdir(t, t.TempDir())
 	defer restoreWD()
 
@@ -149,10 +149,6 @@ func TestLoad_AgentMode_SucceedsOnceAllRequiredSettingsAreSet(t *testing.T) {
 	defer restoreWD()
 
 	t.Setenv("APP_MODE", "agent")
-	t.Setenv("LLM_BASE_URL", "http://localhost:11434/v1")
-	t.Setenv("LLM_MODEL", "some-model")
-	t.Setenv("SARVAM_API_KEY", "key")
-	t.Setenv("SARVAM_TTS_VOICE", "shubh")
 	t.Setenv("DOGRAH_DB_URL", "postgresql://u:p@localhost/dograh")
 
 	_, err := Load()

@@ -556,6 +556,13 @@ func (m *Manager) loadWorkflow(c *call) (*dograh.Workflow, error) {
 		"start_node", wf.Start.Name, "opening", opening, "start_tools", toolNames(wf.Start),
 		"idle_timeout_s", wf.IdleTimeout.Seconds(), "max_duration_s", wf.MaxDuration.Seconds())
 
+	// Never the keys.
+	s := wf.Services
+	slog.Info("agent models", "call_id", c.ID,
+		"llm", s.LLM.Provider+"/"+s.LLM.Model, "llm_url", s.LLM.BaseURL,
+		"stt", "sarvam/"+s.STT.Model, "stt_language", s.STT.Language,
+		"tts", "sarvam/"+s.TTS.Model, "tts_voice", s.TTS.Voice, "tts_language", s.TTS.Language)
+
 	return wf, nil
 }
 
@@ -575,8 +582,8 @@ func toolNames(n *agent.Node) []string {
 }
 
 // newAgentHandler wires internal/ai/{stt,tts,llm,agent} together for one
-// call, using m.cfg's SARVAM_*/LLM_*/BARGE_IN_* settings (validated non-empty
-// at config.Load() time when AppMode is "agent"). If the STT connection can't
+// call: the models from Dograh (see dograh.Services), barge-in from m.cfg's
+// BARGE_IN_* settings. If the STT connection can't
 // be established even after dialWithRetry's budget, the call falls back to
 // LoopbackHandler (nil) rather than failing the call outright -- logged
 // loudly since a caller in agent mode getting loopback behavior instead is a
@@ -596,11 +603,13 @@ func (m *Manager) newAgentHandler(c *call) media.Handler {
 		return media.SilentHandler{}
 	}
 
+	svc := wf.Services
+
 	sttClient, err := dialWithRetry(ctx, callID, "stt connect", func() (stt.Client, error) {
 		return stt.NewSarvamClient(ctx, callID, stt.Config{
-			APIKey:   m.cfg.SarvamAPIKey,
-			Model:    m.cfg.SarvamSTTModel,
-			Language: m.cfg.SarvamSTTLanguage,
+			APIKey:   svc.STT.APIKey,
+			Model:    svc.STT.Model,
+			Language: svc.STT.Language,
 		})
 	})
 	if err != nil {
@@ -619,14 +628,14 @@ func (m *Manager) newAgentHandler(c *call) media.Handler {
 		NewTTS: func() (tts.Client, error) {
 			return dialWithRetry(ctx, callID, "tts connect", func() (tts.Client, error) {
 				return tts.NewSarvamClient(ctx, callID, tts.Config{
-					APIKey:   m.cfg.SarvamAPIKey,
-					Voice:    m.cfg.SarvamTTSVoice,
-					Model:    m.cfg.SarvamTTSModel,
-					Language: m.cfg.SarvamTTSLanguage,
+					APIKey:   svc.TTS.APIKey,
+					Voice:    svc.TTS.Voice,
+					Model:    svc.TTS.Model,
+					Language: svc.TTS.Language,
 				})
 			})
 		},
-		LLM:         llm.NewClient(m.cfg.LLMBaseURL, m.cfg.LLMAPIKey, m.cfg.LLMModel),
+		LLM:         llm.NewClient(svc.LLM.BaseURL, svc.LLM.APIKey, svc.LLM.Model),
 		Start:       wf.Start,
 		IdleTimeout: wf.IdleTimeout,
 		MaxDuration: wf.MaxDuration,

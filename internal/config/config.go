@@ -95,34 +95,13 @@ type Config struct {
 	// just round up to one tick.
 	MediaDeadTimeout time.Duration
 
-	// LLMBaseURL is an OpenAI-compatible /chat/completions base (no trailing
-	// /chat/completions suffix -- see internal/ai/llm.Client). LLMAPIKey and
-	// LLMModel configure the same client. Required (Load fails fast) when
-	// AppMode is "agent".
-	LLMBaseURL string
-	LLMAPIKey  string
-	LLMModel   string
 	// DograhDBURL is the Postgres connection string of a self-hosted Dograh
 	// deployment (DOGRAH_DB_URL), and DograhWorkflowID the Dograh workflow
 	// (workflows.id) the agent runs (DOGRAH_WORKFLOW_ID): its prompts,
-	// greeting, nodes, edges and tools. Both required when AppMode is "agent".
+	// greeting, nodes, edges, tools, and its LLM/STT/TTS models and keys.
+	// Both required when AppMode is "agent".
 	DograhDBURL      string
 	DograhWorkflowID int
-
-	// SarvamAPIKey authenticates both Sarvam STT and TTS (internal/ai/stt,
-	// internal/ai/tts) -- one key per Sarvam account covers both products.
-	// Required when AppMode is "agent".
-	SarvamAPIKey string
-	// SarvamSTTModel/SarvamSTTLanguage configure internal/ai/stt.Config; see
-	// CLAUDE.md for the model this project targets.
-	SarvamSTTModel    string
-	SarvamSTTLanguage string
-	// SarvamTTSModel/SarvamTTSVoice/SarvamTTSLanguage configure
-	// internal/ai/tts.Config. SarvamTTSVoice has no sensible default --
-	// required when AppMode is "agent".
-	SarvamTTSModel    string
-	SarvamTTSVoice    string
-	SarvamTTSLanguage string
 
 	// BargeInEnabled toggles caller-interrupts-agent detection (internal/ai/agent).
 	// When false, internal/ari wires in a no-op detector instead of EnergyDetector
@@ -177,16 +156,7 @@ func Load() (Config, error) {
 		TestSilentHandler:   getEnv("TEST_SILENT_HANDLER", "") == "1",
 		MediaEncapsulation:  getEnv("MEDIA_ENCAPSULATION", "rtp"),
 		DebugAudio:          getEnv("DEBUG_AUDIO", "") == "1",
-		LLMBaseURL:          getEnv("LLM_BASE_URL", ""),
-		LLMAPIKey:           getEnv("LLM_API_KEY", ""),
-		LLMModel:            getEnv("LLM_MODEL", ""),
 		DograhDBURL:         getEnv("DOGRAH_DB_URL", ""),
-		SarvamAPIKey:        getEnv("SARVAM_API_KEY", ""),
-		SarvamSTTModel:      getEnv("SARVAM_STT_MODEL", "saaras:v4"),
-		SarvamSTTLanguage:   getEnv("SARVAM_STT_LANGUAGE", "unknown"),
-		SarvamTTSModel:      getEnv("SARVAM_TTS_MODEL", "bulbul:v3"),
-		SarvamTTSVoice:      getEnv("SARVAM_TTS_VOICE", ""),
-		SarvamTTSLanguage:   getEnv("SARVAM_TTS_LANGUAGE", "en-IN"),
 		BargeInEnabled:      getEnv("BARGE_IN_ENABLED", "1") == "1",
 		VadMode:             getEnv("VAD_MODE", "energy"),
 	}
@@ -310,22 +280,11 @@ func Load() (Config, error) {
 
 	cfg.PostCutSilence = time.Duration(postCutSilenceMS) * time.Millisecond
 
-	// Fail fast at startup rather than at first call: an agent call that opens
-	// STT/TTS/LLM with empty credentials would just fail per-call, far less
-	// visibly than refusing to start.
+	// Fail fast at startup rather than at first call. Everything else the
+	// agent needs (models, keys, prompts) comes from Dograh per call.
 	if cfg.AppMode == "agent" {
-		required := []struct{ name, value string }{
-			{"LLM_BASE_URL", cfg.LLMBaseURL},
-			{"LLM_MODEL", cfg.LLMModel},
-			{"SARVAM_API_KEY", cfg.SarvamAPIKey},
-			{"SARVAM_TTS_VOICE", cfg.SarvamTTSVoice},
-			{"DOGRAH_DB_URL", cfg.DograhDBURL},
-		}
-
-		for _, r := range required {
-			if r.value == "" {
-				return Config{}, fmt.Errorf("config: %s must be set when APP_MODE=agent", r.name)
-			}
+		if cfg.DograhDBURL == "" {
+			return Config{}, fmt.Errorf("config: DOGRAH_DB_URL must be set when APP_MODE=agent")
 		}
 
 		if cfg.DograhWorkflowID <= 0 {

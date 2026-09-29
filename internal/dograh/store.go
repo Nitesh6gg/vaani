@@ -62,18 +62,22 @@ type ToolRow struct {
 // workflow's organization and must be active, as in Dograh's lookup.
 func (s *Store) Workflow(ctx context.Context, workflowID int, callVars map[string]any) (*Workflow, []string, error) {
 	var (
-		defJSON, defVars, wfVars, defConfig string
-		orgID                               *int64
+		defJSON, defVars, wfVars, defConfig, userConfig string
+		orgID                                           *int64
 	)
 
+	// The models come from the workflow owner's user_configurations, as
+	// Dograh does for telephony calls (ari_manager.py: workflow.user_id).
 	err := s.pool.QueryRow(ctx, `
 		SELECT d.workflow_json::text, COALESCE(d.template_context_variables::text, ''),
 			COALESCE(w.template_context_variables::text, ''),
-			COALESCE(d.workflow_configurations::text, ''), w.organization_id
+			COALESCE(d.workflow_configurations::text, ''), w.organization_id,
+			COALESCE((SELECT configuration::text FROM user_configurations
+				WHERE user_id = w.user_id ORDER BY id LIMIT 1), '')
 		FROM workflows w
 		JOIN workflow_definitions d ON d.id = COALESCE(w.released_definition_id,
 			(SELECT id FROM workflow_definitions WHERE workflow_id = w.id AND is_current LIMIT 1))
-		WHERE w.id = $1`, workflowID).Scan(&defJSON, &defVars, &wfVars, &defConfig, &orgID)
+		WHERE w.id = $1`, workflowID).Scan(&defJSON, &defVars, &wfVars, &defConfig, &orgID, &userConfig)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil, fmt.Errorf("dograh: workflow %d not found or has no published definition", workflowID)
 	}
@@ -106,17 +110,25 @@ func (s *Store) Workflow(ctx context.Context, workflowID int, callVars map[strin
 		return nil, nil, fmt.Errorf("dograh: workflow %d: %w", workflowID, err)
 	}
 
+	services, serviceWarnings, err := resolveServices(userConfig, defConfig)
+	if err != nil {
+		return nil, nil, fmt.Errorf("dograh: workflow %d: models: %w", workflowID, err)
+	}
+
+	warnings = append(warnings, serviceWarnings...)
+
 	idle, maxDuration, warn := callLimits(defConfig)
 	if warn != "" {
 		warnings = append(warnings, warn)
 	}
 
-	return &Workflow{Start: start, IdleTimeout: idle, MaxDuration: maxDuration}, warnings, nil
+	return &Workflow{Start: start, Services: services, IdleTimeout: idle, MaxDuration: maxDuration}, warnings, nil
 }
 
 // Workflow is what one call runs.
 type Workflow struct {
-	Start *agent.Node
+	Start    *agent.Node
+	Services Services
 	// From the workflow's settings (see callLimits); 0 disables.
 	IdleTimeout time.Duration
 	MaxDuration time.Duration
