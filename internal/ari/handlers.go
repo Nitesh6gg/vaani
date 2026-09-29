@@ -2,6 +2,7 @@ package ari
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -524,48 +525,52 @@ func (m *Manager) mediaHandler(c *call) media.Handler {
 	return m.newAgentHandler(c)
 }
 
-// loadTools reads this call's tools from the nodes of Dograh workflow
-// DOGRAH_WORKFLOW_ID, fresh on every call so edits in Dograh's editor apply
-// to the next call. Any failure leaves the call running without tools rather
-// than failing it.
-func (m *Manager) loadTools(ctx context.Context, callID string) []agent.Tool {
-	if m.store == nil || m.cfg.DograhWorkflowID == 0 {
-		return nil
+// loadWorkflow reads Dograh workflow DOGRAH_WORKFLOW_ID for call c, fresh on
+// every call so a publish in Dograh's editor applies to the next call.
+func (m *Manager) loadWorkflow(c *call) (*agent.Node, error) {
+	if m.store == nil {
+		return nil, errors.New("no dograh database (DOGRAH_DB_URL)")
 	}
 
-	qctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	qctx, cancel := context.WithTimeout(c.mediaCtx, 3*time.Second)
 	defer cancel()
 
-	rows, listed, err := m.store.WorkflowTools(qctx, m.cfg.DograhWorkflowID)
+	start, warnings, err := m.store.Workflow(qctx, m.cfg.DograhWorkflowID, map[string]any{
+		"caller_number": c.Info.CallerNumber,
+		"called_number": c.Info.CalledNumber,
+	})
 	if err != nil {
-		slog.Error("agent: loading tools from dograh failed; running without tools", "call_id", callID, "error", err)
-		return nil
+		return nil, err
 	}
 
-	tools, unsupported, err := dograh.BuildTools(rows)
-	if err != nil {
-		slog.Error("agent: invalid dograh tool; running without tools", "call_id", callID, "error", err)
-		return nil
+	for _, w := range warnings {
+		slog.Warn("agent: workflow: "+w, "call_id", c.ID, "workflow_id", m.cfg.DograhWorkflowID)
 	}
 
-	for _, u := range unsupported {
-		slog.Warn("agent: dograh tool category not supported yet; skipped",
-			"call_id", callID, "tool", u.Name, "category", u.Category)
+	opening := "llm"
+	if start.Greeting != "" {
+		opening = "greeting"
 	}
 
-	if len(rows) < listed {
-		slog.Warn("agent: some workflow tools not found or not active in dograh",
-			"call_id", callID, "workflow_id", m.cfg.DograhWorkflowID, "listed", listed, "found", len(rows))
+	slog.Info("agent workflow loaded", "call_id", c.ID, "workflow_id", m.cfg.DograhWorkflowID,
+		"start_node", start.Name, "opening", opening, "start_tools", toolNames(start))
+
+	return start, nil
+}
+
+// toolNames lists the functions the LLM is offered at n (tools, then edges).
+func toolNames(n *agent.Node) []string {
+	var names []string
+
+	for _, t := range n.Tools {
+		names = append(names, t.Def.Name)
 	}
 
-	names := make([]string, len(tools))
-	for i, t := range tools {
-		names[i] = t.Def.Name
+	for _, e := range n.Edges {
+		names = append(names, e.Def.Name+"->"+e.To.Name)
 	}
 
-	slog.Info("agent tools loaded", "call_id", callID, "tools", names)
-
-	return tools
+	return names
 }
 
 // newAgentHandler wires internal/ai/{stt,tts,llm,agent} together for one
@@ -577,6 +582,18 @@ func (m *Manager) loadTools(ctx context.Context, callID string) []agent.Tool {
 // real, visible degradation, not a silent one.
 func (m *Manager) newAgentHandler(c *call) media.Handler {
 	ctx, callID := c.mediaCtx, c.ID
+
+	// Without its workflow the agent has no prompt and nothing to say: end
+	// the call rather than run a blank agent. Silence until the hangup lands.
+	start, err := m.loadWorkflow(c)
+	if err != nil {
+		slog.Error("agent: loading the dograh workflow failed; hanging up", "call_id", callID,
+			"workflow_id", m.cfg.DograhWorkflowID, "error", err)
+
+		go hangupChannel(m.cl, callID, callID)
+
+		return media.SilentHandler{}
+	}
 
 	sttClient, err := dialWithRetry(ctx, callID, "stt connect", func() (stt.Client, error) {
 		return stt.NewSarvamClient(ctx, callID, stt.Config{
@@ -596,8 +613,6 @@ func (m *Manager) newAgentHandler(c *call) media.Handler {
 	// verdict is allowed to cut playback (see agent.Config.BargeInObserveOnly).
 	bargeIn := m.newBargeInDetector(callID)
 
-	tools := m.loadTools(ctx, callID)
-
 	return agent.NewHandler(ctx, callID, agent.Config{
 		STT: sttClient,
 		NewTTS: func() (tts.Client, error) {
@@ -610,10 +625,8 @@ func (m *Manager) newAgentHandler(c *call) media.Handler {
 				})
 			})
 		},
-		LLM:          llm.NewClient(m.cfg.LLMBaseURL, m.cfg.LLMAPIKey, m.cfg.LLMModel),
-		SystemPrompt: m.cfg.AgentSystemPrompt,
-		Greeting:     m.cfg.AgentGreeting,
-		Tools:        tools,
+		LLM:   llm.NewClient(m.cfg.LLMBaseURL, m.cfg.LLMAPIKey, m.cfg.LLMModel),
+		Start: start,
 		// Hanging up the caller's channel fires StasisEnd, which runs the
 		// normal teardown (media plane, bridge, externalMedia channel).
 		Hangup: func() { hangupChannel(m.cl, callID, callID) },

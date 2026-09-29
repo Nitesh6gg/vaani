@@ -73,9 +73,8 @@ func run() error {
 
 	slog.Info("connected to ARI")
 
-	// Dograh's database is where agent tools (and later workflows) are
-	// configured. Failing to reach it is fatal at startup: running without the
-	// tools the agent was built around would only fail confusingly mid-call.
+	// Dograh's database holds the workflow the agent runs. Failing to reach it
+	// is fatal at startup rather than failing every call.
 	var store *dograh.Store
 
 	if cfg.DograhDBURL != "" {

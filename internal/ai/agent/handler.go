@@ -105,18 +105,16 @@ type Config struct {
 	// THINKING transition, never at call start. It is called at most once per
 	// call: the resulting Client is reused across every turn (see
 	// tts.Client's doc comment) and only replaced if a barge-in cancels it.
-	NewTTS       func() (tts.Client, error)
-	LLM          llmStreamer
-	SystemPrompt string
-	// Greeting, if set, is spoken once at the start of the call, before the
-	// caller says anything -- bypasses the LLM entirely (it's fixed text, not
-	// generated) and is recorded into history as the agent's own turn so the
-	// LLM doesn't redundantly re-greet on the caller's first real reply.
-	Greeting string
-	// Tools are the functions the LLM may call during a turn (see tools.go).
-	Tools []Tool
-	// Hangup ends the call; used after a ToolEndCall has run and the agent's
-	// last words have finished playing. Nil disables hanging up.
+	NewTTS func() (tts.Client, error)
+	LLM    llmStreamer
+	// Start is the workflow's start node (see workflow.go). Its Greeting, if
+	// set, is spoken before the caller says anything, bypassing the LLM, and
+	// recorded into history as the agent's own turn so the LLM doesn't
+	// re-greet. Otherwise, when it has a Prompt, the LLM speaks first. Nil
+	// means an empty node: no prompt, no tools.
+	Start *Node
+	// Hangup ends the call; used after end_call or at an end node, once the
+	// agent's last words have finished playing. Nil disables hanging up.
 	Hangup func()
 	// Transfer dials destination (an Asterisk dial string) and blocks until
 	// it answers (returning connect) or fails, times out, or ctx ends
@@ -184,6 +182,7 @@ type spokenChunk struct {
 type ttsDoneEvent struct{ gen uint64 }
 type bargeInEvent struct{}
 type greetingEvent struct{}
+type openingEvent struct{}
 type ttsPlaybackDoneEvent struct{}
 type ttsDrainTimeoutEvent struct{}
 
@@ -232,12 +231,13 @@ type Handler struct {
 	// by ProcessFrame's goroutine.
 	hold atomic.Pointer[holdPlayer]
 
-	events chan any
+	// node is the workflow node the conversation is at. Read by run() when a
+	// turn starts; moved by runLLMTurn's goroutine the moment the LLM takes
+	// an edge (as in Dograh, a transition sticks even if the caller then
+	// interrupts the new node's first words).
+	node atomic.Pointer[Node]
 
-	// Set once in NewHandler and never modified: the tools by name, and
-	// their definitions as sent to the LLM.
-	tools    map[string]Tool
-	toolDefs []llm.Tool
+	events chan any
 
 	// run()-owned only.
 	tts        tts.Client
@@ -311,21 +311,22 @@ func NewHandler(ctx context.Context, callID string, cfg Config) *Handler {
 	}
 	h.state.Store(int32(StateListening))
 
-	h.tools = make(map[string]Tool, len(cfg.Tools))
-	for _, t := range cfg.Tools {
-		h.tools[t.Def.Name] = t
-		h.toolDefs = append(h.toolDefs, llm.Tool{Type: "function", Function: t.Def})
+	if cfg.Start == nil {
+		cfg.Start = &Node{}
+		h.cfg.Start = cfg.Start
 	}
 
-	if cfg.SystemPrompt != "" {
-		h.history = append(h.history, llm.Message{Role: "system", Content: cfg.SystemPrompt})
-	}
+	h.node.Store(cfg.Start)
 
 	go h.readSTT()
 	go h.run()
 
-	if cfg.Greeting != "" {
-		h.events <- greetingEvent{} // buffer is fresh; guaranteed not to block
+	// The buffer is fresh, so these can't block.
+	switch {
+	case cfg.Start.Greeting != "":
+		h.events <- greetingEvent{}
+	case cfg.Start.Prompt != "":
+		h.events <- openingEvent{} // Dograh: no greeting -> the LLM opens the call
 	}
 
 	return h
@@ -536,6 +537,9 @@ func (h *Handler) handleEvent(ev any) {
 		h.handleBargeIn()
 	case greetingEvent:
 		h.handleGreeting()
+	case openingEvent:
+		slog.Info("agent opening (llm speaks first)", "call_id", h.callID)
+		h.startTurn()
 	case ttsPlaybackDoneEvent:
 		h.finishTurn(h.curGen)
 	case ttsDrainTimeoutEvent:
@@ -572,7 +576,7 @@ func (h *Handler) openTTS(gen uint64) bool {
 	return true
 }
 
-// handleGreeting speaks Config.Greeting once, at call start, before the
+// handleGreeting speaks the start node's Greeting once, at call start, before the
 // caller has said anything -- fixed text, so it bypasses the LLM entirely.
 // Recorded into history as the agent's own turn so the LLM doesn't
 // redundantly re-greet on the caller's first real reply.
@@ -584,7 +588,7 @@ func (h *Handler) handleGreeting() {
 	h.turnStartedAt = time.Now()
 	h.startTurnChunks()
 
-	slog.Info("agent greeting", "call_id", h.callID, "gen", gen, "text", h.cfg.Greeting)
+	slog.Info("agent greeting", "call_id", h.callID, "gen", gen, "text", h.cfg.Start.Greeting)
 
 	if !h.openTTS(gen) {
 		return
@@ -594,7 +598,7 @@ func (h *Handler) handleGreeting() {
 	// once it has played -- or only the heard part if cut off), so the LLM
 	// knows it already greeted and doesn't do it again.
 	chunker := &SentenceChunker{}
-	for _, chunk := range chunker.Feed(h.cfg.Greeting) {
+	for _, chunk := range chunker.Feed(h.cfg.Start.Greeting) {
 		if gen != h.curGen {
 			// A barge-in superseded the greeting mid-speak (run-goroutine
 			// check, so this is race-free): stop speaking into a torn-down
@@ -623,16 +627,21 @@ func (h *Handler) handleFinalTranscript(text string) {
 		return // already mid-turn; STT shouldn't produce a final here, but guard anyway
 	}
 
-	h.state.Store(int32(StateThinking))
 	h.history = append(h.history, llm.Message{Role: "user", Content: text})
+	slog.Info("stt final transcript", "call_id", h.callID, "gen", h.curGen+1, "text", text)
+	h.startTurn()
+}
+
+// startTurn runs one LLM turn over the current history: after the caller
+// spoke, or at call start when the LLM opens the call.
+func (h *Handler) startTurn() {
+	h.state.Store(int32(StateThinking))
 	h.cfg.Sink.TurnStarted()
 
 	h.curGen++
 	gen := h.curGen
 	h.turnStartedAt = time.Now()
 	h.startTurnChunks()
-
-	slog.Info("stt final transcript", "call_id", h.callID, "gen", gen, "text", text)
 
 	if !h.openTTS(gen) {
 		return
@@ -646,6 +655,27 @@ func (h *Handler) handleFinalTranscript(text string) {
 	go h.runLLMTurn(ctx, history, h.tts, gen, h.turnStartedAt)
 }
 
+// requestMessages is what the LLM is sent at node: its system prompt, then
+// the conversation.
+func requestMessages(node *Node, history []llm.Message) []llm.Message {
+	if node.Prompt == "" {
+		return history
+	}
+
+	msgs := make([]llm.Message, 0, len(history)+2)
+	msgs = append(msgs, llm.Message{Role: "system", Content: node.Prompt})
+
+	if len(history) == 0 {
+		// Opening turn: nobody has spoken yet. Gemini needs at least one
+		// non-system message, so the prompt is repeated as the user message
+		// -- the same thing pipecat's Google service does (Dograh's stack,
+		// pipecat/services/google/llm.py) for a system-only context.
+		msgs = append(msgs, llm.Message{Role: "user", Content: node.Prompt})
+	}
+
+	return append(msgs, history...)
+}
+
 // runLLMTurn streams the LLM's reply for one turn, speaking it sentence by
 // sentence as it arrives. When the model calls tools, any text it wrote first
 // ("ek second, main check kar raha hoon") is spoken immediately, the tools
@@ -654,6 +684,7 @@ func (h *Handler) handleFinalTranscript(text string) {
 // again, and the call hangs up once the reply has played out.
 func (h *Handler) runLLMTurn(ctx context.Context, history []llm.Message, ttsClient tts.Client, gen uint64, turnStartedAt time.Time) {
 	chunker := &SentenceChunker{}
+	node := h.node.Load()
 
 	var (
 		firstTokenAt time.Time
@@ -669,7 +700,7 @@ func (h *Handler) runLLMTurn(ctx context.Context, history []llm.Message, ttsClie
 			said  strings.Builder
 		)
 
-		calls, err = h.cfg.LLM.Stream(ctx, history, h.toolDefs, func(tok string) {
+		calls, err = h.cfg.LLM.Stream(ctx, requestMessages(node, history), node.toolDefs(), func(tok string) {
 			if firstTokenAt.IsZero() {
 				firstTokenAt = time.Now()
 				slog.Info("llm first token", "call_id", h.callID, "gen", gen,
@@ -722,7 +753,16 @@ func (h *Handler) runLLMTurn(ctx context.Context, history []llm.Message, ttsClie
 		toolMsgs = append(toolMsgs, llm.Message{Role: "assistant", ToolCalls: calls})
 
 		for _, call := range calls {
-			result, action := h.runTool(ctx, ttsClient, call, gen)
+			var (
+				result string
+				action toolAction
+			)
+
+			if e := node.edge(call.Function.Name); e != nil {
+				node, result = h.takeEdge(ctx, ttsClient, node, e, gen)
+			} else {
+				result, action = h.runTool(ctx, ttsClient, node, call, gen)
+			}
 
 			msg := llm.Message{Role: "tool", ToolCallID: call.ID, Content: result}
 			history = append(history, msg)
@@ -742,6 +782,10 @@ func (h *Handler) runLLMTurn(ctx context.Context, history []llm.Message, ttsClie
 			break
 		}
 	}
+
+	// At an end node the reply just generated is the closing line: hang up
+	// once it has played (Dograh ends the call right after it).
+	endCall = endCall || node.End
 
 	if err == nil {
 		slog.Info("llm turn complete", "call_id", h.callID, "gen", gen,
@@ -774,12 +818,28 @@ const (
 	actionTransferred            // the caller is now with the transfer destination
 )
 
-// runTool executes one tool call, returning the result for the LLM and what
-// it means for the turn. The tool's Message (Dograh's customMessage) is
-// spoken first. Unknown tools and failures become error results the LLM can
-// react to.
-func (h *Handler) runTool(ctx context.Context, ttsClient tts.Client, call llm.ToolCall, gen uint64) (string, toolAction) {
-	t, ok := h.tools[call.Function.Name]
+// takeEdge moves the conversation along e (the LLM called its function):
+// speaks the edge's transition speech, switches to the target node -- whose
+// prompt and tools the next LLM round uses -- and returns Dograh's
+// transition result.
+func (h *Handler) takeEdge(ctx context.Context, ttsClient tts.Client, from *Node, e *Edge, gen uint64) (*Node, string) {
+	if e.Speech != "" {
+		h.sendToTTS(ctx, ttsClient, e.Speech, gen)
+	}
+
+	slog.Info("node transition", "call_id", h.callID, "gen", gen,
+		"from", from.Name, "to", e.To.Name, "via", e.Def.Name)
+	h.node.Store(e.To)
+
+	return e.To, `{"status":"done"}`
+}
+
+// runTool executes one tool call of node, returning the result for the LLM
+// and what it means for the turn. The tool's Message (Dograh's customMessage)
+// is spoken first. Unknown tools and failures become error results the LLM
+// can react to.
+func (h *Handler) runTool(ctx context.Context, ttsClient tts.Client, node *Node, call llm.ToolCall, gen uint64) (string, toolAction) {
+	t, ok := node.tool(call.Function.Name)
 	if !ok {
 		slog.Warn("llm called an unknown tool", "call_id", h.callID, "gen", gen, "tool", call.Function.Name)
 		return toolErrorResult(fmt.Errorf("unknown tool %q", call.Function.Name)), actionNone
@@ -1210,7 +1270,7 @@ func (h *Handler) finishTurn(gen uint64) {
 
 	if h.hangupAfterTurn {
 		h.hangupAfterTurn = false
-		slog.Info("agent ending call (end_call tool)", "call_id", h.callID, "gen", gen)
+		slog.Info("agent ending call", "call_id", h.callID, "gen", gen, "node", h.node.Load().Name)
 
 		if h.cfg.Hangup != nil {
 			go h.cfg.Hangup() // ARI REST call; never block the event loop on it

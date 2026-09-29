@@ -241,12 +241,12 @@ func TestHandler_GreetingIsSpokenWithoutWaitingForCaller(t *testing.T) {
 	fTTS := newFakeTTS()
 
 	h := NewHandler(context.Background(), "call1", Config{
-		STT:      fSTT,
-		NewTTS:   func() (tts.Client, error) { return fTTS, nil },
-		LLM:      &fakeLLM{}, // must never be called for the greeting
-		Greeting: "Hi, this side Shubh.",
-		BargeIn:  NewEnergyDetector(floor),
-		Sink:     NoopSink{},
+		STT:     fSTT,
+		NewTTS:  func() (tts.Client, error) { return fTTS, nil },
+		LLM:     &fakeLLM{}, // must never be called for the greeting
+		Start:   &Node{Greeting: "Hi, this side Shubh."},
+		BargeIn: NewEnergyDetector(floor),
+		Sink:    NoopSink{},
 	})
 
 	require.Eventually(t, func() bool { return fTTS.spokenCount() > 0 }, time.Second, time.Millisecond)
@@ -717,7 +717,7 @@ func TestHandler_ToolRoundTrip(t *testing.T) {
 	}}
 
 	cfg := testConfig(fSTT, fTTS, fLLM, 0, 0)
-	cfg.Tools = []Tool{echoTool("lookup", `{"ok":true}`, &ran)}
+	cfg.Start = &Node{Tools: []Tool{echoTool("lookup", `{"ok":true}`, &ran)}}
 	h := NewHandler(context.Background(), "call1", cfg)
 
 	fSTT.sendFinal("check my pin")
@@ -757,7 +757,7 @@ func TestHandler_EndCallHangsUpAfterGoodbyePlays(t *testing.T) {
 	var hangups atomic.Int32
 
 	cfg := testConfig(fSTT, fTTS, fLLM, 0, 0)
-	cfg.Tools = []Tool{{Def: llm.FunctionDef{Name: "end_call"}, Kind: ToolEndCall}}
+	cfg.Start = &Node{Tools: []Tool{{Def: llm.FunctionDef{Name: "end_call"}, Kind: ToolEndCall}}}
 	cfg.Hangup = func() { hangups.Add(1) }
 	h := NewHandler(context.Background(), "call1", cfg)
 
@@ -815,7 +815,7 @@ func TestHandler_DrainTimeoutPausedWhileToolRuns(t *testing.T) {
 	fLLM := &fakeLLM{rounds: []fakeRound{{tokens: []string{"One moment."}, toolCalls: []llm.ToolCall{call}}}}
 
 	cfg := testConfig(fSTT, fTTS, fLLM, time.Hour, 0)
-	cfg.Tools = []Tool{slow}
+	cfg.Start = &Node{Tools: []Tool{slow}}
 	h := NewHandler(context.Background(), "call1", cfg)
 
 	fSTT.sendFinal("hi")
@@ -882,7 +882,7 @@ func TestHandler_TransferHoldBeepThenConnect(t *testing.T) {
 	)
 
 	cfg := testConfig(fSTT, fTTS, fLLM, time.Hour, 0)
-	cfg.Tools = []Tool{transferTool()}
+	cfg.Start = &Node{Tools: []Tool{transferTool()}}
 	cfg.HoldAudio = constFrame(holdAmp)
 	cfg.BeepAudio = constFrame(beepAmp)
 	cfg.Transfer = func(ctx context.Context, dest string, timeout time.Duration) (func() error, error) {
@@ -943,7 +943,7 @@ func TestHandler_TransferFailureGoesBackToLLM(t *testing.T) {
 	}}
 
 	cfg := testConfig(fSTT, fTTS, fLLM, time.Hour, 0)
-	cfg.Tools = []Tool{transferTool()}
+	cfg.Start = &Node{Tools: []Tool{transferTool()}}
 	cfg.HoldAudio = constFrame(holdAmp)
 	cfg.Transfer = func(context.Context, string, time.Duration) (func() error, error) {
 		return nil, errors.New("transfer destination did not answer (User busy, cause 17)")
@@ -959,4 +959,68 @@ func TestHandler_TransferFailureGoesBackToLLM(t *testing.T) {
 	assert.Equal(t, "tool", result.Role)
 	assert.JSONEq(t, `{"status":"failed","reason":"transfer destination did not answer (User busy, cause 17)"}`, result.Content)
 	assert.Equal(t, "Nobody is free right now.", fTTS.spoken[1])
+}
+
+// TestHandler_WorkflowWalk follows a Dograh-shaped workflow end to end: the
+// LLM opens the call from the start node's prompt, an edge call moves it to
+// the next node (whose prompt and tools the very next round uses, in the
+// same turn), and reaching the end node makes its closing line the last
+// thing said before the call hangs up.
+func TestHandler_WorkflowWalk(t *testing.T) {
+	fSTT := newFakeSTT()
+	fTTS := newFakeTTS()
+
+	end := &Node{Name: "End Call", Prompt: "end prompt", End: true}
+	main := &Node{Name: "Main", Prompt: "main prompt", Edges: []Edge{
+		{Def: llm.FunctionDef{Name: "end_call", Description: "when done"}, To: end},
+	}}
+	start := &Node{Name: "Start", Prompt: "start prompt", Edges: []Edge{
+		{Def: llm.FunctionDef{Name: "move_to_main", Description: "when ready"}, To: main},
+	}}
+
+	edgeCall := func(id, name string) []llm.ToolCall {
+		return []llm.ToolCall{{ID: id, Type: "function", Function: llm.FunctionCall{Name: name, Arguments: "{}"}}}
+	}
+
+	fLLM := &fakeLLM{rounds: []fakeRound{
+		{tokens: []string{"Hi there."}},             // opening
+		{toolCalls: edgeCall("t1", "move_to_main")}, // caller: "yes"
+		{tokens: []string{"Here is the topic."}},    // now at Main
+		{toolCalls: edgeCall("t2", "end_call")},     // caller: "bye"
+		{tokens: []string{"Thanks, goodbye."}},      // now at End Call
+	}}
+
+	var hangups atomic.Int32
+
+	cfg := testConfig(fSTT, fTTS, fLLM, time.Hour, 0)
+	cfg.Start = start
+	cfg.Hangup = func() { hangups.Add(1) }
+	h := NewHandler(context.Background(), "call1", cfg)
+
+	// Opening: the LLM speaks first, from the start node's prompt.
+	require.Eventually(t, func() bool { return fTTS.spokenCount() == 1 }, time.Second, time.Millisecond)
+	assert.Equal(t, []llm.Message{{Role: "system", Content: "start prompt"}, {Role: "user", Content: "start prompt"}},
+		fLLM.seen[0], "opening: system prompt, repeated as the only user message")
+	assert.Equal(t, "move_to_main", fLLM.tools[0][0].Function.Name, "the start node's edges are offered")
+	playTurn(t, h, fTTS, 1, "Hi there.")
+
+	// Edge call: switch to Main within the same turn.
+	fSTT.sendFinal("yes")
+	require.Eventually(t, func() bool { return fTTS.spokenCount() == 2 }, time.Second, time.Millisecond)
+	assert.Equal(t, "main prompt", fLLM.seen[2][0].Content, "the round after the edge uses the new node's prompt")
+	assert.Equal(t, llm.Message{Role: "tool", ToolCallID: "t1", Content: `{"status":"done"}`}, fLLM.seen[2][len(fLLM.seen[2])-1])
+	assert.Equal(t, "end_call", fLLM.tools[2][0].Function.Name, "and its edges")
+	assert.Equal(t, "Main", h.node.Load().Name)
+	playTurn(t, h, fTTS, 2, "Here is the topic.")
+	assert.Zero(t, hangups.Load())
+
+	// End node: its closing line plays, then the call hangs up.
+	fSTT.sendFinal("bye")
+	require.Eventually(t, func() bool { return fTTS.spokenCount() == 3 }, time.Second, time.Millisecond)
+	assert.Equal(t, "end prompt", fLLM.seen[4][0].Content)
+	assert.Zero(t, hangups.Load(), "must not hang up before the closing line has played")
+	playTurn(t, h, fTTS, 3, "Thanks, goodbye.")
+
+	require.Eventually(t, func() bool { return hangups.Load() == 1 }, time.Second, time.Millisecond)
+	assert.Equal(t, 5, fLLM.streamCalls())
 }

@@ -102,21 +102,11 @@ type Config struct {
 	LLMBaseURL string
 	LLMAPIKey  string
 	LLMModel   string
-	// AgentSystemPrompt is prepended as the system message on every call (see
-	// internal/ai/agent.Config.SystemPrompt). Empty by default -- the LLM gets
-	// no system message at all unless this is set.
-	AgentSystemPrompt string
-	// AgentGreeting, if set, is spoken once at the start of every call before
-	// the caller says anything, bypassing the LLM (see
-	// internal/ai/agent.Config.Greeting). Empty by default -- the agent stays
-	// silent until the caller speaks first.
-	AgentGreeting string
 	// DograhDBURL is the Postgres connection string of a self-hosted Dograh
-	// deployment (DOGRAH_DB_URL). Vaani reads agent configuration -- tools,
-	// and later whole workflows -- straight from it. Empty disables that.
-	DograhDBURL string
-	// DograhWorkflowID is the Dograh workflow (workflows.id) this agent runs
-	// (DOGRAH_WORKFLOW_ID). For now only its nodes' tools are used; 0 = none.
+	// deployment (DOGRAH_DB_URL), and DograhWorkflowID the Dograh workflow
+	// (workflows.id) the agent runs (DOGRAH_WORKFLOW_ID): its prompts,
+	// greeting, nodes, edges and tools. Both required when AppMode is "agent".
+	DograhDBURL      string
 	DograhWorkflowID int
 
 	// SarvamAPIKey authenticates both Sarvam STT and TTS (internal/ai/stt,
@@ -190,8 +180,6 @@ func Load() (Config, error) {
 		LLMBaseURL:          getEnv("LLM_BASE_URL", ""),
 		LLMAPIKey:           getEnv("LLM_API_KEY", ""),
 		LLMModel:            getEnv("LLM_MODEL", ""),
-		AgentSystemPrompt:   getEnv("AGENT_SYSTEM_PROMPT", ""),
-		AgentGreeting:       getEnv("AGENT_GREETING", ""),
 		DograhDBURL:         getEnv("DOGRAH_DB_URL", ""),
 		SarvamAPIKey:        getEnv("SARVAM_API_KEY", ""),
 		SarvamSTTModel:      getEnv("SARVAM_STT_MODEL", "saaras:v4"),
@@ -331,6 +319,7 @@ func Load() (Config, error) {
 			{"LLM_MODEL", cfg.LLMModel},
 			{"SARVAM_API_KEY", cfg.SarvamAPIKey},
 			{"SARVAM_TTS_VOICE", cfg.SarvamTTSVoice},
+			{"DOGRAH_DB_URL", cfg.DograhDBURL},
 		}
 
 		for _, r := range required {
@@ -338,10 +327,10 @@ func Load() (Config, error) {
 				return Config{}, fmt.Errorf("config: %s must be set when APP_MODE=agent", r.name)
 			}
 		}
-	}
 
-	if cfg.DograhWorkflowID != 0 && cfg.DograhDBURL == "" {
-		return Config{}, fmt.Errorf("config: DOGRAH_WORKFLOW_ID needs DOGRAH_DB_URL (the workflow is read from Dograh's database)")
+		if cfg.DograhWorkflowID <= 0 {
+			return Config{}, fmt.Errorf("config: DOGRAH_WORKFLOW_ID must be set when APP_MODE=agent (the Dograh workflow the agent runs)")
+		}
 	}
 
 	// getEnv treats an explicitly-empty env var as unset, so these dev defaults

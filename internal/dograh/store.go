@@ -9,9 +9,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/nitesh/vaani/internal/ai/agent"
 )
 
 // Store is a connection pool to Dograh's database, shared by every call --
@@ -47,40 +50,81 @@ type ToolRow struct {
 	Definition  json.RawMessage
 }
 
-// WorkflowTools returns the active tools attached to any node of workflow
-// workflowID's live definition, plus how many tool UUIDs the nodes listed
-// (so the caller can tell when some are missing or archived).
+// Workflow loads Dograh workflow workflowID for one call and returns its
+// start node (see buildWorkflow). callVars are the call's own template
+// variables (caller_number, called_number), layered over the workflow's
+// template_context_variables. Read fresh per call, so a publish in Dograh's
+// editor applies to the next call.
 //
-// The live definition is resolved like Dograh does for a real call: the
-// published one (released_definition_id), else the legacy is_current row.
-// Tools are scoped to the workflow's organization, as in Dograh's lookup.
-func (s *Store) WorkflowTools(ctx context.Context, workflowID int) ([]ToolRow, int, error) {
+// The definition is resolved like Dograh does for a real call: the
+// published one (released_definition_id), else the legacy is_current row;
+// its template variables, else the workflow's. Tools are scoped to the
+// workflow's organization and must be active, as in Dograh's lookup.
+func (s *Store) Workflow(ctx context.Context, workflowID int, callVars map[string]any) (*agent.Node, []string, error) {
 	var (
-		workflowJSON string
-		orgID        *int64
+		defJSON, defVars, wfVars string
+		orgID                    *int64
 	)
 
 	err := s.pool.QueryRow(ctx, `
-		SELECT d.workflow_json::text, w.organization_id
+		SELECT d.workflow_json::text, COALESCE(d.template_context_variables::text, ''),
+			COALESCE(w.template_context_variables::text, ''), w.organization_id
 		FROM workflows w
 		JOIN workflow_definitions d ON d.id = COALESCE(w.released_definition_id,
 			(SELECT id FROM workflow_definitions WHERE workflow_id = w.id AND is_current LIMIT 1))
-		WHERE w.id = $1`, workflowID).Scan(&workflowJSON, &orgID)
+		WHERE w.id = $1`, workflowID).Scan(&defJSON, &defVars, &wfVars, &orgID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, 0, fmt.Errorf("dograh: workflow %d not found or has no published definition", workflowID)
+		return nil, nil, fmt.Errorf("dograh: workflow %d not found or has no published definition", workflowID)
 	}
 
 	if err != nil {
-		return nil, 0, fmt.Errorf("dograh: query workflow %d: %w", workflowID, err)
+		return nil, nil, fmt.Errorf("dograh: query workflow %d: %w", workflowID, err)
 	}
 
-	uuids, err := nodeToolUUIDs([]byte(workflowJSON))
+	wf, err := parseWorkflow([]byte(defJSON))
 	if err != nil {
-		return nil, 0, fmt.Errorf("dograh: workflow %d: %w", workflowID, err)
+		return nil, nil, fmt.Errorf("dograh: workflow %d: %w", workflowID, err)
 	}
 
+	vars := templateVars(defVars)
+	if len(vars) == 0 {
+		vars = templateVars(wfVars)
+	}
+
+	for k, v := range callVars {
+		vars[k] = v
+	}
+
+	tools, err := s.tools(ctx, wf.toolUUIDs(), orgID)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	start, warnings, err := buildWorkflow(wf, vars, tools, time.Now())
+	if err != nil {
+		return nil, nil, fmt.Errorf("dograh: workflow %d: %w", workflowID, err)
+	}
+
+	return start, warnings, nil
+}
+
+// templateVars decodes a template_context_variables JSON object; anything
+// else (empty, null, malformed) is no variables.
+func templateVars(s string) map[string]any {
+	vars := map[string]any{}
+	_ = json.Unmarshal([]byte(s), &vars)
+
+	if vars == nil { // JSON null
+		vars = map[string]any{}
+	}
+
+	return vars
+}
+
+// tools returns the active tools among uuids that belong to orgID.
+func (s *Store) tools(ctx context.Context, uuids []string, orgID *int64) ([]ToolRow, error) {
 	if len(uuids) == 0 {
-		return nil, 0, nil
+		return nil, nil
 	}
 
 	rows, err := s.pool.Query(ctx, `
@@ -89,7 +133,7 @@ func (s *Store) WorkflowTools(ctx context.Context, workflowID int) ([]ToolRow, i
 		WHERE tool_uuid = ANY($1) AND organization_id IS NOT DISTINCT FROM $2
 			AND status::text = 'active'`, uuids, orgID)
 	if err != nil {
-		return nil, 0, fmt.Errorf("dograh: query tools: %w", err)
+		return nil, fmt.Errorf("dograh: query tools: %w", err)
 	}
 	defer rows.Close()
 
@@ -102,7 +146,7 @@ func (s *Store) WorkflowTools(ctx context.Context, workflowID int) ([]ToolRow, i
 		)
 
 		if err := rows.Scan(&r.UUID, &r.Name, &r.Description, &r.Category, &def); err != nil {
-			return nil, 0, fmt.Errorf("dograh: scan tool: %w", err)
+			return nil, fmt.Errorf("dograh: scan tool: %w", err)
 		}
 
 		r.Definition = json.RawMessage(def)
@@ -110,40 +154,7 @@ func (s *Store) WorkflowTools(ctx context.Context, workflowID int) ([]ToolRow, i
 	}
 
 	if err := rows.Err(); err != nil {
-		return nil, 0, fmt.Errorf("dograh: read tools: %w", err)
-	}
-
-	return out, len(uuids), nil
-}
-
-// nodeToolUUIDs collects the distinct tool UUIDs of every node in a Dograh
-// workflow_json ({"nodes":[{"data":{"tool_uuids":[...]}}]}), in node order.
-// ponytail: every node's tools at once; per-node tools come with the
-// workflow engine (Step 3).
-func nodeToolUUIDs(workflowJSON []byte) ([]string, error) {
-	var wf struct {
-		Nodes []struct {
-			Data struct {
-				ToolUUIDs []string `json:"tool_uuids"`
-			} `json:"data"`
-		} `json:"nodes"`
-	}
-
-	if err := json.Unmarshal(workflowJSON, &wf); err != nil {
-		return nil, fmt.Errorf("parse workflow_json: %w", err)
-	}
-
-	seen := map[string]bool{}
-
-	var out []string
-
-	for _, n := range wf.Nodes {
-		for _, u := range n.Data.ToolUUIDs {
-			if !seen[u] {
-				seen[u] = true
-				out = append(out, u)
-			}
-		}
+		return nil, fmt.Errorf("dograh: read tools: %w", err)
 	}
 
 	return out, nil

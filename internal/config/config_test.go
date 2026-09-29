@@ -153,10 +153,17 @@ func TestLoad_AgentMode_SucceedsOnceAllRequiredSettingsAreSet(t *testing.T) {
 	t.Setenv("LLM_MODEL", "some-model")
 	t.Setenv("SARVAM_API_KEY", "key")
 	t.Setenv("SARVAM_TTS_VOICE", "shubh")
+	t.Setenv("DOGRAH_DB_URL", "postgresql://u:p@localhost/dograh")
+
+	_, err := Load()
+	require.ErrorContains(t, err, "DOGRAH_WORKFLOW_ID", "the agent has nothing to run without a workflow")
+
+	t.Setenv("DOGRAH_WORKFLOW_ID", "19")
 
 	cfg, err := Load()
 	require.NoError(t, err)
 	assert.Equal(t, "agent", cfg.AppMode)
+	assert.Equal(t, 19, cfg.DograhWorkflowID)
 }
 
 func chdir(t *testing.T, dir string) (restore func()) {

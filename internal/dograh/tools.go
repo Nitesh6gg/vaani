@@ -2,6 +2,7 @@ package dograh
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -35,80 +36,71 @@ type toolConfig struct {
 	Timeout     *float64 `json:"timeout"` // seconds; Dograh's default is 30
 }
 
-// Unsupported is a tool that was found but can't run yet (e.g. http_api
-// before custom tools are implemented), reported so the caller can log it.
-type Unsupported struct {
-	Name     string
-	Category string
-}
+// errUnsupported marks a tool category Vaani can't run yet (e.g. http_api
+// before custom tools are implemented): skipped with a warning, not fatal.
+var errUnsupported = errors.New("tool category not supported yet")
 
-// BuildTools turns tool rows into agent tools. Categories Vaani doesn't
-// support yet come back in unsupported instead of failing the call.
-func BuildTools(rows []ToolRow) (tools []agent.Tool, unsupported []Unsupported, err error) {
-	for _, r := range rows {
-		var def struct {
-			Config toolConfig `json:"config"`
-		}
-
-		if len(r.Definition) > 0 {
-			if err := json.Unmarshal(r.Definition, &def); err != nil {
-				return nil, nil, fmt.Errorf("dograh: tool %q (%s): bad definition: %w", r.Name, r.UUID, err)
-			}
-		}
-
-		cfg := def.Config
-		t := agent.Tool{
-			Def: llm.FunctionDef{
-				Name:        FunctionName(r.Name),
-				Description: r.Description,
-			},
-		}
-
-		if t.Def.Description == "" {
-			t.Def.Description = "Execute " + r.Name + " tool"
-		}
-
-		if cfg.MessageType == "custom" {
-			t.Message = cfg.CustomMessage
-		}
-
-		switch r.Category {
-		case CategoryEndCall:
-			t.Kind = agent.ToolEndCall
-
-			if cfg.EndCallReason {
-				desc := cfg.EndCallReasonDescription
-				if desc == "" {
-					desc = "The reason for ending the call (e.g., 'voicemail_detected', 'issue_resolved', 'customer_requested')"
-				}
-
-				params, _ := json.Marshal(map[string]any{
-					"type":       "object",
-					"properties": map[string]any{"reason": map[string]string{"type": "string", "description": desc}},
-					"required":   []string{"reason"},
-				})
-				t.Def.Parameters = params
-			}
-		case CategoryTransferCall:
-			if strings.TrimSpace(cfg.Destination) == "" {
-				return nil, nil, fmt.Errorf("dograh: transfer tool %q (%s) has no destination", r.Name, r.UUID)
-			}
-
-			t.Kind = agent.ToolTransfer
-			t.Destination = cfg.Destination
-
-			if cfg.Timeout != nil && *cfg.Timeout > 0 {
-				t.Timeout = time.Duration(*cfg.Timeout * float64(time.Second))
-			}
-		default:
-			unsupported = append(unsupported, Unsupported{Name: r.Name, Category: r.Category})
-			continue
-		}
-
-		tools = append(tools, t)
+// buildTool turns one tools row into an agent tool.
+func buildTool(r ToolRow) (agent.Tool, error) {
+	var def struct {
+		Config toolConfig `json:"config"`
 	}
 
-	return tools, unsupported, nil
+	if len(r.Definition) > 0 {
+		if err := json.Unmarshal(r.Definition, &def); err != nil {
+			return agent.Tool{}, fmt.Errorf("tool %q (%s): bad definition: %w", r.Name, r.UUID, err)
+		}
+	}
+
+	cfg := def.Config
+	t := agent.Tool{
+		Def: llm.FunctionDef{
+			Name:        FunctionName(r.Name),
+			Description: r.Description,
+		},
+	}
+
+	if t.Def.Description == "" {
+		t.Def.Description = "Execute " + r.Name + " tool"
+	}
+
+	if cfg.MessageType == "custom" {
+		t.Message = cfg.CustomMessage
+	}
+
+	switch r.Category {
+	case CategoryEndCall:
+		t.Kind = agent.ToolEndCall
+
+		if cfg.EndCallReason {
+			desc := cfg.EndCallReasonDescription
+			if desc == "" {
+				desc = "The reason for ending the call (e.g., 'voicemail_detected', 'issue_resolved', 'customer_requested')"
+			}
+
+			params, _ := json.Marshal(map[string]any{
+				"type":       "object",
+				"properties": map[string]any{"reason": map[string]string{"type": "string", "description": desc}},
+				"required":   []string{"reason"},
+			})
+			t.Def.Parameters = params
+		}
+	case CategoryTransferCall:
+		if strings.TrimSpace(cfg.Destination) == "" {
+			return agent.Tool{}, fmt.Errorf("transfer tool %q (%s) has no destination", r.Name, r.UUID)
+		}
+
+		t.Kind = agent.ToolTransfer
+		t.Destination = cfg.Destination
+
+		if cfg.Timeout != nil && *cfg.Timeout > 0 {
+			t.Timeout = time.Duration(*cfg.Timeout * float64(time.Second))
+		}
+	default:
+		return agent.Tool{}, fmt.Errorf("tool %q (category %s): %w", r.Name, r.Category, errUnsupported)
+	}
+
+	return t, nil
 }
 
 var (
