@@ -48,6 +48,9 @@
   double-assigned across concurrent calls.
 - One `sync.Pool` of 640-byte frame buffers (`internal/media/pool.go`), shared by
   every call's reader/writer goroutines to keep the hot path allocation-free.
+- In agent mode, one Postgres connection pool to Dograh's database
+  (`internal/dograh.Store`, `DOGRAH_DB_URL`), opened and pinged at startup --
+  an unreachable database stops the server from starting.
 
 ## Per-call state
 
@@ -78,6 +81,127 @@ utterance becomes the next turn. `BARGE_IN_ENABLED=0` puts the detector in
 observe-only mode: transitions keep logging, nothing is ever cut. Full knob
 table in `docs/AI_PROVIDERS.md`; state machine in
 `internal/ai/agent/handler.go`.
+
+History: the conversation the LLM sees records only what the caller actually
+heard. A reply that plays out is recorded whole; one cut short (barge-in, dead
+TTS connection) is recorded only up to the sentence that was playing. Tool
+calls and their results are recorded ahead of the spoken reply.
+
+### Configured in Dograh
+
+Everything that defines *the agent* is read from a self-hosted Dograh's
+Postgres (`internal/dograh`) -- the visual editor stays Dograh's; Vaani only
+reads its tables, never writes. On every call, before the STT connection
+opens, `Manager.loadWorkflow` (3s timeout) loads workflow `DOGRAH_WORKFLOW_ID`:
+
+- **Which version:** the published definition (`workflows.released_definition_id`),
+  else the legacy `is_current` row -- as Dograh picks it for a real call. Read
+  fresh per call, so a publish in the editor applies to the next call.
+- **The graph** (`workflow_json`): nodes, edges, prompts, the start node's
+  greeting, each node's tools (see "Workflow walk" below).
+- **Variables:** `{{...}}` in prompts, the greeting and edge transition
+  speech are filled in once, at call start, following Dograh's
+  `render_template`: `caller_number`/`called_number` from the call, the
+  definition's `template_context_variables` (else the workflow's), and
+  Dograh's built-ins `{{current_time}}`, `{{current_time_<Zone>}}`,
+  `{{current_weekday}}`, `{{current_weekday_<Zone>}}`; dotted paths and
+  `{{var | default}}` / `{{var | fallback:default}}` fallbacks work; a
+  missing variable becomes empty text. (Dograh renders on entering each
+  node, so `{{current_time}}` there can be minutes later on a long call.)
+- **Tools:** the rows of `tools` referenced by the nodes' `tool_uuids`,
+  limited to active ones in the workflow's organization (Dograh's own lookup).
+- **Models and keys:** see "Where the models come from" in
+  `docs/AI_PROVIDERS.md`.
+- **Call limits:** `max_user_idle_timeout` and `max_call_duration` from the
+  definition's `workflow_configurations` (see below).
+
+If any of it can't be used -- workflow not found or unpublished, no start
+node, the owner has no model configuration, a provider Vaani can't run --
+the call is hung up (`agent: loading the dograh workflow failed; hanging up`
+with the reason). There is deliberately no fallback to `.env` settings.
+Problems that shouldn't stop a call -- a tool that's missing, archived, of a
+category Vaani doesn't run yet (e.g. `http_api`) or misconfigured, an audio
+greeting -- are logged as `agent: workflow: ...` warnings and skipped.
+
+### Workflow walk
+
+`internal/ai/agent/workflow.go` (`Node`, `Edge`) mirrors Dograh's engine
+(`pipecat_engine.py`, `pipecat_engine_context_composer.py`):
+
+- **System prompt per node:** the global node's prompt + a blank line + the
+  node's own prompt; a node with `add_global_prompt=false` gets only its own.
+- **Functions per node:** the node's tools, then one function per outgoing
+  edge -- named from the edge label the way Dograh does it (lowercase, every
+  character outside `a-z0-9` becomes `_`: "Move to Main Agenda" ->
+  `move_to_main_agenda`), described by the edge's condition, no parameters.
+- **Taking an edge:** the edge's transition speech (if any) is spoken, the
+  conversation moves to the target node (`node transition` log), the LLM gets
+  Dograh's result `{"status":"done"}`, and runs again at once, in the same
+  turn, with the new node's prompt and functions. History carries over. The
+  move sticks even if the caller then interrupts.
+- **Opening:** a start node with a greeting speaks it as-is, bypassing the
+  LLM. Without one, the LLM speaks first from the start node's prompt; since
+  nobody has spoken yet, that request repeats the prompt as the only user
+  message, as pipecat's Google service does for a system-only context.
+- **End node:** the reply generated there is the closing line; the call
+  hangs up once it has played (`agent ending call reason=end_call`).
+- Up to 5 LLM rounds per turn (`maxToolRounds`), so a model stuck calling
+  functions can't keep the caller waiting indefinitely.
+
+### Tools
+
+Supported Dograh tool categories (`internal/dograh/tools.go`). Tool function
+names follow Dograh's rule: lowercase, runs of characters outside `a-z0-9_`
+become one `_`, trimmed ("Transfer Call to Support Team" ->
+`transfer_call_to_support_team`). A tool's custom message (`messageType`
+"custom") is spoken before it acts. An unknown function name gets an error
+result the LLM can react to.
+
+- **`end_call`:** the LLM is not asked again, and the call hangs up once
+  everything said so far has played. With `endCallReason` on, the LLM must
+  pass a `reason` (described by `endCallReasonDescription`), which is logged
+  (`end call requested`).
+- **`transfer_call`:** dials `destination` (an Asterisk dial string, e.g.
+  `PJSIP/<number>@<endpoint>` -- chan_sip's `SIP/...` is gone in Asterisk 21+)
+  and rings it for `timeout` seconds (default 30). `internal/ari/transfer.go`
+  mirrors Dograh's ARI transfer:
+  1. The destination is originated into the same Stasis app with app args
+     `transfer,<call id>`, so its `StasisStart` (sent only once it answers)
+     is recognised as a transfer leg, not a new call.
+  2. Meanwhile the caller hears the queued custom message, then the hold ring
+     looping (`assets/transfer_hold_ring_8000.wav`); no STT, no barge-in.
+  3. On answer, the beep (`assets/beep.wav`) plays to the caller (waited on
+     for up to 2s), then the destination is added to the call's bridge, the
+     agent's externalMedia leg is removed and hung up, and the agent stops.
+     Teardown later ends both remaining legs together.
+  4. Busy, rejected, not answered in time (our own wait is the timeout + 5s),
+     or the caller hung up: the ring stops and the LLM gets
+     `{"status":"failed","reason":...}` and carries on.
+  Both sounds are 8kHz mono 16-bit WAVs embedded at build time and upsampled
+  to 16kHz; if one can't be decoded the server logs a warning at startup and
+  that sound is silence.
+
+### Caller silence and call length
+
+Both mirror Dograh, with its settings from the workflow's Settings page
+(`workflow_configurations`); never saved, Dograh's backend defaults apply.
+
+- **Silence** (`max_user_idle_timeout`, default 10s; 0 disables) -- pipecat's
+  `UserIdleController`: the clock starts each time the agent finishes
+  speaking and stops when the caller starts (Sarvam's `START_SPEECH`). If it
+  runs out, the LLM gets Dograh's instruction to briefly ask whether they're
+  still there; the second time in a row, Dograh's goodbye instruction, and
+  the call hangs up after that reply (`caller silent`, then
+  `agent ending call reason=caller_silent`). If speech is heard but never
+  becomes a transcript (noise), the clock restarts at Sarvam's `END_SPEECH`.
+- **Call length** (`max_call_duration`, default 300s; Vaani treats <= 0 as no
+  limit): counted from the start of the call; hangs up at once if no reply is
+  in progress, otherwise once the current reply has played
+  (`reason=max_call_duration`). No goodbye is generated, as in Dograh.
+
+This is separate from `MAX_CALL_DURATION_SECONDS` in `.env`: that one is a
+transport-level backstop (off by default) that tears the call down the
+moment it's reached, whatever is playing, and applies in every mode.
 
 ## Operability endpoints
 

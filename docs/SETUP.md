@@ -33,6 +33,46 @@ sensitive manual ear-testing, set `JITTER_BUFFER_PACKETS=1` (20ms window); leave
 it at the default for load testing, since loss concealment is what that
 validates.
 
+## Agent mode: connecting to Dograh
+
+`APP_MODE=agent` needs a self-hosted Dograh; the agent's workflow, tools,
+models and keys are all configured there (see "Configured in Dograh" in
+`docs/ARCHITECTURE.md`). In Vaani's `.env`:
+
+- `DOGRAH_DB_URL` -- Dograh's Postgres, e.g.
+  `postgresql://user:pass@host:5432/dograh`. Vaani only reads from it.
+  Checked at startup (10s): unreachable = the server doesn't start.
+- `DOGRAH_WORKFLOW_ID` -- the workflow to run: the number in its editor URL
+  (`/workflow/19` -> `19`).
+
+No `LLM_*` or `SARVAM_*` settings -- they were removed; if still present in
+an old `.env` they're ignored.
+
+In Dograh:
+
+- **Publish** the workflow -- Vaani runs the published version (or the legacy
+  "current" one), not a draft.
+- The **workflow's owner** needs a model configuration (LLM, STT, TTS with
+  keys). STT and TTS must be Sarvam; the LLM an OpenAI-compatible provider
+  (list in `docs/AI_PROVIDERS.md`). A workflow's own model overrides take
+  precedence, per service.
+- **Tools** reach the agent only when attached to a node (the node's Tools
+  setting). A transfer tool's destination must be an Asterisk dial string
+  that exists on this Asterisk, e.g. `PJSIP/<number>@<endpoint>` -- chan_sip
+  (`SIP/...`) doesn't exist in Asterisk 21+.
+- **Call limits** (caller silence, maximum call length) come from the
+  workflow's Settings page; never saved, 10s and 300s apply.
+
+Network: the Vaani host must reach Dograh's Postgres and the LLM endpoint
+itself (for a gateway such as Bifrost, its `base_url`, e.g.
+`curl http://<bifrost-host>:8080/v1/models` from the Vaani host), plus
+Sarvam's API over the internet.
+
+What a healthy call logs at its start:
+
+    agent workflow loaded ... start_node="Start Call" opening=llm start_tools="[...]" idle_timeout_s=10 max_duration_s=300
+    agent models ... llm=bifrost/<model> llm_url=... stt=sarvam/saaras:v4 ... tts_voice=...
+
 ## Metrics and health
 
 `http://localhost:9091/metrics` (Prometheus format) -- see `internal/metrics` for

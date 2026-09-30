@@ -68,3 +68,41 @@ mic and can false-trigger interrupts; no code-side fix yet.
 
 **Not done: the load test run** (Phase 2 carry-over) — `docs/LOADTEST.md` is
 still a template awaiting real numbers.
+
+## Phase 5 — Dograh-driven agent
+Goal: a Dograh-like voice agent whose configuration lives in a self-hosted
+Dograh (its visual editor stays a separate app); Vaani reads Dograh's
+Postgres directly. Design in `docs/ARCHITECTURE.md` ("Configured in Dograh")
+and `docs/AI_PROVIDERS.md` ("Where the models come from").
+
+Status, item by item — "live" means seen working on a real call:
+- **History records the agent's own replies**, only what the caller heard —
+  done, live.
+- **Tool calling** in the LLM client (OpenAI-style, fragmented or whole
+  calls, Gemini thought signature kept) and the agent turn loop — done, live
+  through workflow edges. The Gemini thought-signature round trip is
+  unit-tested only.
+- **Workflow engine** — published definition, global + node prompts, edge
+  transitions, LLM opening, end node + hangup — done, live (workflow 19,
+  `sarvam-v2/gemma4` via Bifrost). `{{variables}}` (incl. Dograh's date/time
+  built-ins) — done, unit-tested; workflow 19 uses none, so not yet seen live.
+- **Models and keys from Dograh** (owner's configuration + workflow
+  overrides) — done, live with Bifrost LLM + Sarvam STT/TTS. The `google`
+  LLM provider path has not been tried live.
+- **`end_call` tool** — done, unit-tested; not yet seen live (calls so far
+  ended through the End Call node instead).
+- **`transfer_call` tool** over ARI with hold ring + beep — done,
+  unit-tested; **not yet tried live**.
+- **Caller silence handling and call length** from the workflow's settings —
+  done, unit-tested; not yet triggered live.
+- **Turn latency from the caller's end of speech** (`endpoint_ms`,
+  `since_speech_end_ms`) — done, unit-tested; not yet seen live.
+
+Not done yet:
+- **Step 3b:** `http_api` custom tools (e.g. web search, with bearer
+  credentials from `external_credentials`), variable extraction, and writing
+  each call to Dograh's `workflow_runs` so calls appear in the Dograh UI.
+- **Step 4:** knowledge base (Dograh's documents, pgvector).
+- Dograh features Vaani skips for now: per-node `allow_interrupt`,
+  audio greetings and recordings, `delayed_start`, voicemail detection,
+  pre-call fetch, context summarization, realtime (speech-to-speech) models.

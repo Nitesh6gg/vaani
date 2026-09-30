@@ -4,9 +4,11 @@ Real-time voice agent: Asterisk ARI (telephony) + Go media plane + Sarvam STT/TT
 
 ## Stack
 - Go 1.26+, Asterisk 22.8+ (PJSIP, ARI, AudioSocket/externalMedia)
-- STT: Sarvam `saaras:v4` (WebSocket, 16kHz PCM s16le)
-- TTS: Sarvam Bulbul v3 (WebSocket streaming, request 16kHz output)
-- LLM: OpenAI-compatible streaming API (shared http.Client, HTTP/2)
+- Agent configuration: a self-hosted Dograh, read from its Postgres
+  (workflow, prompts, tools, models, keys)
+- STT: Sarvam, e.g. `saaras:v4` (WebSocket, 16kHz PCM s16le; model set in Dograh)
+- TTS: Sarvam Bulbul, e.g. v3 (WebSocket streaming, request 16kHz output; model/voice set in Dograh)
+- LLM: any OpenAI-compatible streaming API set in Dograh (shared http.Client, HTTP/2)
 - Barge-in VAD: TEN VAD (`VAD_MODE=ten`, Linux/cgo, vendored under
   `third_party/ten-vad/`) or RMS energy (`VAD_MODE=energy`, default)
 

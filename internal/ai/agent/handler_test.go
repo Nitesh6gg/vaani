@@ -1122,3 +1122,45 @@ func TestHandler_MaxDurationLetsCurrentReplyFinish(t *testing.T) {
 	drainUntilListening(t, h)
 	require.Eventually(t, func() bool { return hangups.Load() == 1 }, time.Second, time.Millisecond)
 }
+
+// TestHandler_LogsLatencyFromCallerSpeechEnd: a transcript preceded by the
+// STT's end-of-speech signal logs endpoint_ms, and its reply's first audio
+// logs since_speech_end_ms; a transcript with no signal of its own logs
+// neither (a stale end-of-speech must never be borrowed).
+func TestHandler_LogsLatencyFromCallerSpeechEnd(t *testing.T) {
+	getLog := captureSlog(t)
+
+	fSTT := newFakeSTT()
+	fTTS := newFakeTTS()
+	fLLM := &fakeLLM{tokens: []string{"Okay."}}
+	h := NewHandler(context.Background(), "call1", testConfig(fSTT, fTTS, fLLM, time.Hour, 0))
+
+	fSTT.results <- stt.Result{Signal: stt.SpeechStarted}
+	fSTT.results <- stt.Result{Signal: stt.SpeechEnded}
+	fSTT.sendFinal("first")
+	require.Eventually(t, func() bool { return fTTS.spokenCount() == 1 }, time.Second, time.Millisecond)
+	playTurn(t, h, fTTS, 1, "Okay.")
+
+	fSTT.sendFinal("second") // no START/END for this one
+	require.Eventually(t, func() bool { return fTTS.spokenCount() == 2 }, time.Second, time.Millisecond)
+	playTurn(t, h, fTTS, 2, "Okay.")
+
+	var first, second []string
+
+	for _, line := range strings.Split(getLog().String(), "\n") {
+		switch {
+		case strings.Contains(line, "gen=1") && (strings.Contains(line, "stt final transcript") || strings.Contains(line, "tts first audio")):
+			first = append(first, line)
+		case strings.Contains(line, "gen=2") && (strings.Contains(line, "stt final transcript") || strings.Contains(line, "tts first audio")):
+			second = append(second, line)
+		}
+	}
+
+	require.Len(t, first, 2)
+	assert.Contains(t, first[0], "endpoint_ms=")
+	assert.Contains(t, first[1], "since_speech_end_ms=")
+
+	require.Len(t, second, 2)
+	assert.NotContains(t, second[0], "endpoint_ms=")
+	assert.NotContains(t, second[1], "since_speech_end_ms=")
+}

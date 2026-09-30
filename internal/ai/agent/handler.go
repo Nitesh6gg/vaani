@@ -271,6 +271,20 @@ type Handler struct {
 	// chunk has already been logged, so repeat chunks don't repeat the log.
 	turnStartedAt time.Time
 	ttfaLoggedGen uint64
+	// speechEndAt is when the STT's end-of-speech signal (Sarvam END_SPEECH)
+	// for the caller's current utterance arrived, on this process's clock --
+	// never Sarvam's own occured_at, whose clock was measured ~3.9s off in a
+	// sibling project (D:\go-agent-worker ADR-017). Sarvam sends START ->
+	// END -> transcript in order on one connection, so the value belongs to
+	// the next transcript with nothing to correlate: START_SPEECH clears it,
+	// and the transcript consumes it whether or not it starts a turn.
+	// turnSpeechEndAt is the current turn's copy, zero for turns no caller
+	// speech started (opening, greeting, silence prompts). Note END_SPEECH is
+	// Sarvam's detection time, which trails the caller's actual last sound
+	// (by ~400ms in that project's one measurement), so figures measured from
+	// it understate what the caller experiences by that much.
+	speechEndAt     time.Time
+	turnSpeechEndAt time.Time
 	// dropWarnedGen records which generation's outbound-buffer-full warning has
 	// already been logged, so an oversized reply that overflows the buffer logs
 	// once for the whole turn instead of once per dropped frame -- observed
@@ -622,11 +636,14 @@ func (h *Handler) post(ev any) {
 // switch silence detection off for the rest of the call.
 func (h *Handler) handleCallerSpeech(started bool) {
 	if started {
+		h.speechEndAt = time.Time{}
 		h.stopIdleTimer()
 		h.idleCount = 0
 
 		return
 	}
+
+	h.speechEndAt = time.Now()
 
 	if h.idleArmed && State(h.state.Load()) == StateListening {
 		h.startIdleTimer()
@@ -782,6 +799,12 @@ func (h *Handler) handleGreeting() {
 }
 
 func (h *Handler) handleFinalTranscript(text string) {
+	// This transcript's own end-of-speech, if the STT sent one -- consumed
+	// here even if the transcript is dropped below, so it can never be
+	// attributed to a later utterance.
+	speechEnd := h.speechEndAt
+	h.speechEndAt = time.Time{}
+
 	if time.Now().UnixNano() < h.silenceUntil.Load() {
 		slog.Debug("agent: dropping final transcript inside post-cut silence gate", "call_id", h.callID)
 		return
@@ -793,9 +816,18 @@ func (h *Handler) handleFinalTranscript(text string) {
 	}
 
 	h.history = append(h.history, llm.Message{Role: "user", Content: text})
-	slog.Info("stt final transcript", "call_id", h.callID, "gen", h.curGen+1, "text", text)
+
+	args := []any{"call_id", h.callID, "gen", h.curGen + 1, "text", text}
+	if !speechEnd.IsZero() {
+		// Sarvam's end-of-speech detection -> its transcript.
+		args = append(args, "endpoint_ms", time.Since(speechEnd).Milliseconds())
+	}
+
+	slog.Info("stt final transcript", args...)
+
 	h.idleCount = 0
 	h.startTurn()
+	h.turnSpeechEndAt = speechEnd
 }
 
 // startTurn runs one LLM turn over the current history: after the caller
@@ -809,6 +841,7 @@ func (h *Handler) startTurn() {
 	h.curGen++
 	gen := h.curGen
 	h.turnStartedAt = time.Now()
+	h.turnSpeechEndAt = time.Time{} // handleFinalTranscript sets its own after this
 	h.startTurnChunks()
 
 	if !h.openTTS(gen) {
@@ -1343,8 +1376,14 @@ func (h *Handler) handleTTSAudio(pcm []byte, gen, req uint64, text string) {
 
 	if h.ttfaLoggedGen != gen {
 		h.ttfaLoggedGen = gen
-		slog.Info("tts first audio", "call_id", h.callID, "gen", gen,
-			"latency_ms", time.Since(h.turnStartedAt).Milliseconds())
+		args := []any{"call_id", h.callID, "gen", gen, "latency_ms", time.Since(h.turnStartedAt).Milliseconds()}
+		if !h.turnSpeechEndAt.IsZero() {
+			// The caller's wait, from Sarvam's end-of-speech detection to the
+			// reply's first audio (see speechEndAt for what it leaves out).
+			args = append(args, "since_speech_end_ms", time.Since(h.turnSpeechEndAt).Milliseconds())
+		}
+
+		slog.Info("tts first audio", args...)
 
 		// Only start draining outbound to the caller once real audio has
 		// actually arrived -- see sendToTTS's comment for why this doesn't

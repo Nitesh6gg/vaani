@@ -4,9 +4,11 @@ Real-time voice agent: Asterisk ARI (telephony) + Go media plane + Sarvam STT/TT
 
 ## Stack
 - Go 1.26+, Asterisk 22.8+ (PJSIP, ARI, externalMedia)
-- STT: Sarvam `saaras:v4` (WebSocket, 16kHz PCM s16le)
-- TTS: Sarvam Bulbul v3 (WebSocket streaming, request 16kHz output)
-- LLM: OpenAI-compatible streaming API (shared http.Client, HTTP/2)
+- Agent configuration: a self-hosted Dograh, read from its Postgres per call
+  (workflow, prompts, tools, models, keys) — no model settings in `.env`
+- STT: Sarvam, e.g. `saaras:v4` (WebSocket, 16kHz PCM s16le; model set in Dograh)
+- TTS: Sarvam Bulbul, e.g. v3 (WebSocket streaming, request 16kHz output; set in Dograh)
+- LLM: OpenAI-compatible streaming API set in Dograh (shared http.Client, HTTP/2)
 - Barge-in VAD: TEN VAD (`VAD_MODE=ten`, Linux/cgo, vendored under
   `third_party/ten-vad/`) or RMS energy (`VAD_MODE=energy`, default)
 
@@ -18,8 +20,12 @@ Real-time voice agent: Asterisk ARI (telephony) + Go media plane + Sarvam STT/TT
 - `internal/ai/stt|llm|tts/` — provider clients
 - `internal/ai/agent/` — per-call agent Handler (STT→LLM→TTS state machine,
   barge-in, playout queue); `internal/ai/agent/tenvad/` — TEN VAD cgo wrapper
-  (Linux only; native library vendored under `third_party/ten-vad/`)
+  (Linux only; native library vendored under `third_party/ten-vad/`);
+  `workflow.go` — workflow nodes/edges; `tools.go` — tool kinds
+- `internal/dograh/` — read-only access to Dograh's Postgres: workflow graph,
+  `{{variable}}` rendering, tools, models/keys, call limits
 - `internal/session/` — per-call state machine, barge-in orchestration
+- `assets/` — embedded transfer sounds (hold ring, beep)
 
 ## Critical Invariants (NEVER violate these)
 1. **20ms pacer**: use `time.NewTicker` (`internal/media/pacer.go`) and pass each
