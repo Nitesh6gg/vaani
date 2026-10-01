@@ -97,12 +97,23 @@ Status, item by item — "live" means seen working on a real call:
   done, unit-tested; not yet triggered live.
 - **Turn latency from Sarvam's end of speech** (`endpoint_ms`,
   `since_speech_end_ms`) — done, live (2026-09-30 and 2026-10-01 calls).
-- **Per-node interruption** (Dograh's `allow_interrupt`, under the
-  `BARGE_IN_ENABLED` master switch) — done, unit-tested; not yet tried live.
 - **Caller's last sound timed by TEN VAD while listening** (`end_detect_ms`,
-  `since_last_speech_ms`) — done, unit-tested; not yet seen live.
-- **Conversation lines** in the logs (`[User]`, `[Agent]`) — done,
-  unit-tested; not yet seen live.
+  `since_last_speech_ms`) — done, live (2026-10-01: Sarvam's end-of-speech
+  wait ~600-680ms). On a noisy line the "last sound" can be noise, so the
+  figures are unreliable there.
+- **Conversation lines** in the logs (`[User]`, `[Agent]`) — done, live
+  (2026-10-01).
+- **Per-node interruption** (Dograh's `allow_interrupt`, under the
+  `BARGE_IN_ENABLED` master switch) — live on 2026-10-01, which showed it was far
+  too sensitive (about 50ms of sound cut a reply; noise cut 6 of 7 replies)
+  and that an interrupted goodbye cancelled the hangup. Fixed, unit-tested,
+  not yet tried live:
+  - `BARGE_IN_MIN_SPEECH_MS` (default 200) and `TEN_VAD_THRESHOLD` default
+    0.7, matching Dograh's live VAD;
+  - an interruption pauses the reply first; a transcript confirms the cut,
+    otherwise the reply resumes after 2s of quiet;
+  - an End node, the `end_call` tool and a call Vaani is ending can't be
+    interrupted, as in Dograh.
 
 Not done yet:
 - **Step 3b:** `http_api` custom tools (e.g. web search, with bearer

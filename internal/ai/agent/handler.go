@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/nitesh/vaani/internal/ai/llm"
 	"github.com/nitesh/vaani/internal/ai/stt"
@@ -150,6 +152,11 @@ type Config struct {
 	// SPEAKING, so the agent's own voice leaking into the mic at the start of
 	// playback can't immediately trigger a false self-interrupt.
 	BargeInGuard time.Duration
+	// BargeInMinSpeech is how long the detector must report speech without a
+	// break before it counts as an interruption -- Dograh's VAD needs 200ms
+	// (pipecat start_secs). Without it, a ~50ms burst (3 of 5 16ms TEN VAD
+	// hops) was enough: observed live, noise cut 6 of 7 replies in one call.
+	BargeInMinSpeech time.Duration
 	// PostCutSilence is how long a barge-in cut requires quiet before a new
 	// final transcript is accepted -- otherwise the tail of the interrupting
 	// utterance the STT was already mid-transcribing when it flushed could
@@ -194,6 +201,7 @@ type bargeInEvent struct{}
 type greetingEvent struct{}
 type openingEvent struct{}
 type callerSpeechEvent struct{ started bool } // STT VAD: caller started/stopped speaking
+type resumeCheckEvent struct{ seq uint64 }    // is a paused reply's interruption false?
 type idleEvent struct{ seq uint64 }
 type maxDurationEvent struct{}
 type ttsPlaybackDoneEvent struct{}
@@ -243,6 +251,17 @@ type Handler struct {
 	// cleared by the tool goroutine; the player's position is advanced only
 	// by ProcessFrame's goroutine.
 	hold atomic.Pointer[holdPlayer]
+
+	// paused is set (by ProcessFrame) when the caller seems to interrupt: the
+	// reply stops playing but keeps generating and queueing, STT is fed, and
+	// run() waits to see whether it's real -- a transcript confirms it and
+	// the reply is cut; quiet without one means it was noise and the reply
+	// resumes where it stopped (see handleBargeIn / handleResumeCheck).
+	paused atomic.Bool
+	// closing is set once the call is ending -- an end node reached, the
+	// end_call tool run, or Handler.ending -- after which the caller can no
+	// longer interrupt, as in Dograh (end_call_with_reason mutes the user).
+	closing atomic.Bool
 
 	// clock is Config.BargeIn when that detector can say when it last heard
 	// speech (TEN VAD); then it also runs while listening, so the caller's
@@ -341,8 +360,19 @@ type Handler struct {
 	endReason string
 	hungUp    bool
 
+	// Interruption pause bookkeeping, run()-owned: pausedAt is when the
+	// current pause began, resumeSeq tags resume checks so stale ones are
+	// ignored, and callerSpeaking is whether the STT's VAD has the caller
+	// mid-utterance (START_SPEECH seen, END_SPEECH not yet).
+	pausedAt       time.Time
+	resumeSeq      uint64
+	callerSpeaking bool
+
 	// ProcessFrame-goroutine-owned only.
 	preroll [][]byte
+	// speechRunStart is when the detector's current unbroken run of speech
+	// began during Speaking (zero: none) -- see Config.BargeInMinSpeech.
+	speechRunStart time.Time
 	// emptyTicks counts consecutive Speaking-state release ticks that found
 	// the outbound queue empty without ttsDeliveryDone set -- the drain
 	// dead-call safeguard in processSpeakingFrame. A counter, not a stored
@@ -442,6 +472,19 @@ func (h *Handler) ProcessFrame(_ context.Context, _ string, pcm []byte) [][]byte
 }
 
 func (h *Handler) processSpeakingFrame(pcm []byte) [][]byte {
+	// Paused on a possible interruption: play nothing, let the caller be
+	// heard (STT, and the VAD for its timing), and leave the queued reply
+	// where it is -- run() resumes or cuts it.
+	if h.paused.Load() {
+		if err := h.cfg.STT.Feed(pcm); err != nil {
+			h.cfg.Sink.Error("stt")
+		}
+
+		h.cfg.BargeIn.Detect(pcm)
+
+		return nil
+	}
+
 	// The preroll buffer exists solely to recover the interrupting
 	// utterance's start on a cut; in observe-only mode no cut can ever fire,
 	// so skip the per-frame copy entirely.
@@ -455,20 +498,27 @@ func (h *Handler) processSpeakingFrame(pcm []byte) [][]byte {
 	// logging VAD) the verdict changes nothing else.
 	detected := h.cfg.BargeIn.Detect(pcm)
 
-	// A cut needs barge-in enabled (the master switch) AND the current node
-	// to allow interruption (Dograh's allow_interrupt; otherwise the caller
-	// is muted while the agent speaks, as in Dograh's should_mute_user).
-	elapsed := time.Duration(time.Now().UnixNano() - h.speakingSince.Load())
-	if detected && !h.cfg.BargeInObserveOnly && h.node.Load().AllowInterrupt && elapsed >= h.cfg.BargeInGuard {
-		// Order matters: flip state and flush BEFORE signaling run() to cut
-		// the turn, so the very next ProcessFrame call (20ms later) already
-		// resumes feeding STT live instead of re-detecting the same barge-in.
-		h.state.Store(int32(StateTranscribing))
+	now := time.Now()
+	if !detected {
+		h.speechRunStart = time.Time{}
+	} else if h.speechRunStart.IsZero() {
+		h.speechRunStart = now
+	}
+
+	elapsed := time.Duration(now.UnixNano() - h.speakingSince.Load())
+	if detected && now.Sub(h.speechRunStart) >= h.cfg.BargeInMinSpeech &&
+		elapsed >= h.cfg.BargeInGuard && h.interruptible() {
+		// Pause, don't cut: whether this is the caller or just noise isn't
+		// known yet (see paused). Flush the preroll so STT hears the start of
+		// what they said, and gate out the junk transcript the flush itself
+		// tends to produce 0.5-1.5s later (commit 249a6c4) -- a transcript
+		// inside that gate neither confirms the interruption nor starts a turn.
+		h.paused.Store(true)
 		h.flushPrerollToSTT()
 		h.cfg.BargeIn.Reset()
-		h.silenceUntil.Store(time.Now().Add(h.cfg.PostCutSilence).UnixNano())
-		h.cfg.Sink.BargeIn()
-		slog.Info("agent barge-in detected", "call_id", h.callID)
+		h.speechRunStart = time.Time{}
+		h.silenceUntil.Store(now.Add(h.cfg.PostCutSilence).UnixNano())
+		slog.Info("agent barge-in detected; pausing the reply", "call_id", h.callID)
 		h.emptyTicks = 0
 
 		select {
@@ -534,6 +584,16 @@ func (h *Handler) processSpeakingFrame(pcm []byte) [][]byte {
 	}
 
 	return nil
+}
+
+// interruptible: the caller may cut in right now -- barge-in enabled (the
+// BARGE_IN_ENABLED master switch), the current node allows it (Dograh's
+// allow_interrupt; an end node never does), and the call isn't closing.
+// Otherwise the caller is muted while the agent speaks, as in Dograh's
+// should_mute_user.
+func (h *Handler) interruptible() bool {
+	return !h.cfg.BargeInObserveOnly && !h.closing.Load() &&
+		InterruptMode(true, h.node.Load()) == "on"
 }
 
 func (h *Handler) appendPreroll(pcm []byte) {
@@ -628,6 +688,8 @@ func (h *Handler) handleEvent(ev any) {
 		h.startTurn()
 	case callerSpeechEvent:
 		h.handleCallerSpeech(e.started)
+	case resumeCheckEvent:
+		h.handleResumeCheck(e.seq)
 	case idleEvent:
 		h.handleIdle(e.seq)
 	case maxDurationEvent:
@@ -665,6 +727,8 @@ func (h *Handler) post(ev any) {
 // clock again -- the clock restarts, so noise that never became words can't
 // switch silence detection off for the rest of the call.
 func (h *Handler) handleCallerSpeech(started bool) {
+	h.callerSpeaking = started
+
 	if started {
 		h.speechEndAt, h.lastSoundAt = time.Time{}, time.Time{}
 		h.stopIdleTimer()
@@ -733,6 +797,7 @@ func (h *Handler) handleIdle(seq uint64) {
 	if h.idleCount >= 2 {
 		prompt = idleFinalPrompt
 		h.ending, h.endReason = true, "caller_silent"
+		h.closing.Store(true)
 	}
 
 	slog.Info("caller silent", "call_id", h.callID, "times", h.idleCount,
@@ -746,6 +811,7 @@ func (h *Handler) handleIdle(seq uint64) {
 // progress, otherwise once the current one has played (finishTurn).
 func (h *Handler) endCall(reason string) {
 	h.ending, h.endReason = true, reason
+	h.closing.Store(true)
 	h.stopIdleTimer()
 
 	switch State(h.state.Load()) {
@@ -846,8 +912,23 @@ func (h *Handler) handleFinalTranscript(text string) {
 	h.speechEndAt, h.lastSoundAt = time.Time{}, time.Time{}
 
 	if time.Now().UnixNano() < h.silenceUntil.Load() {
-		slog.Debug("agent: dropping final transcript inside post-cut silence gate", "call_id", h.callID)
+		// Usually the junk an interruption's preroll flush produces (commit
+		// 249a6c4). It neither confirms the interruption nor starts a turn.
+		slog.Info("transcript ignored: too soon after an interruption", "call_id", h.callID, "text", text)
 		return
+	}
+
+	if h.paused.Load() {
+		if h.closing.Load() {
+			// The call started ending while paused: the caller is muted from
+			// here on, as in Dograh -- let the goodbye finish.
+			slog.Info("transcript ignored: the call is ending", "call_id", h.callID, "text", text)
+			h.resumeReply("call ending")
+
+			return
+		}
+
+		h.confirmInterruption() // a real interruption: cut, and this becomes the next turn
 	}
 
 	switch State(h.state.Load()) {
@@ -1080,6 +1161,10 @@ func (h *Handler) takeEdge(ctx context.Context, ttsClient tts.Client, from *Node
 		"allow_interrupt", e.To.AllowInterrupt, "interrupt", InterruptMode(!h.cfg.BargeInObserveOnly, e.To))
 	h.node.Store(e.To)
 
+	if e.To.End {
+		h.closing.Store(true) // Dograh mutes the caller once the end node is reached
+	}
+
 	return e.To, `{"status":"done"}`
 }
 
@@ -1112,6 +1197,7 @@ func (h *Handler) runTool(ctx context.Context, ttsClient tts.Client, node *Node,
 
 		_ = json.Unmarshal([]byte(call.Function.Arguments), &args)
 		slog.Info("end call requested", "call_id", h.callID, "gen", gen, "reason", args.Reason)
+		h.closing.Store(true) // no interrupting the goodbye, as in Dograh
 
 		return `{"status":"success","action":"ending_call"}`, actionEndCall
 	case ToolTransfer:
@@ -1564,6 +1650,13 @@ func (h *Handler) recordReply(cut bool) {
 			break
 		}
 
+		// LLM chunks carry their own spacing; separately spoken pieces (a
+		// transition speech, a tool message) don't -- don't run them into
+		// the next sentence ("...हैं।धन्यवाद।").
+		if b.Len() > 0 && c.text != "" && !endsInSpace(b.String()) && !startsWithSpace(c.text) {
+			b.WriteByte(' ')
+		}
+
 		b.WriteString(c.text)
 	}
 
@@ -1583,6 +1676,16 @@ func (h *Handler) recordReply(cut bool) {
 	// Exactly what the caller heard of this reply (cut: only up to where it
 	// was interrupted).
 	slog.Info("[Agent]", "call_id", h.callID, "gen", h.curGen, "text", text, "cut", cut)
+}
+
+func endsInSpace(s string) bool {
+	r, _ := utf8.DecodeLastRuneInString(s)
+	return unicode.IsSpace(r)
+}
+
+func startsWithSpace(s string) bool {
+	r, _ := utf8.DecodeRuneInString(s)
+	return unicode.IsSpace(r)
 }
 
 // startTurnChunks resets reply tracking at the start of a new turn.
@@ -1612,28 +1715,107 @@ func (h *Handler) handleLLMDone(e llmDoneEvent) {
 	// case to handle here.
 }
 
+// falseInterruptionTimeout: a paused reply resumes when no transcript has
+// confirmed the interruption and the caller has been quiet this long.
+// Comfortably above Sarvam's end-of-speech wait plus transcript (~0.7s
+// live) and the default 1.2s post-cut gate. falseInterruptionMaxPause caps
+// the wait even if the STT's VAD never reports the caller stopping, so a
+// stuck signal can't leave the call silent.
+const (
+	falseInterruptionTimeout  = 2 * time.Second
+	falseInterruptionMaxPause = 10 * time.Second
+)
+
+// handleBargeIn: ProcessFrame has paused the reply on a possible
+// interruption; start checking whether it was real.
 func (h *Handler) handleBargeIn() {
+	h.pausedAt = time.Now()
+	h.scheduleResumeCheck(falseInterruptionTimeout)
+}
+
+func (h *Handler) scheduleResumeCheck(after time.Duration) {
+	h.resumeSeq++
+	seq := h.resumeSeq
+
+	time.AfterFunc(after, func() { h.post(resumeCheckEvent{seq: seq}) })
+}
+
+// handleResumeCheck resumes a paused reply once the caller has been quiet
+// for falseInterruptionTimeout with no transcript confirming the
+// interruption: it was noise (or echo), so the caller hears the rest of the
+// reply from where it stopped instead of dead air.
+func (h *Handler) handleResumeCheck(seq uint64) {
+	if seq != h.resumeSeq || !h.paused.Load() {
+		return
+	}
+
+	paused := time.Since(h.pausedAt)
+
+	quietSince := h.pausedAt
+	if h.clock != nil {
+		if last := h.clock.LastSpeechAt(); last.After(quietSince) {
+			quietSince = last
+		}
+	}
+
+	if h.prevSpeechEndAt.After(quietSince) {
+		quietSince = h.prevSpeechEndAt
+	}
+
+	if h.callerSpeaking {
+		quietSince = time.Now() // the STT still has them mid-utterance
+	}
+
+	if wait := falseInterruptionTimeout - time.Since(quietSince); wait > 0 && paused < falseInterruptionMaxPause {
+		h.scheduleResumeCheck(min(wait, falseInterruptionMaxPause-paused))
+		return
+	}
+
+	h.resumeReply("no transcript")
+}
+
+// resumeReply lets the paused reply play on from where it stopped.
+func (h *Handler) resumeReply(reason string) {
+	h.resumeSeq++ // any pending check is now stale
+	h.paused.Store(false)
+	slog.Info("false interruption; resuming the reply", "call_id", h.callID, "gen", h.curGen,
+		"paused_ms", time.Since(h.pausedAt).Milliseconds(), "reason", reason)
+}
+
+// confirmInterruption: a transcript arrived while the reply was paused --
+// the caller really is talking. Cut the reply (the five barge-in cuts) so
+// their words become the next turn.
+func (h *Handler) confirmInterruption() {
+	h.resumeSeq++
+	// State before paused: ProcessFrame must never see "not paused" while
+	// still Speaking, or it would play a frame of the reply being cut.
+	h.state.Store(int32(StateTranscribing))
+	h.paused.Store(false)
+	h.cfg.Sink.BargeIn()
+	slog.Info("agent barge-in confirmed; reply cut", "call_id", h.callID, "gen", h.curGen,
+		"paused_ms", time.Since(h.pausedAt).Milliseconds())
+	h.cutReply()
+}
+
+// cutReply is the barge-in cut: LLM and TTS cancelled, queued audio
+// dropped, and only what the caller heard recorded.
+func (h *Handler) cutReply() {
 	if h.turnCancel != nil {
 		h.turnCancel()
 		h.turnCancel = nil
 	}
 
+	// Keep only what the caller heard before cutting in -- recorded before
+	// the generation advances, so it's logged under its own turn's number.
+	// Safe to read playingReq: ProcessFrame stopped popping frames when it
+	// paused.
+	h.recordReply(true)
+
 	h.curGen++ // invalidate the interrupted turn's in-flight audio/done events
 	h.agentQuietSince = time.Now()
 
-	// Keep only what the caller heard before cutting in. Safe to read
-	// playingReq here: processSpeakingFrame flipped state to Transcribing
-	// before sending bargeInEvent, so it has stopped popping frames.
-	h.recordReply(true)
-
-	// The caller cut in over a goodbye: they want to keep talking, so don't
-	// hang up on them -- unless the call is being ended regardless (max
-	// duration, silence), which Dograh doesn't reverse either.
-	h.hangupAfterTurn = false
-
-	if h.ending {
-		h.hangup()
-	}
+	// No hangup handling needed: once a call is closing it can't be
+	// interrupted at all (see closing).
 
 	if h.tts != nil {
 		if err := h.tts.Cancel(); err != nil {

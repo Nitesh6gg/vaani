@@ -39,10 +39,12 @@ type Edge struct {
 }
 
 // InterruptMode is "on" when the caller can cut in while the agent speaks at
-// n: barge-in enabled (BARGE_IN_ENABLED, the master switch) and the node's
-// allow_interrupt on. For logs.
+// n: barge-in enabled (BARGE_IN_ENABLED, the master switch), the node's
+// allow_interrupt on, and not an end node -- once the call is ending Dograh
+// mutes the caller whatever the node says (its End Call node has no
+// interruption setting; a stored allow_interrupt there is ignored).
 func InterruptMode(bargeInEnabled bool, n *Node) string {
-	if bargeInEnabled && n.AllowInterrupt {
+	if bargeInEnabled && n.AllowInterrupt && !n.End {
 		return "on"
 	}
 

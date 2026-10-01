@@ -310,11 +310,13 @@ func TestHandler_FullyPlayedReplyIsRecordedInHistory(t *testing.T) {
 // generated reply, or the LLM would believe it said things the caller never
 // heard.
 func TestHandler_BargeInRecordsOnlyWhatWasHeard(t *testing.T) {
+	getLog := captureSlog(t)
+
 	fSTT := newFakeSTT()
 	fTTS := newFakeTTS()
 	fLLM := &fakeLLM{tokens: []string{"First sentence.", " Second sentence."}}
 
-	h := NewHandler(context.Background(), "call1", testConfig(fSTT, fTTS, fLLM, 0, time.Hour))
+	h := NewHandler(context.Background(), "call1", testConfig(fSTT, fTTS, fLLM, 0, 0))
 
 	fSTT.sendFinal("hi")
 	require.Eventually(t, func() bool { return fTTS.spokenCount() == 2 }, time.Second, time.Millisecond)
@@ -337,13 +339,19 @@ func TestHandler_BargeInRecordsOnlyWhatWasHeard(t *testing.T) {
 	h.ProcessFrame(context.Background(), "call1", constFrame(loudAmplitude))  // frame 3
 	h.ProcessFrame(context.Background(), "call1", constFrame(loudAmplitude))  // 3rd loud vote: barge-in
 
-	require.Equal(t, StateTranscribing, h.State(), "barge-in must fire on the third loud frame")
+	require.True(t, h.paused.Load(), "barge-in must fire (pause) on the third loud frame")
 
+	// The caller's words confirm it: the reply is cut.
+	fSTT.sendFinal("wait")
 	require.Eventually(t, func() bool { return fTTS.wasCancelled() }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return fLLM.streamCalls() == 2 }, time.Second, time.Millisecond)
 	assert.Equal(t, []llm.Message{
 		{Role: "user", Content: "hi"},
 		{Role: "assistant", Content: "First sentence."},
-	}, h.history, "only the sentence the caller started hearing may be recorded")
+		{Role: "user", Content: "wait"},
+	}, fLLM.seen[1], "only the sentence the caller started hearing may be recorded")
+	assert.Contains(t, getLog().String(), `[Agent] call_id=call1 gen=1 text="First sentence." cut=true`,
+		"a cut reply is logged under its own turn's number")
 }
 
 // TestHandler_RecordReplyCutBeforePlaybackRecordsNothing: nothing played means
@@ -541,10 +549,126 @@ func TestHandler_BargeInExecutesCutsAndFlushesPreroll(t *testing.T) {
 	out := h.ProcessFrame(context.Background(), "call1", constFrame(loudAmplitude))
 
 	assert.Nil(t, out, "the triggering tick returns no agent audio")
-	assert.Equal(t, StateTranscribing, h.State(), "must flip state immediately, not wait for the event loop")
-
-	require.Eventually(t, fTTS.wasCancelled, time.Second, time.Millisecond, "cut #2: TTS must be cancelled")
+	assert.True(t, h.paused.Load(), "must pause immediately, not wait for the event loop")
 	assert.Greater(t, fSTT.fedCount(), fedBefore, "preroll frames must be flushed to STT")
+	assert.False(t, fTTS.wasCancelled(), "a pause is not a cut yet")
+	assert.Nil(t, h.ProcessFrame(context.Background(), "call1", constFrame(quietAmplitude)), "nothing plays while paused")
+
+	// A transcript inside the post-cut gate (the flush's usual junk) doesn't confirm it...
+	fSTT.sendFinal("ह")
+	time.Sleep(20 * time.Millisecond)
+	assert.False(t, fTTS.wasCancelled())
+
+	// ...one after it does: all the cuts.
+	time.Sleep(50 * time.Millisecond)
+	fSTT.sendFinal("hold on")
+	require.Eventually(t, fTTS.wasCancelled, time.Second, time.Millisecond, "cut #2: TTS must be cancelled")
+	assert.False(t, h.paused.Load())
+}
+
+// TestHandler_FalseInterruptionResumesTheReply: a pause no transcript
+// confirms (noise, echo) ends after falseInterruptionTimeout of quiet, and
+// the reply plays on from where it stopped -- nothing cut, nothing lost.
+func TestHandler_FalseInterruptionResumesTheReply(t *testing.T) {
+	fSTT := newFakeSTT()
+	fTTS := newFakeTTS()
+	fLLM := &fakeLLM{tokens: []string{"A reply."}}
+
+	h := NewHandler(context.Background(), "call1", testConfig(fSTT, fTTS, fLLM, 0, 0))
+
+	fSTT.sendFinal("hi")
+	require.Eventually(t, func() bool { return fTTS.spokenCount() == 1 }, time.Second, time.Millisecond)
+
+	fTTS.audio <- tts.Chunk{PCM: multiFrame(10, quietAmplitude), Gen: 1, Req: 1, Text: "A reply."}
+	require.Eventually(t, func() bool { return h.State() == StateSpeaking && len(h.outbound) == 10 }, time.Second, time.Millisecond)
+
+	for i := 0; i < 3; i++ {
+		h.ProcessFrame(context.Background(), "call1", constFrame(loudAmplitude))
+	}
+
+	require.True(t, h.paused.Load())
+	queued := len(h.outbound)
+
+	require.Eventually(t, func() bool { return !h.paused.Load() }, falseInterruptionTimeout+time.Second, 10*time.Millisecond)
+	assert.False(t, fTTS.wasCancelled(), "a false interruption cuts nothing")
+	assert.Equal(t, queued, len(h.outbound), "the rest of the reply is still queued")
+	assert.NotNil(t, h.ProcessFrame(context.Background(), "call1", constFrame(quietAmplitude)), "and plays on")
+
+	fTTS.done <- 1
+	drainUntilListening(t, h)
+	assert.Equal(t, 1, fLLM.streamCalls())
+}
+
+// TestHandler_BargeInNeedsSustainedSpeech: speech shorter than
+// BargeInMinSpeech, or broken up, never interrupts.
+func TestHandler_BargeInNeedsSustainedSpeech(t *testing.T) {
+	fSTT := newFakeSTT()
+	fTTS := newFakeTTS()
+
+	cfg := testConfig(fSTT, fTTS, &fakeLLM{tokens: []string{"A reply."}}, 0, 0)
+	cfg.BargeInMinSpeech = 200 * time.Millisecond
+	h := NewHandler(context.Background(), "call1", cfg)
+
+	fSTT.sendFinal("hi")
+	require.Eventually(t, func() bool { return fTTS.spokenCount() == 1 }, time.Second, time.Millisecond)
+	fTTS.audio <- tts.Chunk{PCM: multiFrame(50, quietAmplitude), Gen: 1, Req: 1, Text: "A reply."}
+	require.Eventually(t, func() bool { return h.State() == StateSpeaking }, time.Second, time.Millisecond)
+
+	loud := func() { h.ProcessFrame(context.Background(), "call1", constFrame(loudAmplitude)) }
+
+	for i := 0; i < 5; i++ {
+		loud()
+	}
+
+	assert.False(t, h.paused.Load(), "a short burst is not an interruption")
+
+	time.Sleep(150 * time.Millisecond)
+	for i := 0; i < 5; i++ { // a quiet gap resets the run
+		h.ProcessFrame(context.Background(), "call1", constFrame(quietAmplitude))
+	}
+
+	loud()
+	loud()
+	loud()
+	time.Sleep(40 * time.Millisecond)
+	loud()
+	assert.False(t, h.paused.Load(), "the run restarted after the gap, so it's not long enough yet")
+
+	time.Sleep(200 * time.Millisecond)
+	loud()
+	assert.True(t, h.paused.Load(), "200ms of unbroken speech interrupts")
+}
+
+// TestHandler_EndNodeAndClosingCallCantBeInterrupted: like Dograh, once the
+// call is ending (end node, end_call, ending) the caller is muted, whatever
+// a stored allow_interrupt says.
+func TestHandler_EndNodeAndClosingCallCantBeInterrupted(t *testing.T) {
+	h := &Handler{cfg: Config{}}
+	h.node.Store(&Node{AllowInterrupt: true})
+	assert.True(t, h.interruptible())
+
+	h.node.Store(&Node{AllowInterrupt: true, End: true})
+	assert.False(t, h.interruptible(), "an end node never")
+
+	h.node.Store(&Node{AllowInterrupt: true})
+	h.closing.Store(true)
+	assert.False(t, h.interruptible(), "nor a closing call")
+
+	h.closing.Store(false)
+	h.cfg.BargeInObserveOnly = true
+	assert.False(t, h.interruptible(), "nor with BARGE_IN_ENABLED=0")
+}
+
+func TestRecordReplySpacesSeparatelySpokenPieces(t *testing.T) {
+	h := &Handler{callID: "call1"}
+	h.turnChunks = []spokenChunk{
+		{req: 1, text: "चलिए मुख्य विषय पर बात करते हैं।"}, // transition speech
+		{req: 2, text: "धन्यवाद।"},                         // the LLM's reply
+		{req: 3, text: " Next one."},                       // LLM chunk with its own space
+	}
+
+	h.recordReply(false)
+	assert.Equal(t, "चलिए मुख्य विषय पर बात करते हैं। धन्यवाद। Next one.", h.history[0].Content)
 }
 
 func TestHandler_BargeInRespectsGuardWindow(t *testing.T) {

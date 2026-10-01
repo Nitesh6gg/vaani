@@ -101,6 +101,8 @@ func TestLoad_BargeIn_Defaults(t *testing.T) {
 	assert.True(t, cfg.BargeInEnabled)
 	assert.Equal(t, 500.0, cfg.BargeInRMSFloor)
 	assert.Equal(t, 300*time.Millisecond, cfg.BargeInGuard)
+	assert.Equal(t, 200*time.Millisecond, cfg.BargeInMinSpeech)
+	assert.Equal(t, 0.7, cfg.TenVadThreshold)
 	assert.Equal(t, 1200*time.Millisecond, cfg.PostCutSilence)
 }
 
@@ -111,6 +113,7 @@ func TestLoad_BargeIn_ReadsFromEnv(t *testing.T) {
 	t.Setenv("BARGE_IN_ENABLED", "0")
 	t.Setenv("BARGE_IN_RMS_FLOOR", "750.5")
 	t.Setenv("BARGE_IN_GUARD_MS", "150")
+	t.Setenv("BARGE_IN_MIN_SPEECH_MS", "400")
 	t.Setenv("POST_CUT_SILENCE_MS", "400")
 
 	cfg, err := Load()
@@ -119,6 +122,7 @@ func TestLoad_BargeIn_ReadsFromEnv(t *testing.T) {
 	assert.False(t, cfg.BargeInEnabled)
 	assert.Equal(t, 750.5, cfg.BargeInRMSFloor)
 	assert.Equal(t, 150*time.Millisecond, cfg.BargeInGuard)
+	assert.Equal(t, 400*time.Millisecond, cfg.BargeInMinSpeech)
 	assert.Equal(t, 400*time.Millisecond, cfg.PostCutSilence)
 }
 

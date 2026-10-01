@@ -113,10 +113,26 @@ startup -- changing any of them requires a restart.
 |---|---|
 | `BARGE_IN_ENABLED` | Master switch. `1` (default) = interruption on, **at workflow nodes whose `allow_interrupt` is on in Dograh** (see below). `0` = never cut, whatever the nodes say, two flavors: with `VAD_MODE=ten` the VAD still runs in observe-only mode and keeps logging `speech started`/`speech ended`; with `VAD_MODE=energy` barge-in is fully off (no-op detector). |
 | `VAD_MODE` | `energy` (default): RMS-threshold detector, no native dependency. `ten`: TEN VAD, a real neural VAD that tells speech from coughs/music/line noise (native library vendored under `third_party/ten-vad`; Linux/cgo only -- elsewhere, or if the library can't load, calls fall back to `energy` with a loud warning). |
-| `TEN_VAD_THRESHOLD` | TEN VAD speech-probability threshold in [0,1], default 0.5. Only used when `VAD_MODE=ten`. |
+| `TEN_VAD_THRESHOLD` | TEN VAD speech-probability threshold in [0,1], default 0.7 -- the confidence Dograh's VAD runs with (TEN VAD's own example uses 0.5). Only used when `VAD_MODE=ten`. |
 | `BARGE_IN_RMS_FLOOR` | Energy detector's RMS speech threshold. Only used when `VAD_MODE=energy`. |
 | `BARGE_IN_GUARD_MS` | Ignores detection this long after playback starts, so the agent's own voice leaking into the mic can't immediately self-trigger. Default 300. |
-| `POST_CUT_SILENCE_MS` | After a cut, how long before a new turn is accepted: the cut flushes a junk partial-utterance transcript to STT ~0.5-1.5s later, and this gate drops exactly those while still catching the caller's real next utterance. Default 1200. |
+| `BARGE_IN_MIN_SPEECH_MS` | How long the detector must report speech without a break before it counts as an interruption. Default 200, matching Dograh. Before this setting existed, about 50ms was enough (3 of 5 TEN VAD readings of 16ms each), and noise cut 6 of 7 replies in one live call. |
+| `POST_CUT_SILENCE_MS` | After an interruption pauses the reply, how long transcripts are ignored: the pause flushes the preroll to STT, which tends to produce a junk partial-utterance transcript ~0.5-1.5s later (commit `249a6c4`). A transcript inside this gate neither confirms the interruption nor starts a turn (`transcript ignored: too soon after an interruption`). Default 1200. |
+
+**How Dograh does it, for comparison.** Dograh's live VAD is Silero with
+pipecat's defaults: confidence 0.7, speech must last 0.2s to count as started
+(that's what interrupts the bot), 0.2s of silence to count as stopped, and a
+minimum volume of 0.6 (`run_pipeline.py`:
+`SileroVADAnalyzer(params=VADParams(stop_secs=0.2))`; defaults in
+`pipecat/audio/vad/vad_analyzer.py`). The VAD settings on a workflow's
+Settings page (`vad_configuration`: confidence, start and stop seconds,
+minimum volume) are stored, but in this version of Dograh
+nothing applies them: the transport setup functions accept the value and
+never use it. Vaani matches the live confidence (`TEN_VAD_THRESHOLD`) and
+start time (`BARGE_IN_MIN_SPEECH_MS`). It has no equivalent of the minimum
+volume, because pipecat's volume scale doesn't map directly onto Vaani's
+audio. TEN VAD's and Silero's probabilities aren't directly comparable
+either, so the same 0.7 may behave differently.
 
 **Per node (Dograh's `allow_interrupt`).** Even with `BARGE_IN_ENABLED=1`, the
 caller can only cut in while the agent speaks at a workflow node whose
@@ -133,16 +149,39 @@ which applies: `node transition ... allow_interrupt=true interrupt=on`
 and `start_allow_interrupt`/`start_interrupt` on `agent workflow loaded` for
 the start node.
 
-While the agent is speaking, the active detector logs `speech started` /
-`speech ended` transitions (one per utterance boundary; per-hop verdicts are
-never logged), and a sustained interrupt at an interruptible node fires
-`agent barge-in detected`, which cuts playback, cancels the in-flight LLM
-stream and TTS connection, and flushes queued audio -- after which the
-caller's utterance becomes the next turn. With `VAD_MODE=ten` the detector
+**Once the call is ending, nothing interrupts it**, as in Dograh (whose
+`end_call_with_reason` mutes the caller): at an End node -- whose editor has
+no interruption setting, so an `allow_interrupt` stored on it is ignored and
+the log shows `interrupt=off` -- after the `end_call` tool, and once Vaani is
+ending the call itself (caller silent twice, maximum call length). The
+goodbye always plays and the call always hangs up. A transcript that arrives
+while a reply is paused but the call is ending is ignored
+(`transcript ignored: the call is ending`) and the goodbye resumes.
+
+**Pause first, then cut or resume.** While the agent is speaking, the active
+detector logs `speech started` / `speech ended` transitions (one per
+utterance boundary; per-hop verdicts are never logged). Sustained speech at
+an interruptible node first **pauses** the reply (`agent barge-in detected;
+pausing the reply`): nothing plays, the caller's audio goes to STT, and the
+reply keeps generating and queueing. Then one of two things happens:
+
+- **Confirmed:** a transcript arrives (after the `POST_CUT_SILENCE_MS` gate).
+  The reply is cut -- LLM stream and TTS connection cancelled, queued audio
+  dropped, only the part the caller heard recorded -- and the transcript
+  becomes the next turn (`agent barge-in confirmed; reply cut`).
+- **False alarm:** no transcript, and the caller has been quiet for 2s (by
+  TEN VAD's last speech, Sarvam's `END_SPEECH`, and Sarvam not reporting
+  them mid-utterance). The reply resumes from exactly where it stopped
+  (`false interruption; resuming the reply`); nothing was cut, so nothing
+  is lost or re-generated. The wait is capped at 10s, so a stuck signal
+  can't leave the call silent.
+
+With `VAD_MODE=ten` the detector
 also runs while the agent is listening (for the latency fields below), so
 `speech started`/`speech ended` lines appear between replies too; that
-listening-time verdict never cuts anything. Turning `BARGE_IN_ENABLED` to
-`0` stops all cutting; with `VAD_MODE=energy` it also silences the logging.
+listening-time verdict never interrupts anything. Turning `BARGE_IN_ENABLED`
+to `0` stops all interruptions (no pause, no cut); with `VAD_MODE=energy` it
+also silences the logging.
 
 ## Turn latency in the logs
 

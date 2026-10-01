@@ -75,13 +75,17 @@ Speaking: TTS PCM re-framed to 640B frames -> played out at 20ms/tick
 
 Barge-in while speaking: a per-call VAD -- TEN VAD (`VAD_MODE=ten`, vendored
 under `third_party/ten-vad/`, `internal/ai/agent/tenvad`) or an RMS energy
-gate -- watches the inbound audio; a sustained speech verdict cuts the turn
-(LLM stream and TTS connection cancelled, queue drained) and the caller's
-utterance becomes the next turn -- only at workflow nodes whose Dograh
-`allow_interrupt` is on; elsewhere the caller is ignored until the agent
-finishes. `BARGE_IN_ENABLED=0` puts the detector in observe-only mode:
-transitions keep logging, nothing is ever cut. Full knob table and the
-per-node rule in `docs/AI_PROVIDERS.md`; state machine in
+gate -- watches the inbound audio. At workflow nodes whose Dograh
+`allow_interrupt` is on (elsewhere, and once the call is ending, the caller
+is ignored until the agent finishes), unbroken speech for
+`BARGE_IN_MIN_SPEECH_MS` first **pauses** the reply: nothing plays and the
+caller's audio goes to STT. A transcript confirms the interruption and the
+turn is cut (LLM stream and TTS connection cancelled, queue drained), with
+the caller's utterance as the next turn; no transcript and 2s of quiet means
+it was noise, and the reply resumes where it stopped.
+`BARGE_IN_ENABLED=0` puts the detector in observe-only mode: transitions keep
+logging, nothing is ever interrupted. Full knob table and the rules in
+"Barge-in configuration" in `docs/AI_PROVIDERS.md`; state machine in
 `internal/ai/agent/handler.go`.
 
 History: the conversation the LLM sees records only what the caller actually
@@ -152,10 +156,14 @@ greeting -- are logged as `agent: workflow: ...` warnings and skipped.
   nobody has spoken yet, that request repeats the prompt as the only user
   message, as pipecat's Google service does for a system-only context.
 - **End node:** the reply generated there is the closing line; the call
-  hangs up once it has played (`agent ending call reason=end_call`).
+  hangs up once it has played (`agent ending call reason=end_call`). It
+  can't be interrupted -- Dograh mutes the caller once the call is ending,
+  and its End Call node has no interruption setting -- so the hangup always
+  happens.
 - **Interruption:** each node's `allow_interrupt` (absent = off, Dograh's
-  default) decides whether the caller can cut in while the agent speaks
-  there -- see "Barge-in configuration" in `docs/AI_PROVIDERS.md`. Each
+  default; ignored on an End node) decides whether the caller can cut in
+  while the agent speaks there -- see "Barge-in configuration" in
+  `docs/AI_PROVIDERS.md`. Each
   `node transition` line shows the new node's setting and the effective
   result with the `BARGE_IN_ENABLED` master switch applied
   (`allow_interrupt=true interrupt=on`); `agent workflow loaded` shows the
@@ -173,7 +181,8 @@ become one `_`, trimmed ("Transfer Call to Support Team" ->
 result the LLM can react to.
 
 - **`end_call`:** the LLM is not asked again, and the call hangs up once
-  everything said so far has played. With `endCallReason` on, the LLM must
+  everything said so far has played; from the moment the tool runs the
+  caller can't interrupt, as in Dograh. With `endCallReason` on, the LLM must
   pass a `reason` (described by `endCallReasonDescription`), which is logged
   (`end call requested`).
 - **`transfer_call`:** dials `destination` (an Asterisk dial string, e.g.

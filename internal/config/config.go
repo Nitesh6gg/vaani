@@ -117,6 +117,11 @@ type Config struct {
 	// starts speaking, so its own voice leaking into the mic can't immediately
 	// self-trigger. See internal/ai/agent.Config.BargeInGuard.
 	BargeInGuard time.Duration
+	// BargeInMinSpeech is how long the caller must keep speaking, without a
+	// break, before it counts as an interruption (BARGE_IN_MIN_SPEECH_MS,
+	// default 200 -- Dograh's live setting, pipecat's VAD start_secs 0.2).
+	// See internal/ai/agent.Config.BargeInMinSpeech.
+	BargeInMinSpeech time.Duration
 	// PostCutSilence is how long a barge-in cut requires quiet before a new
 	// turn is accepted. See internal/ai/agent.Config.PostCutSilence.
 	PostCutSilence time.Duration
@@ -128,8 +133,9 @@ type Config struct {
 	// setup, never breaks the call.
 	VadMode string
 	// TenVadThreshold is TEN VAD's speech-probability threshold in [0,1];
-	// the native binary decision is probability >= threshold. 0.5 is the
-	// official example's value. Only meaningful when VadMode is "ten".
+	// the native binary decision is probability >= threshold. Default 0.7,
+	// the confidence Dograh's VAD runs with (pipecat's VADParams default);
+	// TEN VAD's own example uses 0.5. Only meaningful when VadMode is "ten".
 	TenVadThreshold float64
 }
 
@@ -245,7 +251,7 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("config: VAD_MODE must be \"energy\" or \"ten\", got %q", cfg.VadMode)
 	}
 
-	if cfg.TenVadThreshold, err = getEnvFloat("TEN_VAD_THRESHOLD", 0.5); err != nil {
+	if cfg.TenVadThreshold, err = getEnvFloat("TEN_VAD_THRESHOLD", 0.7); err != nil {
 		return Config{}, err
 	}
 
@@ -263,6 +269,17 @@ func Load() (Config, error) {
 	}
 
 	cfg.BargeInGuard = time.Duration(bargeInGuardMS) * time.Millisecond
+
+	bargeInMinSpeechMS, err := getEnvInt("BARGE_IN_MIN_SPEECH_MS", 200)
+	if err != nil {
+		return Config{}, err
+	}
+
+	if bargeInMinSpeechMS < 0 {
+		return Config{}, fmt.Errorf("config: BARGE_IN_MIN_SPEECH_MS must be >= 0, got %d", bargeInMinSpeechMS)
+	}
+
+	cfg.BargeInMinSpeech = time.Duration(bargeInMinSpeechMS) * time.Millisecond
 
 	// 1200ms: after a barge-in cut, the STT flushes the ~200ms preroll as a
 	// junk partial-utterance final (observed live: 1-2 character fragments in

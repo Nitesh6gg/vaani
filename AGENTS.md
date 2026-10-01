@@ -50,7 +50,12 @@ Real-time voice agent: Asterisk ARI (telephony) + Go media plane + Sarvam STT/TT
    and emits silence per invariant #1/#9 — "pacer stop" is implemented as *stop
    feeding the outbound queue*, i.e. the queue drain + playback state flip in
    `internal/ai/agent/handler.go`, together with STT/LLM context cancellation,
-   TTS connection teardown, and `ttsBuf` clearing.
+   TTS connection teardown, and `ttsBuf` clearing. The cuts run only once an
+   interruption is **confirmed**: a detected one first *pauses* playback (no
+   frames popped, STT fed, LLM/TTS keep queueing); a transcript confirms it and
+   triggers all five cuts, while no transcript and 2s of quiet resumes the
+   reply as a false interruption. A pause is not a cut — don't cancel anything
+   before confirmation.
 8. **Audio format**: slin16 (16kHz 16-bit mono PCM) end-to-end. Asterisk handles μ-law transcoding.
 9. **One media socket per call**, bound to a port from the managed pool (never shared
    across calls), and bound/listening *before* the externalMedia channel is created —

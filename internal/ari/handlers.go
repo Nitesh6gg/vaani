@@ -652,6 +652,7 @@ func (m *Manager) newAgentHandler(c *call) media.Handler {
 		BargeIn:            bargeIn,
 		BargeInObserveOnly: !m.cfg.BargeInEnabled,
 		BargeInGuard:       m.cfg.BargeInGuard,
+		BargeInMinSpeech:   m.cfg.BargeInMinSpeech,
 		PostCutSilence:     m.cfg.PostCutSilence,
 		Sink:               metrics.AgentSink{},
 	})
