@@ -579,20 +579,31 @@ func TestHandler_FalseInterruptionResumesTheReply(t *testing.T) {
 	fSTT.sendFinal("hi")
 	require.Eventually(t, func() bool { return fTTS.spokenCount() == 1 }, time.Second, time.Millisecond)
 
-	fTTS.audio <- tts.Chunk{PCM: multiFrame(10, quietAmplitude), Gen: 1, Req: 1, Text: "A reply."}
-	require.Eventually(t, func() bool { return h.State() == StateSpeaking && len(h.outbound) == 10 }, time.Second, time.Millisecond)
-
-	for i := 0; i < 3; i++ {
-		h.ProcessFrame(context.Background(), "call1", constFrame(loudAmplitude))
+	// Ten frames, each with its own amplitude (101..110), so the order they
+	// play in is visible.
+	var pcm []byte
+	for amp := int16(101); amp <= 110; amp++ {
+		pcm = append(pcm, constFrame(amp)...)
 	}
 
+	fTTS.audio <- tts.Chunk{PCM: pcm, Gen: 1, Req: 1, Text: "A reply."}
+	require.Eventually(t, func() bool { return h.State() == StateSpeaking && len(h.outbound) == 10 }, time.Second, time.Millisecond)
+
+	play := func(in []byte) int16 { return firstSample(t, h.ProcessFrame(context.Background(), "call1", in)) }
+
+	// The caller's (loud) audio plays frames 101 and 102; the third tick pauses.
+	assert.Equal(t, int16(101), play(constFrame(loudAmplitude)))
+	assert.Equal(t, int16(102), play(constFrame(loudAmplitude)))
+	h.ProcessFrame(context.Background(), "call1", constFrame(loudAmplitude))
 	require.True(t, h.paused.Load())
-	queued := len(h.outbound)
 
 	require.Eventually(t, func() bool { return !h.paused.Load() }, falseInterruptionTimeout+time.Second, 10*time.Millisecond)
 	assert.False(t, fTTS.wasCancelled(), "a false interruption cuts nothing")
-	assert.Equal(t, queued, len(h.outbound), "the rest of the reply is still queued")
-	assert.NotNil(t, h.ProcessFrame(context.Background(), "call1", constFrame(quietAmplitude)), "and plays on")
+
+	// Resumes from the start of the interrupted sentence, then carries on.
+	for _, want := range []int16{101, 102, 103, 104} {
+		assert.Equal(t, want, play(constFrame(quietAmplitude)))
+	}
 
 	fTTS.done <- 1
 	drainUntilListening(t, h)
@@ -659,16 +670,43 @@ func TestHandler_EndNodeAndClosingCallCantBeInterrupted(t *testing.T) {
 	assert.False(t, h.interruptible(), "nor with BARGE_IN_ENABLED=0")
 }
 
-func TestRecordReplySpacesSeparatelySpokenPieces(t *testing.T) {
+// TestRecordReplyJoinsChunksAsSpoken: pieces spoken on their own are sent
+// with a trailing space so they don't run into the reply, and chunks are
+// joined exactly as spoken -- never with an added space, which split a word
+// in two ("बिजल ी") when a chunk ended mid-word.
+func TestRecordReplyJoinsChunksAsSpoken(t *testing.T) {
 	h := &Handler{callID: "call1"}
 	h.turnChunks = []spokenChunk{
-		{req: 1, text: "चलिए मुख्य विषय पर बात करते हैं।"}, // transition speech
-		{req: 2, text: "धन्यवाद।"},                         // the LLM's reply
-		{req: 3, text: " Next one."},                       // LLM chunk with its own space
+		{req: 1, text: "चलिए मुख्य विषय पर बात करते हैं। "}, // transition speech, as takeEdge sends it
+		{req: 2, text: "सड़क और बिजल"},                      // a chunk cut mid-word...
+		{req: 3, text: "ी, या कानून व्यवस्था?"},             // ...and the rest of it
+		{req: 4, text: " Next one."}, // LLM chunk with its own space
 	}
 
 	h.recordReply(false)
-	assert.Equal(t, "चलिए मुख्य विषय पर बात करते हैं। धन्यवाद। Next one.", h.history[0].Content)
+	assert.Equal(t, "चलिए मुख्य विषय पर बात करते हैं। सड़क और बिजली, या कानून व्यवस्था? Next one.", h.history[0].Content)
+}
+
+func TestHandler_SeparatelySpokenPiecesEndWithASpace(t *testing.T) {
+	fSTT := newFakeSTT()
+	fTTS := newFakeTTS()
+
+	main := &Node{Name: "Main"}
+	start := &Node{Name: "Start", Edges: []Edge{
+		{Def: llm.FunctionDef{Name: "go"}, Speech: "चलिए आगे बढ़ते हैं।", To: main},
+	}}
+	fLLM := &fakeLLM{rounds: []fakeRound{
+		{toolCalls: []llm.ToolCall{{ID: "e", Type: "function", Function: llm.FunctionCall{Name: "go", Arguments: "{}"}}}},
+		{tokens: []string{"धन्यवाद।"}},
+	}}
+
+	cfg := testConfig(fSTT, fTTS, fLLM, 0, 0)
+	cfg.Start = start
+	NewHandler(context.Background(), "call1", cfg)
+
+	fSTT.sendFinal("हाँ")
+	require.Eventually(t, func() bool { return fTTS.spokenCount() == 2 }, time.Second, time.Millisecond)
+	assert.Equal(t, []string{"चलिए आगे बढ़ते हैं। ", "धन्यवाद।"}, fTTS.spoken)
 }
 
 func TestHandler_BargeInRespectsGuardWindow(t *testing.T) {
@@ -1440,4 +1478,82 @@ func TestHandler_LogsCallerLastSoundAndConversation(t *testing.T) {
 	assert.Contains(t, log, `[User] call_id=call1 text=first`)
 	assert.Contains(t, log, `[Agent] call_id=call1 gen=1 text=Okay. cut=false`)
 	assert.NotContains(t, log, "agent reply recorded")
+}
+
+func TestJunkTranscript(t *testing.T) {
+	cases := map[string]bool{
+		"ह":     true, // a lone letter: what noise transcribes to
+		"म।":    true, // plus punctuation
+		"।":     true, // punctuation only
+		"":      true,
+		"जी":    false, // letter + vowel sign: a real answer
+		"ना।":   false,
+		"हाँ।":  false,
+		"5":     false, // a digit answer
+		"no":    false,
+		"बेनी।": false, // live: a real short answer the old 1.2s gate threw away
+	}
+
+	for text, want := range cases {
+		assert.Equal(t, want, junkTranscript(text), "%q", text)
+	}
+}
+
+// TestHandler_PausedJunkDoesNotConfirmButAShortAnswerDoes: during a pause a
+// lone-letter transcript is noise and leaves the pause in place; a real
+// one-word answer like "जी" confirms the interruption.
+func TestHandler_PausedJunkDoesNotConfirmButAShortAnswerDoes(t *testing.T) {
+	fSTT := newFakeSTT()
+	fTTS := newFakeTTS()
+	fLLM := &fakeLLM{tokens: []string{"A long question."}}
+
+	h := NewHandler(context.Background(), "call1", testConfig(fSTT, fTTS, fLLM, 0, 0))
+
+	fSTT.sendFinal("hi")
+	require.Eventually(t, func() bool { return fTTS.spokenCount() == 1 }, time.Second, time.Millisecond)
+	fTTS.audio <- tts.Chunk{PCM: multiFrame(20, quietAmplitude), Gen: 1, Req: 1, Text: "A long question."}
+	require.Eventually(t, func() bool { return h.State() == StateSpeaking }, time.Second, time.Millisecond)
+
+	for i := 0; i < 3; i++ {
+		h.ProcessFrame(context.Background(), "call1", constFrame(loudAmplitude))
+	}
+
+	require.True(t, h.paused.Load())
+
+	fSTT.sendFinal("म")
+	time.Sleep(30 * time.Millisecond)
+	assert.True(t, h.paused.Load(), "junk leaves the pause in place")
+	assert.False(t, fTTS.wasCancelled())
+
+	fSTT.sendFinal("जी")
+	require.Eventually(t, fTTS.wasCancelled, time.Second, time.Millisecond, "a real short answer confirms")
+	require.Eventually(t, func() bool { return fLLM.streamCalls() == 2 }, time.Second, time.Millisecond)
+	assert.Equal(t, llm.Message{Role: "user", Content: "जी"}, lastMessage(fLLM.seen[1]))
+}
+
+// TestHandler_ReplyHeardWhenTheCallEndsIsLogged: the caller hanging up
+// mid-reply still leaves an [Agent] line with what they heard.
+func TestHandler_ReplyHeardWhenTheCallEndsIsLogged(t *testing.T) {
+	getLog := captureSlog(t)
+
+	fSTT := newFakeSTT()
+	fTTS := newFakeTTS()
+
+	ctx, hangUp := context.WithCancel(context.Background())
+	defer hangUp()
+
+	h := NewHandler(ctx, "call1", testConfig(fSTT, fTTS, &fakeLLM{tokens: []string{"Goodbye now.", " Take care."}}, 0, 0))
+
+	fSTT.sendFinal("bye")
+	require.Eventually(t, func() bool { return fTTS.spokenCount() == 2 }, time.Second, time.Millisecond)
+	fTTS.audio <- tts.Chunk{PCM: multiFrame(3, quietAmplitude), Gen: 1, Req: 1, Text: "Goodbye now."}
+	fTTS.audio <- tts.Chunk{PCM: multiFrame(3, quietAmplitude), Gen: 1, Req: 2, Text: " Take care."}
+	require.Eventually(t, func() bool { return len(h.outbound) == 6 }, time.Second, time.Millisecond)
+
+	h.ProcessFrame(context.Background(), "call1", constFrame(quietAmplitude)) // the first sentence starts playing
+	hangUp()
+
+	require.Eventually(t, func() bool {
+		return strings.Contains(getLog().String(), `[Agent] call_id=call1 gen=1 text="Goodbye now." cut=true`)
+	}, time.Second, time.Millisecond)
 }

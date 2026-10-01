@@ -79,10 +79,11 @@ gate -- watches the inbound audio. At workflow nodes whose Dograh
 `allow_interrupt` is on (elsewhere, and once the call is ending, the caller
 is ignored until the agent finishes), unbroken speech for
 `BARGE_IN_MIN_SPEECH_MS` first **pauses** the reply: nothing plays and the
-caller's audio goes to STT. A transcript confirms the interruption and the
-turn is cut (LLM stream and TTS connection cancelled, queue drained), with
-the caller's utterance as the next turn; no transcript and 2s of quiet means
-it was noise, and the reply resumes where it stopped.
+caller's audio goes to STT. A transcript (other than junk like a lone
+letter) confirms the interruption and the turn is cut (LLM stream and TTS
+connection cancelled, queue drained), with the caller's utterance as the
+next turn; no transcript and 2s of quiet means it was noise, and the reply
+resumes from the start of the sentence it was paused in.
 `BARGE_IN_ENABLED=0` puts the detector in observe-only mode: transitions keep
 logging, nothing is ever interrupted. Full knob table and the rules in
 "Barge-in configuration" in `docs/AI_PROVIDERS.md`; state machine in
@@ -97,7 +98,9 @@ Conversation in the logs: each accepted caller transcript is logged as
 `[User] call_id=... text="..."`, and each agent reply -- exactly the part the
 caller heard, greeting, transition speech and tool messages included -- as
 `[Agent] call_id=... gen=N text="..." cut=false|true` once it has finished
-playing or been cut, so the two read in conversation order.
+playing or been cut, so the two read in conversation order. If the call ends
+during a reply (usually the caller hanging up), what they heard of it is
+logged with `cut=true` as the call closes.
 
 ### Configured in Dograh
 

@@ -9,7 +9,6 @@ import (
 	"sync/atomic"
 	"time"
 	"unicode"
-	"unicode/utf8"
 
 	"github.com/nitesh/vaani/internal/ai/llm"
 	"github.com/nitesh/vaani/internal/ai/stt"
@@ -85,7 +84,11 @@ type llmStreamer interface {
 // the call site (same pattern as media.Sink) so this package stays free of a
 // prometheus dependency.
 type Sink interface {
-	BargeIn()
+	BargeIn() // an interruption confirmed: the reply was cut
+	// InterruptionPaused: a possible interruption paused the reply;
+	// FalseInterruption: one ended with no transcript and the reply resumed.
+	InterruptionPaused()
+	FalseInterruption()
 	TurnStarted()
 	PrerollFlushed(frames int)
 	Error(stage string)
@@ -94,10 +97,12 @@ type Sink interface {
 // NoopSink discards every event; useful for tests and as a safe default.
 type NoopSink struct{}
 
-func (NoopSink) BargeIn()           {}
-func (NoopSink) TurnStarted()       {}
-func (NoopSink) PrerollFlushed(int) {}
-func (NoopSink) Error(string)       {}
+func (NoopSink) BargeIn()            {}
+func (NoopSink) InterruptionPaused() {}
+func (NoopSink) FalseInterruption()  {}
+func (NoopSink) TurnStarted()        {}
+func (NoopSink) PrerollFlushed(int)  {}
+func (NoopSink) Error(string)        {}
 
 // Config bundles one call's agent dependencies.
 type Config struct {
@@ -157,10 +162,10 @@ type Config struct {
 	// (pipecat start_secs). Without it, a ~50ms burst (3 of 5 16ms TEN VAD
 	// hops) was enough: observed live, noise cut 6 of 7 replies in one call.
 	BargeInMinSpeech time.Duration
-	// PostCutSilence is how long a barge-in cut requires quiet before a new
-	// final transcript is accepted -- otherwise the tail of the interrupting
-	// utterance the STT was already mid-transcribing when it flushed could
-	// double-fire a turn.
+	// PostCutSilence: transcripts arriving this soon after an interruption
+	// pauses the reply are ignored -- they were already on their way, not
+	// what the caller is saying now. Junk later on is caught by content
+	// (junkTranscript), not time.
 	PostCutSilence time.Duration
 
 	Sink Sink
@@ -188,6 +193,7 @@ type ttsAudioEvent struct {
 type outFrame struct {
 	pcm []byte
 	req uint64
+	gen uint64 // with req, identifies the sentence (req numbering restarts with a new TTS connection)
 }
 
 // spokenChunk is one sentence of the current reply whose audio has started
@@ -258,6 +264,9 @@ type Handler struct {
 	// the reply is cut; quiet without one means it was noise and the reply
 	// resumes where it stopped (see handleBargeIn / handleResumeCheck).
 	paused atomic.Bool
+	// replayPending is set by run() when it resumes a paused reply, telling
+	// ProcessFrame to restart the interrupted sentence (see sentFrames).
+	replayPending atomic.Bool
 	// closing is set once the call is ending -- an end node reached, the
 	// end_call tool run, or Handler.ending -- after which the caller can no
 	// longer interrupt, as in Dograh (end_call_with_reason mutes the user).
@@ -373,6 +382,15 @@ type Handler struct {
 	// speechRunStart is when the detector's current unbroken run of speech
 	// began during Speaking (zero: none) -- see Config.BargeInMinSpeech.
 	speechRunStart time.Time
+	// sentGen/sentReq identify the sentence being played and sentFrames the
+	// frames of it already played (references, not copies: each frame is
+	// its own allocation and never reused). After a false interruption the
+	// reply resumes from the start of that sentence -- replaying from
+	// replayIdx while replaying -- instead of mid-word.
+	sentGen, sentReq uint64
+	sentFrames       [][]byte
+	replaying        bool
+	replayIdx        int
 	// emptyTicks counts consecutive Speaking-state release ticks that found
 	// the outbound queue empty without ttsDeliveryDone set -- the drain
 	// dead-call safeguard in processSpeakingFrame. A counter, not a stored
@@ -514,6 +532,7 @@ func (h *Handler) processSpeakingFrame(pcm []byte) [][]byte {
 		// tends to produce 0.5-1.5s later (commit 249a6c4) -- a transcript
 		// inside that gate neither confirms the interruption nor starts a turn.
 		h.paused.Store(true)
+		h.cfg.Sink.InterruptionPaused()
 		h.flushPrerollToSTT()
 		h.cfg.BargeIn.Reset()
 		h.speechRunStart = time.Time{}
@@ -530,10 +549,35 @@ func (h *Handler) processSpeakingFrame(pcm []byte) [][]byte {
 		return nil
 	}
 
+	// Resuming after a false interruption: replay the interrupted sentence
+	// from its start before taking new frames from the queue.
+	if h.replayPending.CompareAndSwap(true, false) {
+		h.replayIdx = 0
+		h.replaying = len(h.sentFrames) > 0
+	}
+
+	if h.replaying {
+		if h.replayIdx < len(h.sentFrames) {
+			h.emptyTicks = 0
+			h.replayIdx++
+
+			return [][]byte{h.sentFrames[h.replayIdx-1]}
+		}
+
+		h.replaying = false
+	}
+
 	select {
 	case frame := <-h.outbound:
 		h.emptyTicks = 0
 		h.playingReq.Store(frame.req)
+
+		if frame.gen != h.sentGen || frame.req != h.sentReq {
+			h.sentGen, h.sentReq = frame.gen, frame.req
+			h.sentFrames = h.sentFrames[:0]
+		}
+
+		h.sentFrames = append(h.sentFrames, frame.pcm)
 
 		return [][]byte{frame.pcm}
 	default:
@@ -660,6 +704,12 @@ func (h *Handler) run() {
 		case <-h.baseCtx.Done():
 			if h.tts != nil {
 				_ = h.tts.Close()
+			}
+
+			// The call ended mid-reply (usually the caller hanging up during
+			// it): log what they heard of it, which would otherwise be lost.
+			if len(h.turnChunks) > 0 {
+				h.recordReply(true)
 			}
 
 			return
@@ -912,13 +962,22 @@ func (h *Handler) handleFinalTranscript(text string) {
 	h.speechEndAt, h.lastSoundAt = time.Time{}, time.Time{}
 
 	if time.Now().UnixNano() < h.silenceUntil.Load() {
-		// Usually the junk an interruption's preroll flush produces (commit
-		// 249a6c4). It neither confirms the interruption nor starts a turn.
+		// Arrived too soon after the pause to be what the caller is saying
+		// now -- Sarvam needs ~0.7s after they stop just to send a transcript,
+		// so this one was already on its way. It neither confirms the
+		// interruption nor starts a turn.
 		slog.Info("transcript ignored: too soon after an interruption", "call_id", h.callID, "text", text)
 		return
 	}
 
 	if h.paused.Load() {
+		if junkTranscript(text) {
+			// A lone letter is what noise transcribes to (commit 249a6c4) --
+			// not confirmation that the caller is talking.
+			slog.Info("transcript ignored: too short to be speech", "call_id", h.callID, "text", text)
+			return
+		}
+
 		if h.closing.Load() {
 			// The call started ending while paused: the caller is muted from
 			// here on, as in Dograh -- let the goodbye finish.
@@ -956,6 +1015,25 @@ func (h *Handler) handleFinalTranscript(text string) {
 	h.idleCount = 0
 	h.startTurn()
 	h.turnSpeechEndAt, h.turnLastSoundAt = speechEnd, lastSound
+}
+
+// junkTranscript: no digit and fewer than two letters/vowel signs -- a lone
+// letter like "ह" or "म", or punctuation only. Deliberately narrow: real
+// one-word answers such as "जी", "ना", "हाँ" (letter + vowel sign) or "5"
+// must still count.
+func junkTranscript(text string) bool {
+	n := 0
+
+	for _, r := range text {
+		switch {
+		case unicode.IsDigit(r):
+			return false
+		case unicode.IsLetter(r) || unicode.Is(unicode.M, r):
+			n++
+		}
+	}
+
+	return n < 2
 }
 
 // startTurn runs one LLM turn over the current history: after the caller
@@ -1153,7 +1231,9 @@ const (
 // transition result.
 func (h *Handler) takeEdge(ctx context.Context, ttsClient tts.Client, from *Node, e *Edge, gen uint64) (*Node, string) {
 	if e.Speech != "" {
-		h.sendToTTS(ctx, ttsClient, e.Speech, gen)
+		// Trailing space: a piece spoken on its own must not run into the
+		// LLM's reply in the recorded text ("...हैं।धन्यवाद।").
+		h.sendToTTS(ctx, ttsClient, e.Speech+" ", gen)
 	}
 
 	slog.Info("node transition", "call_id", h.callID, "gen", gen,
@@ -1183,7 +1263,7 @@ func (h *Handler) runTool(ctx context.Context, ttsClient tts.Client, node *Node,
 		"args", truncate(call.Function.Arguments, 200))
 
 	if t.Message != "" {
-		h.sendToTTS(ctx, ttsClient, t.Message, gen)
+		h.sendToTTS(ctx, ttsClient, t.Message+" ", gen) // trailing space: see takeEdge
 	}
 
 	h.toolRunning.Store(true)
@@ -1552,7 +1632,7 @@ func (h *Handler) handleTTSAudio(pcm []byte, gen, req uint64, text string) {
 		h.ttsBuf = h.ttsBuf[media.FrameSize:]
 
 		select {
-		case h.outbound <- outFrame{pcm: frame, req: req}:
+		case h.outbound <- outFrame{pcm: frame, req: req, gen: gen}:
 		default:
 			h.cfg.Sink.Error("tts_outbound_full")
 
@@ -1650,13 +1730,9 @@ func (h *Handler) recordReply(cut bool) {
 			break
 		}
 
-		// LLM chunks carry their own spacing; separately spoken pieces (a
-		// transition speech, a tool message) don't -- don't run them into
-		// the next sentence ("...हैं।धन्यवाद।").
-		if b.Len() > 0 && c.text != "" && !endsInSpace(b.String()) && !startsWithSpace(c.text) {
-			b.WriteByte(' ')
-		}
-
+		// Plain concatenation: LLM chunks carry their own spacing, and pieces
+		// spoken on their own (transition speech, tool messages) are sent with
+		// a trailing space. Never insert one here -- a chunk can end mid-word.
 		b.WriteString(c.text)
 	}
 
@@ -1676,16 +1752,6 @@ func (h *Handler) recordReply(cut bool) {
 	// Exactly what the caller heard of this reply (cut: only up to where it
 	// was interrupted).
 	slog.Info("[Agent]", "call_id", h.callID, "gen", h.curGen, "text", text, "cut", cut)
-}
-
-func endsInSpace(s string) bool {
-	r, _ := utf8.DecodeLastRuneInString(s)
-	return unicode.IsSpace(r)
-}
-
-func startsWithSpace(s string) bool {
-	r, _ := utf8.DecodeRuneInString(s)
-	return unicode.IsSpace(r)
 }
 
 // startTurnChunks resets reply tracking at the start of a new turn.
@@ -1775,10 +1841,22 @@ func (h *Handler) handleResumeCheck(seq uint64) {
 }
 
 // resumeReply lets the paused reply play on from where it stopped.
+// The reply restarts from the beginning of the sentence it was paused in.
 func (h *Handler) resumeReply(reason string) {
 	h.resumeSeq++ // any pending check is now stale
+	// replayPending before paused: ProcessFrame must see the replay request
+	// on its very first unpaused tick.
+	h.replayPending.Store(true)
 	h.paused.Store(false)
-	slog.Info("false interruption; resuming the reply", "call_id", h.callID, "gen", h.curGen,
+
+	msg := "false interruption; resuming the reply"
+	if reason == "no transcript" {
+		h.cfg.Sink.FalseInterruption()
+	} else {
+		msg = "resuming the reply"
+	}
+
+	slog.Info(msg, "call_id", h.callID, "gen", h.curGen,
 		"paused_ms", time.Since(h.pausedAt).Milliseconds(), "reason", reason)
 }
 

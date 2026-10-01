@@ -103,7 +103,7 @@ func TestLoad_BargeIn_Defaults(t *testing.T) {
 	assert.Equal(t, 300*time.Millisecond, cfg.BargeInGuard)
 	assert.Equal(t, 200*time.Millisecond, cfg.BargeInMinSpeech)
 	assert.Equal(t, 0.7, cfg.TenVadThreshold)
-	assert.Equal(t, 1200*time.Millisecond, cfg.PostCutSilence)
+	assert.Equal(t, 300*time.Millisecond, cfg.PostCutSilence)
 }
 
 func TestLoad_BargeIn_ReadsFromEnv(t *testing.T) {

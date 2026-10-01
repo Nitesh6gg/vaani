@@ -104,16 +104,27 @@ Status, item by item — "live" means seen working on a real call:
 - **Conversation lines** in the logs (`[User]`, `[Agent]`) — done, live
   (2026-10-01).
 - **Per-node interruption** (Dograh's `allow_interrupt`, under the
-  `BARGE_IN_ENABLED` master switch) — live on 2026-10-01, which showed it was far
-  too sensitive (about 50ms of sound cut a reply; noise cut 6 of 7 replies)
-  and that an interrupted goodbye cancelled the hangup. Fixed, unit-tested,
-  not yet tried live:
-  - `BARGE_IN_MIN_SPEECH_MS` (default 200) and `TEN_VAD_THRESHOLD` default
-    0.7, matching Dograh's live VAD;
-  - an interruption pauses the reply first; a transcript confirms the cut,
-    otherwise the reply resumes after 2s of quiet;
-  - an End node, the `end_call` tool and a call Vaani is ending can't be
-    interrupted, as in Dograh.
+  `BARGE_IN_ENABLED` master switch), in three rounds, all on 2026-10-01:
+  1. First live call: far too sensitive (about 50ms of sound cut a reply;
+     noise cut 6 of 7 replies), a false cut left 13s of dead air, and an
+     interrupted goodbye cancelled the hangup.
+  2. Fixed, then live: `BARGE_IN_MIN_SPEECH_MS` (default 200) and
+     `TEN_VAD_THRESHOLD` default 0.7, matching Dograh's live VAD; an
+     interruption pauses the reply first (a transcript confirms the cut,
+     otherwise it resumes after 2s of quiet); an End node, the `end_call`
+     tool and a call Vaani is ending can't be interrupted, as in Dograh.
+     Result: no more noise cuts, both pauses resumed, and the goodbye was
+     no longer interruptible.
+  3. That call showed four more problems -- fixed, unit-tested, **not yet
+     tried live**:
+     - the 1.2s post-pause gate threw away real short answers -- now
+       300ms, plus junk recognised by content (a lone letter);
+     - text was split into TTS requests at exactly 80 characters, mid-word
+       ("बिजल" + "ी"), heard as a broken word -- now cut only between words;
+     - a resumed reply restarted mid-word -- now from the start of the
+       interrupted sentence;
+     - the reply playing when the caller hangs up wasn't logged, and there
+       were no pause / false-interruption counters -- both added.
 
 Not done yet:
 - **Step 3b:** `http_api` custom tools (e.g. web search, with bearer

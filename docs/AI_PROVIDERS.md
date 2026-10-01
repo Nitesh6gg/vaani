@@ -104,6 +104,32 @@ logs what it resolved to, never the keys:
   writer would still play out after the caller starts talking; the outbound
   queue must be drained too.
 
+### How the LLM's text becomes audio
+
+1. **Splitting** (`internal/ai/agent/chunker.go`): the LLM's streamed text is
+   cut into pieces as it arrives. A piece ends at a sentence end (`.`, `!`,
+   `?`, `।`, `॥`, a new line; a `.` right after a digit doesn't count), or
+   once it passes 80 characters -- then at the last word break: after a
+   comma/semicolon/colon in the piece's second half if there is one, else
+   after the last space. A word is never split; only a piece with no space
+   in 160 characters is cut without one, and even then never before a vowel
+   sign or after a virama. There is no minimum length, and a comma alone
+   doesn't end a piece.
+2. **Synthesis** (`internal/ai/tts/sarvam.go`): each piece is sent as soon as
+   it's ready, as its own request on the call's one TTS connection (`text`
+   then `flush`), so Sarvam speaks each piece **on its own**. That's why a
+   word split across two pieces was heard broken in half (live, 2026-10-01:
+   "बिजल" + "ी", fixed by rule 1). A piece spoken on its own (transition
+   speech, a tool message) is sent with a trailing space so the recorded
+   reply doesn't run it into the next sentence.
+3. **Playback** (`internal/ai/agent/handler.go`): Sarvam streams audio back
+   in its own chunk sizes; it's cut into 20ms frames (640 bytes) in a queue
+   holding up to 30s, and playback starts with the first frame -- nothing
+   waits for the whole reply. One frame goes out per 20ms tick. Sarvam
+   delivers far faster than real time (`tts delivery complete` comes long
+   before the reply has played), so the queue never runs dry mid-reply; the
+   turn ends when the queue is empty and delivery is complete.
+
 ## Barge-in configuration
 
 The caller-interrupts-agent switch and its tuning knobs. All are read at
@@ -117,7 +143,7 @@ startup -- changing any of them requires a restart.
 | `BARGE_IN_RMS_FLOOR` | Energy detector's RMS speech threshold. Only used when `VAD_MODE=energy`. |
 | `BARGE_IN_GUARD_MS` | Ignores detection this long after playback starts, so the agent's own voice leaking into the mic can't immediately self-trigger. Default 300. |
 | `BARGE_IN_MIN_SPEECH_MS` | How long the detector must report speech without a break before it counts as an interruption. Default 200, matching Dograh. Before this setting existed, about 50ms was enough (3 of 5 TEN VAD readings of 16ms each), and noise cut 6 of 7 replies in one live call. |
-| `POST_CUT_SILENCE_MS` | After an interruption pauses the reply, how long transcripts are ignored: the pause flushes the preroll to STT, which tends to produce a junk partial-utterance transcript ~0.5-1.5s later (commit `249a6c4`). A transcript inside this gate neither confirms the interruption nor starts a turn (`transcript ignored: too soon after an interruption`). Default 1200. |
+| `POST_CUT_SILENCE_MS` | After an interruption pauses the reply, how long transcripts are ignored (`transcript ignored: too soon after an interruption`): one arriving that soon was already on its way, since Sarvam needs ~0.7s after the caller stops just to send a transcript. Default 300. It was 1200, to drop the junk a cut used to produce 0.5-1.5s later (commit `249a6c4`), but on 2026-10-01 that threw away callers' real short answers ("बेनी", "ते भी नहीं"), so junk is now recognised by content instead (see "Pause first" below). |
 
 **How Dograh does it, for comparison.** Dograh's live VAD is Silero with
 pipecat's defaults: confidence 0.7, speech must last 0.2s to count as started
@@ -165,16 +191,26 @@ an interruptible node first **pauses** the reply (`agent barge-in detected;
 pausing the reply`): nothing plays, the caller's audio goes to STT, and the
 reply keeps generating and queueing. Then one of two things happens:
 
-- **Confirmed:** a transcript arrives (after the `POST_CUT_SILENCE_MS` gate).
-  The reply is cut -- LLM stream and TTS connection cancelled, queued audio
-  dropped, only the part the caller heard recorded -- and the transcript
-  becomes the next turn (`agent barge-in confirmed; reply cut`).
+- **Confirmed:** a real transcript arrives (after the `POST_CUT_SILENCE_MS`
+  gate). The reply is cut -- LLM stream and TTS connection cancelled, queued
+  audio dropped, only the part the caller heard recorded -- and the
+  transcript becomes the next turn (`agent barge-in confirmed; reply cut`).
+  A **junk** transcript doesn't count (`transcript ignored: too short to be
+  speech`): no digit and fewer than two letters/vowel signs, i.e. a lone
+  letter like "ह", which is what noise transcribes to. The rule is
+  deliberately narrow so one-word answers such as "जी", "ना", "हाँ" or "5"
+  still confirm.
 - **False alarm:** no transcript, and the caller has been quiet for 2s (by
   TEN VAD's last speech, Sarvam's `END_SPEECH`, and Sarvam not reporting
-  them mid-utterance). The reply resumes from exactly where it stopped
-  (`false interruption; resuming the reply`); nothing was cut, so nothing
-  is lost or re-generated. The wait is capped at 10s, so a stuck signal
-  can't leave the call silent.
+  them mid-utterance). The reply resumes **from the start of the sentence it
+  was paused in** (`false interruption; resuming the reply`), not mid-word;
+  nothing was cut, so nothing is re-generated. If the pause came right
+  after a sentence finished, that sentence is repeated. The wait is capped
+  at 10s, so a stuck signal can't leave the call silent.
+
+Metrics: `vaani_agent_interruption_pauses_total` counts pauses,
+`vaani_agent_false_interruptions_total` those that resumed, and
+`vaani_agent_bargein_total` those confirmed and cut.
 
 With `VAD_MODE=ten` the detector
 also runs while the agent is listening (for the latency fields below), so

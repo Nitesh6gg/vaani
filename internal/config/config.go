@@ -122,8 +122,8 @@ type Config struct {
 	// default 200 -- Dograh's live setting, pipecat's VAD start_secs 0.2).
 	// See internal/ai/agent.Config.BargeInMinSpeech.
 	BargeInMinSpeech time.Duration
-	// PostCutSilence is how long a barge-in cut requires quiet before a new
-	// turn is accepted. See internal/ai/agent.Config.PostCutSilence.
+	// PostCutSilence is how long after an interruption pauses the reply
+	// transcripts are ignored. See internal/ai/agent.Config.PostCutSilence.
 	PostCutSilence time.Duration
 	// VadMode selects the barge-in detector when BargeInEnabled: "energy"
 	// (default -- the RMS-threshold EnergyDetector, no native dependency) or
@@ -281,12 +281,16 @@ func Load() (Config, error) {
 
 	cfg.BargeInMinSpeech = time.Duration(bargeInMinSpeechMS) * time.Millisecond
 
-	// 1200ms: after a barge-in cut, the STT flushes the ~200ms preroll as a
-	// junk partial-utterance final (observed live: 1-2 character fragments in
-	// random scripts) roughly 0.5-1.5s after the cut; a gate this long drops
-	// exactly those while still accepting the caller's real next utterance,
-	// which lands when they pause. Overridable via POST_CUT_SILENCE_MS.
-	postCutSilenceMS, err := getEnvInt("POST_CUT_SILENCE_MS", 1200)
+	// 300ms: transcripts this soon after an interruption pauses the reply
+	// were already on their way (Sarvam needs ~0.7s after the caller stops
+	// just to send one) and are ignored. It used to be 1200ms, to drop the
+	// junk a cut's preroll flush produced 0.5-1.5s later (1-2 character
+	// fragments in random scripts, under STT language "unknown"); now that
+	// an interruption only pauses, 1200ms was observed live (2026-10-01)
+	// throwing away the caller's real short answers, so junk is caught by
+	// content instead (agent.junkTranscript). Overridable via
+	// POST_CUT_SILENCE_MS.
+	postCutSilenceMS, err := getEnvInt("POST_CUT_SILENCE_MS", 300)
 	if err != nil {
 		return Config{}, err
 	}

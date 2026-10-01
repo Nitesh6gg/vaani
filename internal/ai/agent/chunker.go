@@ -10,8 +10,19 @@ import (
 // chunkerRuneThreshold bounds how long the SentenceChunker waits for a sentence
 // delimiter before flushing anyway, in runes (not bytes -- a byte count badly
 // undercounts multi-byte scripts like Devanagari, where 80 bytes is only
-// ~27 characters).
+// ~27 characters). Past it, the chunk ends at the last word break, never
+// inside a word: each chunk is a separate Sarvam request, spoken on its own,
+// so a word split across two (observed live: "बिजल" + "ी", "संतुष्" + "ट")
+// is heard broken in half.
 const chunkerRuneThreshold = 80
+
+// chunkerHardLimit is where a chunk with no word break at all (one enormous
+// "word") is cut anyway -- still never before a combining mark (a vowel sign)
+// or right after a virama, which would split a written syllable.
+const chunkerHardLimit = 2 * chunkerRuneThreshold
+
+// virama (U+094D) joins the consonants around it into one conjunct.
+const virama = '्'
 
 // sentenceDelimiters are flush triggers: standard sentence-ending punctuation
 // plus the Devanagari danda and double danda, since Hindi/Marathi/Sanskrit use
@@ -74,9 +85,16 @@ func (c *SentenceChunker) Feed(token string) []string {
 // -- danda, !, ?, and newline don't occur inside numbers or list markers.
 // Tradeoff: an English sentence genuinely ending in a number ("born in
 // 1990.") merges into the following sentence and starts slightly later.
+//
+// Past chunkerRuneThreshold with no delimiter, the cut goes after the last
+// space that follows a comma/semicolon/colon (a natural pause), else after
+// the last space -- so the chunk ends with that space and the next one starts
+// on a whole word.
 func (c *SentenceChunker) nextCut() (cut int, ok bool) {
 	runeCount := 0
 	hasContent := false
+	lastSpace, lastPause := 0, 0
+
 	var prev rune
 
 	for i := 0; i < len(c.buf); {
@@ -84,8 +102,27 @@ func (c *SentenceChunker) nextCut() (cut int, ok bool) {
 		i += size
 		runeCount++
 
-		if runeCount >= chunkerRuneThreshold {
-			return i, true
+		if unicode.IsSpace(r) && hasContent {
+			lastSpace = i
+
+			// A pause only counts in the chunk's second half: an early comma
+			// would just make a needlessly short request.
+			if (prev == ',' || prev == ';' || prev == ':') && runeCount >= chunkerRuneThreshold/2 {
+				lastPause = i
+			}
+		}
+
+		if runeCount >= chunkerRuneThreshold && !(sentenceDelimiters[r] && hasContent) {
+			switch {
+			case lastPause > 0:
+				return lastPause, true
+			case lastSpace > 0:
+				return lastSpace, true
+			case runeCount >= chunkerHardLimit && i < len(c.buf):
+				if next, _ := utf8.DecodeRune(c.buf[i:]); !unicode.Is(unicode.M, next) && r != virama {
+					return i, true
+				}
+			}
 		}
 
 		if sentenceDelimiters[r] && hasContent {
