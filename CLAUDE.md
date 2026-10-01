@@ -54,7 +54,10 @@ Real-time voice agent: Asterisk ARI (telephony) + Go media plane + Sarvam STT/TT
    interruption is **confirmed**: a detected one first *pauses* playback (no
    frames popped, STT fed, LLM/TTS keep queueing); a transcript confirms it and
    triggers all five cuts, while no transcript and 2s of quiet resumes the
-   reply (from the start of the interrupted sentence) as a false interruption. A pause is not a cut — don't cancel anything
+   reply (from the start of the interrupted sentence) as a false interruption.
+   The STT is fed the caller's audio continuously, in every state (as in
+   Dograh) — never only while listening, which clipped the first syllable of
+   answers given over the agent; transcripts are filtered, not audio. A pause is not a cut — don't cancel anything
    before confirmation.
 8. **Audio format**: slin16 (16kHz 16-bit mono PCM) end-to-end. Asterisk handles μ-law transcoding.
 9. **One media socket per call**, bound to a port from the managed pool (never shared

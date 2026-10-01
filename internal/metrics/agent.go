@@ -23,11 +23,6 @@ var (
 		Help: "Total paused replies that resumed because no transcript confirmed the interruption (noise, echo).",
 	})
 
-	AgentPrerollFlushedFramesTotal = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "vaani_agent_preroll_flushed_frames_total",
-		Help: "Total pre-roll frames flushed to STT when an interruption paused the reply (the SPEAKING-state audio STT never saw live).",
-	})
-
 	AgentTurnsTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "vaani_agent_turns_total",
 		Help: "Total agent turns started: one per accepted caller transcript, plus the LLM opening a call and caller-silence prompts.",
@@ -48,9 +43,6 @@ func (AgentSink) BargeIn()            { AgentBargeInTotal.Inc() }
 func (AgentSink) InterruptionPaused() { AgentInterruptionPausesTotal.Inc() }
 func (AgentSink) FalseInterruption()  { AgentFalseInterruptionsTotal.Inc() }
 func (AgentSink) TurnStarted()        { AgentTurnsTotal.Inc() }
-func (AgentSink) PrerollFlushed(frames int) {
-	AgentPrerollFlushedFramesTotal.Add(float64(frames))
-}
-func (AgentSink) Error(stage string) { AgentErrorsTotal.WithLabelValues(stage).Inc() }
+func (AgentSink) Error(stage string)  { AgentErrorsTotal.WithLabelValues(stage).Inc() }
 
 var _ agent.Sink = AgentSink{}

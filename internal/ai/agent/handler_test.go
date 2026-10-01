@@ -525,7 +525,7 @@ func TestHandler_AudioBeforeDoneEvenWhenBothArriveTogether(t *testing.T) {
 	drainUntilListening(t, h)
 }
 
-func TestHandler_BargeInExecutesCutsAndFlushesPreroll(t *testing.T) {
+func TestHandler_BargeInPausesThenCuts(t *testing.T) {
 	fSTT := newFakeSTT()
 	fTTS := newFakeTTS()
 	fLLM := &fakeLLM{tokens: []string{"a long response the caller interrupts"}}
@@ -538,11 +538,8 @@ func TestHandler_BargeInExecutesCutsAndFlushesPreroll(t *testing.T) {
 	fTTS.audio <- tts.Chunk{PCM: constFrame(quietAmplitude), Gen: 1}
 	require.Eventually(t, func() bool { return h.State() == StateSpeaking }, time.Second, time.Millisecond)
 
-	// Quiet SPEAKING frames first, so preroll has content besides the trigger.
 	h.ProcessFrame(context.Background(), "call1", constFrame(quietAmplitude))
 	h.ProcessFrame(context.Background(), "call1", constFrame(quietAmplitude))
-
-	fedBefore := fSTT.fedCount()
 
 	h.ProcessFrame(context.Background(), "call1", constFrame(loudAmplitude))
 	h.ProcessFrame(context.Background(), "call1", constFrame(loudAmplitude))
@@ -550,11 +547,10 @@ func TestHandler_BargeInExecutesCutsAndFlushesPreroll(t *testing.T) {
 
 	assert.Nil(t, out, "the triggering tick returns no agent audio")
 	assert.True(t, h.paused.Load(), "must pause immediately, not wait for the event loop")
-	assert.Greater(t, fSTT.fedCount(), fedBefore, "preroll frames must be flushed to STT")
 	assert.False(t, fTTS.wasCancelled(), "a pause is not a cut yet")
 	assert.Nil(t, h.ProcessFrame(context.Background(), "call1", constFrame(quietAmplitude)), "nothing plays while paused")
 
-	// A transcript inside the post-cut gate (the flush's usual junk) doesn't confirm it...
+	// A transcript inside the post-cut gate (already on its way) doesn't confirm it...
 	fSTT.sendFinal("ह")
 	time.Sleep(20 * time.Millisecond)
 	assert.False(t, fTTS.wasCancelled())
@@ -1556,4 +1552,93 @@ func TestHandler_ReplyHeardWhenTheCallEndsIsLogged(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return strings.Contains(getLog().String(), `[Agent] call_id=call1 gen=1 text="Goodbye now." cut=true`)
 	}, time.Second, time.Millisecond)
+}
+
+// TestHandler_STTHearsTheCallerInEveryState: the caller's audio reaches the
+// STT on every tick -- listening, preparing a reply, speaking, paused -- so
+// an answer begun over the agent is transcribed from its first syllable
+// (live: "महंगाई" clipped to "हाँ जी" / "नहीं" when the STT only listened
+// between replies). Each frame goes once, nothing extra.
+func TestHandler_STTHearsTheCallerInEveryState(t *testing.T) {
+	fSTT := newFakeSTT()
+	fTTS := newFakeTTS()
+	release := make(chan struct{})
+
+	slowLLM := &blockingLLM{release: release, tokens: []string{"A reply."}}
+	h := NewHandler(context.Background(), "call1", testConfig(fSTT, fTTS, slowLLM, 0, 0))
+
+	tick := func() { h.ProcessFrame(context.Background(), "call1", constFrame(quietAmplitude)) }
+
+	tick() // listening
+	assert.Equal(t, 1, fSTT.fedCount())
+
+	fSTT.sendFinal("hi")
+	require.Eventually(t, func() bool { return h.State() == StateThinking }, time.Second, time.Millisecond)
+	tick() // preparing the reply
+	assert.Equal(t, 2, fSTT.fedCount())
+
+	close(release)
+	require.Eventually(t, func() bool { return fTTS.spokenCount() == 1 }, time.Second, time.Millisecond)
+	fTTS.audio <- tts.Chunk{PCM: multiFrame(10, quietAmplitude), Gen: 1, Req: 1, Text: "A reply."}
+	require.Eventually(t, func() bool { return h.State() == StateSpeaking }, time.Second, time.Millisecond)
+	tick() // speaking
+	assert.Equal(t, 3, fSTT.fedCount())
+
+	for i := 0; i < 3; i++ { // the caller talks over it: paused
+		h.ProcessFrame(context.Background(), "call1", constFrame(loudAmplitude))
+	}
+
+	require.True(t, h.paused.Load())
+	tick()
+	assert.Equal(t, 7, fSTT.fedCount(), "paused: still one frame per tick")
+}
+
+// TestHandler_TranscriptWhileSpeakingIsMuted: a transcript of something said
+// entirely while the agent spoke, with no interruption, is discarded and
+// logged (Dograh's mute) -- not silently dropped.
+func TestHandler_TranscriptWhileSpeakingIsMuted(t *testing.T) {
+	getLog := captureSlog(t)
+
+	fSTT := newFakeSTT()
+	fTTS := newFakeTTS()
+	fLLM := &fakeLLM{tokens: []string{"A reply."}}
+
+	cfg := testConfig(fSTT, fTTS, fLLM, 0, 0)
+	cfg.Start = &Node{AllowInterrupt: false}
+	h := NewHandler(context.Background(), "call1", cfg)
+
+	fSTT.sendFinal("hi")
+	require.Eventually(t, func() bool { return fTTS.spokenCount() == 1 }, time.Second, time.Millisecond)
+	fTTS.audio <- tts.Chunk{PCM: multiFrame(10, quietAmplitude), Gen: 1, Req: 1, Text: "A reply."}
+	require.Eventually(t, func() bool { return h.State() == StateSpeaking }, time.Second, time.Millisecond)
+
+	fSTT.sendFinal("जी")
+	require.Eventually(t, func() bool {
+		return strings.Contains(getLog().String(), "transcript ignored: the agent is speaking")
+	}, time.Second, time.Millisecond)
+	assert.Equal(t, 1, fLLM.streamCalls(), "no new turn")
+
+	fTTS.done <- 1
+	drainUntilListening(t, h)
+}
+
+// blockingLLM holds its reply until release is closed, so a test can
+// observe the Thinking state.
+type blockingLLM struct {
+	release chan struct{}
+	tokens  []string
+}
+
+func (b *blockingLLM) Stream(ctx context.Context, _ []llm.Message, _ []llm.Tool, onToken func(string)) ([]llm.ToolCall, error) {
+	select {
+	case <-b.release:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
+	for _, tok := range b.tokens {
+		onToken(tok)
+	}
+
+	return nil, nil
 }

@@ -64,8 +64,8 @@ Per call, `internal/ai/agent.Handler` implements the same `media.Handler` seam
 and drives a four-state turn loop over the media frames:
 
 ```
-Listening/Transcribing: inbound audio -> Sarvam STT (WebSocket, per call)
-  final transcript -> LLM (OpenAI-compatible SSE stream)
+Every state: inbound audio -> Sarvam STT (WebSocket, per call, fed continuously)
+  final transcript (used while listening; see below) -> LLM (OpenAI-compatible SSE stream)
     -> sentence chunks -> Sarvam TTS (WebSocket, one connection per call)
 Speaking: TTS PCM re-framed to 640B frames -> played out at 20ms/tick
   (one frame per ProcessFrame call; synthesis finishes long before the
@@ -78,12 +78,16 @@ under `third_party/ten-vad/`, `internal/ai/agent/tenvad`) or an RMS energy
 gate -- watches the inbound audio. At workflow nodes whose Dograh
 `allow_interrupt` is on (elsewhere, and once the call is ending, the caller
 is ignored until the agent finishes), unbroken speech for
-`BARGE_IN_MIN_SPEECH_MS` first **pauses** the reply: nothing plays and the
-caller's audio goes to STT. A transcript (other than junk like a lone
+`BARGE_IN_MIN_SPEECH_MS` first **pauses** the reply: nothing plays, while
+the caller's audio keeps going to STT as always. A transcript (other than junk like a lone
 letter) confirms the interruption and the turn is cut (LLM stream and TTS
 connection cancelled, queue drained), with the caller's utterance as the
 next turn; no transcript and 2s of quiet means it was noise, and the reply
-resumes from the start of the sentence it was paused in.
+resumes from the start of the sentence it was paused in. A transcript of
+something said entirely while the agent spoke, with no interruption, is
+discarded (`transcript ignored: the agent is speaking`) -- Dograh's mute; an
+answer that started over the agent and ended after it is transcribed whole
+(see "Fed continuously" in `docs/AI_PROVIDERS.md`).
 `BARGE_IN_ENABLED=0` puts the detector in observe-only mode: transitions keep
 logging, nothing is ever interrupted. Full knob table and the rules in
 "Barge-in configuration" in `docs/AI_PROVIDERS.md`; state machine in

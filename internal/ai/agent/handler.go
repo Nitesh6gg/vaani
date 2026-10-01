@@ -43,12 +43,6 @@ func (s State) String() string {
 	}
 }
 
-// prerollFrames is how many trailing 20ms SPEAKING-state frames are kept (200ms):
-// when barge-in fires, STT never saw these frames (it isn't fed during
-// SPEAKING, to avoid transcribing the agent's own voice), so they're flushed to
-// STT first, recovering the start of the interrupting utterance.
-const prerollFrames = 10
-
 // outboundBufferFrames sizes Handler.outbound. This is not a jitter margin --
 // it's the gap between how TTS audio arrives and how it can be played out.
 // Sarvam delivers a whole turn's synthesized audio over the network in a
@@ -90,7 +84,6 @@ type Sink interface {
 	InterruptionPaused()
 	FalseInterruption()
 	TurnStarted()
-	PrerollFlushed(frames int)
 	Error(stage string)
 }
 
@@ -101,7 +94,6 @@ func (NoopSink) BargeIn()            {}
 func (NoopSink) InterruptionPaused() {}
 func (NoopSink) FalseInterruption()  {}
 func (NoopSink) TurnStarted()        {}
-func (NoopSink) PrerollFlushed(int)  {}
 func (NoopSink) Error(string)        {}
 
 // Config bundles one call's agent dependencies.
@@ -223,7 +215,7 @@ type ttsDrainTimeoutEvent struct{}
 //   - state/speakingSince/silenceUntil/ttsDeliveryDone/playingReq: atomics,
 //     written by whichever goroutine reaches the transition, read by any.
 //   - tts/turnCancel/history/turnChunks: touched only by run()'s goroutine.
-//   - preroll/emptyTicks: touched only by ProcessFrame's goroutine.
+//   - emptyTicks and the replay/speech-run fields: touched only by ProcessFrame's goroutine.
 //   - per-turn chunker: a local variable inside runLLMTurn, never shared.
 //   - outbound: a channel (safe for concurrent send/receive by construction).
 type Handler struct {
@@ -378,7 +370,6 @@ type Handler struct {
 	callerSpeaking bool
 
 	// ProcessFrame-goroutine-owned only.
-	preroll [][]byte
 	// speechRunStart is when the detector's current unbroken run of speech
 	// began during Speaking (zero: none) -- see Config.BargeInMinSpeech.
 	speechRunStart time.Time
@@ -461,24 +452,28 @@ func (h *Handler) ProcessFrame(_ context.Context, _ string, pcm []byte) [][]byte
 		return h.processHoldFrame(hp)
 	}
 
-	switch State(h.state.Load()) {
-	case StateListening, StateTranscribing:
-		if err := h.cfg.STT.Feed(pcm); err != nil {
-			h.cfg.Sink.Error("stt")
-		}
+	// The caller's audio always reaches the STT, whatever the agent is doing
+	// -- as in Dograh, where speech-to-text sits before everything else in the
+	// pipeline and muting only discards transcripts. So the STT always has an
+	// utterance from its first syllable, even one begun while the agent was
+	// speaking; what to do with each transcript is decided when it arrives
+	// (handleFinalTranscript). Feeding only while listening clipped the start
+	// of answers given over the agent: observed live, "महंगाई" transcribed as
+	// "हाँ जी" and "नहीं" with its first syllable missing.
+	if err := h.cfg.STT.Feed(pcm); err != nil {
+		h.cfg.Sink.Error("stt")
+	}
 
+	switch State(h.state.Load()) {
+	case StateListening, StateTranscribing, StateThinking:
 		// The same frame Sarvam just got, so the VAD's "last speech" lines
 		// up with what Sarvam is endpointing. Only for timing (see
-		// lastSoundAt): the verdict is not used here.
+		// lastSoundAt): the verdict is not used here. (While Thinking, the
+		// silence fallback in CallMedia's writeLoop handles this tick.)
 		if h.clock != nil {
 			h.cfg.BargeIn.Detect(pcm)
 		}
 
-		return nil
-
-	case StateThinking:
-		// Silence fallback (CallMedia's writeLoop) handles this tick. Do not
-		// feed STT: there's nothing new to transcribe until the agent responds.
 		return nil
 
 	case StateSpeaking:
@@ -490,24 +485,12 @@ func (h *Handler) ProcessFrame(_ context.Context, _ string, pcm []byte) [][]byte
 }
 
 func (h *Handler) processSpeakingFrame(pcm []byte) [][]byte {
-	// Paused on a possible interruption: play nothing, let the caller be
-	// heard (STT, and the VAD for its timing), and leave the queued reply
-	// where it is -- run() resumes or cuts it.
+	// Paused on a possible interruption: play nothing (the caller is heard
+	// as always -- ProcessFrame fed the STT; the VAD keeps its timing) and
+	// leave the queued reply where it is -- run() resumes or cuts it.
 	if h.paused.Load() {
-		if err := h.cfg.STT.Feed(pcm); err != nil {
-			h.cfg.Sink.Error("stt")
-		}
-
 		h.cfg.BargeIn.Detect(pcm)
-
 		return nil
-	}
-
-	// The preroll buffer exists solely to recover the interrupting
-	// utterance's start on a cut; in observe-only mode no cut can ever fire,
-	// so skip the per-frame copy entirely.
-	if !h.cfg.BargeInObserveOnly {
-		h.appendPreroll(pcm)
 	}
 
 	// Detect runs on every SPEAKING frame whether or not cuts are enabled:
@@ -527,13 +510,12 @@ func (h *Handler) processSpeakingFrame(pcm []byte) [][]byte {
 	if detected && now.Sub(h.speechRunStart) >= h.cfg.BargeInMinSpeech &&
 		elapsed >= h.cfg.BargeInGuard && h.interruptible() {
 		// Pause, don't cut: whether this is the caller or just noise isn't
-		// known yet (see paused). Flush the preroll so STT hears the start of
-		// what they said, and gate out the junk transcript the flush itself
-		// tends to produce 0.5-1.5s later (commit 249a6c4) -- a transcript
-		// inside that gate neither confirms the interruption nor starts a turn.
+		// known yet (see paused). The STT already has everything they've said
+		// (it's fed continuously); a transcript arriving within PostCutSilence
+		// was already on its way and neither confirms the interruption nor
+		// starts a turn.
 		h.paused.Store(true)
 		h.cfg.Sink.InterruptionPaused()
-		h.flushPrerollToSTT()
 		h.cfg.BargeIn.Reset()
 		h.speechRunStart = time.Time{}
 		h.silenceUntil.Store(now.Add(h.cfg.PostCutSilence).UnixNano())
@@ -638,29 +620,6 @@ func (h *Handler) processSpeakingFrame(pcm []byte) [][]byte {
 func (h *Handler) interruptible() bool {
 	return !h.cfg.BargeInObserveOnly && !h.closing.Load() &&
 		InterruptMode(true, h.node.Load()) == "on"
-}
-
-func (h *Handler) appendPreroll(pcm []byte) {
-	cp := make([]byte, len(pcm))
-	copy(cp, pcm)
-
-	if len(h.preroll) >= prerollFrames {
-		h.preroll = h.preroll[1:]
-	}
-
-	h.preroll = append(h.preroll, cp)
-}
-
-func (h *Handler) flushPrerollToSTT() {
-	for _, frame := range h.preroll {
-		if err := h.cfg.STT.Feed(frame); err != nil {
-			h.cfg.Sink.Error("stt")
-			break
-		}
-	}
-
-	h.cfg.Sink.PrerollFlushed(len(h.preroll))
-	h.preroll = h.preroll[:0]
 }
 
 func (h *Handler) readSTT() {
@@ -990,9 +949,14 @@ func (h *Handler) handleFinalTranscript(text string) {
 		h.confirmInterruption() // a real interruption: cut, and this becomes the next turn
 	}
 
-	switch State(h.state.Load()) {
+	// Said entirely while the agent was preparing or speaking its reply, with
+	// no interruption: the caller is muted, as in Dograh (its mute discards
+	// transcripts, not audio). An answer that started over the agent but
+	// ended after it finished arrives in Listening instead, whole.
+	switch s := State(h.state.Load()); s {
 	case StateThinking, StateSpeaking:
-		return // already mid-turn; STT shouldn't produce a final here, but guard anyway
+		slog.Info("transcript ignored: the agent is "+s.String(), "call_id", h.callID, "text", text)
+		return
 	}
 
 	h.history = append(h.history, llm.Message{Role: "user", Content: text})

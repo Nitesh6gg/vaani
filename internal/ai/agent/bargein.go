@@ -3,12 +3,12 @@ package agent
 import "github.com/nitesh/vaani/internal/media"
 
 // BargeInDetector decides, frame by frame, whether the caller has started
-// talking over the agent's TTS playback. STT can't provide this signal: it
-// isn't fed audio during SPEAKING (feeding it would transcribe the agent's own
-// voice leaking back through the caller's mic), so barge-in detection has to
-// run locally on every inbound frame regardless of state. Implementations must
-// be safe to call once per 20ms frame from ProcessFrame's single goroutine --
-// no blocking, no I/O.
+// talking over the agent's TTS playback. It runs locally on the inbound audio
+// because it must react within a fraction of a second; the STT (fed the
+// caller's audio continuously) only produces a transcript once they pause,
+// and that transcript is what then confirms or dismisses the interruption.
+// Implementations must be safe to call once per 20ms frame from
+// ProcessFrame's single goroutine -- no blocking, no I/O.
 type BargeInDetector interface {
 	// Detect reports whether pcm (one 20ms LE PCM16 frame) counts as speech.
 	Detect(pcm []byte) bool

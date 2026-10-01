@@ -251,8 +251,8 @@ func TestTenVadDetector_ResetDoesNotLogSpeechEnded(t *testing.T) {
 // TestHandler_ObserveOnlyNeverCuts pins the BARGE_IN_ENABLED=0 + VAD_MODE=ten
 // semantics ("observe, don't cut"): the real detector still runs and its
 // speech started transition still logs, but a sustained speech verdict never
-// fires a barge-in -- the agent keeps playing its reply, the TTS connection
-// stays alive, and no preroll is flushed to STT.
+// fires a barge-in -- the agent keeps playing its reply and the TTS
+// connection stays alive.
 func TestHandler_ObserveOnlyNeverCuts(t *testing.T) {
 	buf := captureSlog(t)()
 	fSTT := newFakeSTT()
@@ -290,7 +290,7 @@ func TestHandler_ObserveOnlyNeverCuts(t *testing.T) {
 
 	assert.Equal(t, StateSpeaking, h.State(), "observe-only must never leave Speaking via a barge-in")
 	assert.False(t, fTTS.wasCancelled(), "observe-only must never cancel the TTS connection")
-	assert.Equal(t, fedBefore, fSTT.fedCount(), "observe-only must not flush preroll to STT")
+	assert.Equal(t, fedBefore+12, fSTT.fedCount(), "the STT gets every frame, once -- nothing extra")
 	assert.Equal(t, 1, strings.Count(buf.String(), "speech started"),
 		"the detector's transition logging must survive in observe-only mode")
 	assert.NotContains(t, buf.String(), "agent barge-in detected")

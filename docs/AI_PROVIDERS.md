@@ -62,6 +62,29 @@ logs what it resolved to, never the keys:
   a second channel would let Go's `select` reorder them. They drive the
   caller-silence clock and the latency fields below -- not barge-in, which
   stays local (START_SPEECH also fires on background conversation).
+- **Fed continuously, as in Dograh.** The caller's audio goes to Sarvam on
+  every 20ms tick in every state -- listening, while the agent prepares or
+  speaks a reply, and while a reply is paused (only a transfer's hold audio
+  is excluded). Dograh works the same way: speech-to-text comes first in its
+  pipeline (`pipeline_builder.py`), and its "mute" only discards transcripts
+  afterwards. What to do with each transcript is decided when it arrives:
+
+  | When the transcript arrives | What happens |
+  |---|---|
+  | Agent listening | A new turn |
+  | Reply paused by a possible interruption | Confirms it -- unless junk or too soon (see "Pause first") |
+  | Agent preparing or speaking a reply, not paused | Discarded and logged: `transcript ignored: the agent is speaking` (or `thinking`) |
+
+  An answer that starts over the agent but ends after it finishes arrives
+  while listening, and is transcribed whole. Until 2026-10-01 Vaani fed the
+  STT only while listening, plus a 200ms buffer of the caller's audio sent
+  when an interruption began; that clipped the start of answers given over
+  the agent (live: "महंगाई" transcribed as "हाँ जी" and "नहीं", its first
+  syllable missing). Two consequences to watch: if the agent's own voice
+  echoes back down the caller's line, Sarvam transcribes that too (discarded
+  while the agent speaks, but able to confirm a pause at an interruptible
+  node -- Dograh has the same exposure); and Sarvam now receives the whole
+  call's audio, whose effect on Sarvam's billing hasn't been checked.
 - If the STT connection can't be opened (after a few quick retries), the call
   currently falls back to `LoopbackHandler` (the caller hears their own
   voice) rather than being hung up -- logged as

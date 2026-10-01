@@ -125,6 +125,14 @@ Status, item by item — "live" means seen working on a real call:
        interrupted sentence;
      - the reply playing when the caller hangs up wasn't logged, and there
        were no pause / false-interruption counters -- both added.
+  4. Tried live (13:11, 2026-10-01): no broken words, and all three pauses
+     were real and confirmed. But "महंगाई" was transcribed as "हाँ जी" /
+     "नहीं" three times, though the recording had it clearly: the STT was
+     fed only while listening, plus a 200ms buffer at an interruption,
+     which a 300ms speech trigger outran -- the first syllable never
+     reached Sarvam. Now the STT is fed continuously, as in Dograh, and a
+     transcript said entirely over the agent is discarded and logged.
+     Unit-tested, **not yet tried live**.
 
 Not done yet:
 - **Step 3b:** `http_api` custom tools (e.g. web search, with bearer
