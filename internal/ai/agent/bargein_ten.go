@@ -3,6 +3,7 @@ package agent
 import (
 	"encoding/binary"
 	"log/slog"
+	"sync/atomic"
 	"time"
 )
 
@@ -11,6 +12,13 @@ import (
 // accumulate in TenVadDetector's carry buffer and are drained as whole hops,
 // with the remainder carrying over to the next call.
 const tenVadHopSize = 256
+
+// speechClock is a BargeInDetector that can also say when it last heard
+// speech (TenVadDetector). The Handler then runs it while listening as well,
+// to time the caller's last sound (see Handler.lastSoundAt).
+type speechClock interface {
+	LastSpeechAt() time.Time
+}
 
 // HopSpeechFunc runs one hop of int16 samples (LE PCM16, 16kHz) through a
 // speech/no-speech decision and reports the binary verdict. On Linux this is
@@ -51,8 +59,23 @@ type TenVadDetector struct {
 	speechActive    bool
 	speechStartedAt time.Time
 
+	// lastSpeechAt (UnixNano) is when a hop last came back as speech --
+	// written here, read by the Handler's run() goroutine (LastSpeechAt).
+	lastSpeechAt atomic.Int64
+
 	history [bargeInHistoryFrames]bool
 	idx     int
+}
+
+// LastSpeechAt is when the detector last heard speech (any single hop, not
+// the vote window), on this process's clock: the caller's last sound as
+// Vaani saw it, give or take one 16ms hop. Zero if never.
+func (d *TenVadDetector) LastSpeechAt() time.Time {
+	if ns := d.lastSpeechAt.Load(); ns != 0 {
+		return time.Unix(0, ns)
+	}
+
+	return time.Time{}
 }
 
 // NewTenVadDetector creates a detector that feeds hops to hop (the native
@@ -94,6 +117,10 @@ func (d *TenVadDetector) Detect(pcm []byte) bool {
 
 		d.history[d.idx] = speech && err == nil
 		d.idx = (d.idx + 1) % len(d.history)
+
+		if speech && err == nil {
+			d.lastSpeechAt.Store(time.Now().UnixNano())
+		}
 
 		d.carry = d.carry[tenVadHopSize:]
 

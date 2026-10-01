@@ -62,6 +62,10 @@ In Dograh:
   (`SIP/...`) doesn't exist in Asterisk 21+.
 - **Call limits** (caller silence, maximum call length) come from the
   workflow's Settings page; never saved, 10s and 300s apply.
+- **Interruption** is per node: switch on a node's `allow_interrupt` where
+  the caller may cut in while the agent speaks. It only takes effect with
+  `BARGE_IN_ENABLED=1` in Vaani's `.env` (the master switch); with `0`
+  nothing is ever cut.
 
 Network: the Vaani host must reach Dograh's Postgres and the LLM endpoint
 itself (for a gateway such as Bifrost, its `base_url`, e.g.
@@ -70,7 +74,7 @@ Sarvam's API over the internet.
 
 What a healthy call logs at its start:
 
-    agent workflow loaded ... start_node="Start Call" opening=llm start_tools="[...]" idle_timeout_s=10 max_duration_s=300
+    agent workflow loaded ... start_node="Start Call" opening=llm start_tools="[...]" start_allow_interrupt=false start_interrupt=off idle_timeout_s=10 max_duration_s=300
     agent models ... llm=bifrost/<model> llm_url=... stt=sarvam/saaras:v4 ... tts_voice=...
 
 ## Metrics and health

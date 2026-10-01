@@ -229,6 +229,7 @@ func testConfig(sttClient stt.Client, ttsClient tts.Client, llmClient llmStreame
 		STT:            sttClient,
 		NewTTS:         func() (tts.Client, error) { return ttsClient, nil },
 		LLM:            llmClient,
+		Start:          &Node{AllowInterrupt: true}, // barge-in tests need an interruptible node
 		BargeIn:        NewEnergyDetector(floor),
 		BargeInGuard:   guard,
 		PostCutSilence: postCut,
@@ -565,6 +566,36 @@ func TestHandler_BargeInRespectsGuardWindow(t *testing.T) {
 
 	assert.Equal(t, StateSpeaking, h.State(), "loud frames inside the guard window must not trigger barge-in")
 	assert.False(t, fTTS.wasCancelled())
+}
+
+// TestHandler_NodeWithoutAllowInterruptIsNeverCut: Dograh's allow_interrupt
+// =false mutes the caller while the agent speaks at that node, even with
+// barge-in enabled and the detector firing.
+func TestHandler_NodeWithoutAllowInterruptIsNeverCut(t *testing.T) {
+	fSTT := newFakeSTT()
+	fTTS := newFakeTTS()
+	fLLM := &fakeLLM{tokens: []string{"a reply the caller talks over"}}
+
+	cfg := testConfig(fSTT, fTTS, fLLM, 0, 0)
+	cfg.Start = &Node{AllowInterrupt: false}
+	h := NewHandler(context.Background(), "call1", cfg)
+
+	fSTT.sendFinal("hi")
+	require.Eventually(t, func() bool { return fTTS.spokenCount() > 0 }, time.Second, time.Millisecond)
+
+	fTTS.audio <- tts.Chunk{PCM: multiFrame(20, quietAmplitude), Gen: 1, Req: 1, Text: "a reply the caller talks over"}
+	require.Eventually(t, func() bool { return h.State() == StateSpeaking }, time.Second, time.Millisecond)
+
+	for i := 0; i < 10; i++ {
+		h.ProcessFrame(context.Background(), "call1", constFrame(loudAmplitude))
+	}
+
+	assert.Equal(t, StateSpeaking, h.State(), "no cut at a node that doesn't allow interruption")
+	assert.False(t, fTTS.wasCancelled())
+
+	// Finish the turn so its log lines can't leak into a later test.
+	fTTS.done <- 1
+	drainUntilListening(t, h)
 }
 
 func TestHandler_PostCutSilenceGateDropsTooSoonFinal(t *testing.T) {
@@ -967,11 +998,13 @@ func TestHandler_TransferFailureGoesBackToLLM(t *testing.T) {
 // same turn), and reaching the end node makes its closing line the last
 // thing said before the call hangs up.
 func TestHandler_WorkflowWalk(t *testing.T) {
+	getLog := captureSlog(t)
+
 	fSTT := newFakeSTT()
 	fTTS := newFakeTTS()
 
 	end := &Node{Name: "End Call", Prompt: "end prompt", End: true}
-	main := &Node{Name: "Main", Prompt: "main prompt", Edges: []Edge{
+	main := &Node{Name: "Main", Prompt: "main prompt", AllowInterrupt: true, Edges: []Edge{
 		{Def: llm.FunctionDef{Name: "end_call", Description: "when done"}, To: end},
 	}}
 	start := &Node{Name: "Start", Prompt: "start prompt", Edges: []Edge{
@@ -1023,6 +1056,27 @@ func TestHandler_WorkflowWalk(t *testing.T) {
 
 	require.Eventually(t, func() bool { return hangups.Load() == 1 }, time.Second, time.Millisecond)
 	assert.Equal(t, 5, fLLM.streamCalls())
+
+	// Each transition logs whether the caller can interrupt at the new node.
+	log := getLog().String()
+	assert.Contains(t, log, `from=Start to=Main via=move_to_main allow_interrupt=true interrupt=on`)
+	assert.Contains(t, log, `from=Main to="End Call" via=end_call allow_interrupt=false interrupt=off`)
+}
+
+func TestInterruptMode(t *testing.T) {
+	cases := []struct {
+		enabled, allow bool
+		want           string
+	}{
+		{true, true, "on"},
+		{true, false, "off"},
+		{false, true, "off"}, // BARGE_IN_ENABLED=0 wins
+		{false, false, "off"},
+	}
+
+	for _, c := range cases {
+		assert.Equal(t, c.want, InterruptMode(c.enabled, &Node{AllowInterrupt: c.allow}), "%+v", c)
+	}
 }
 
 func lastMessage(msgs []llm.Message) llm.Message { return msgs[len(msgs)-1] }
@@ -1163,4 +1217,103 @@ func TestHandler_LogsLatencyFromCallerSpeechEnd(t *testing.T) {
 	require.Len(t, second, 2)
 	assert.NotContains(t, second[0], "endpoint_ms=")
 	assert.NotContains(t, second[1], "since_speech_end_ms=")
+}
+
+// fakeClockDetector is a BargeInDetector that can say when it last heard
+// speech (like TenVadDetector), with that time set by the test.
+type fakeClockDetector struct {
+	mu      sync.Mutex
+	last    time.Time
+	detects int
+}
+
+func (d *fakeClockDetector) Detect([]byte) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	d.detects++
+
+	return false
+}
+
+func (d *fakeClockDetector) Reset() {}
+
+func (d *fakeClockDetector) LastSpeechAt() time.Time {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	return d.last
+}
+
+func (d *fakeClockDetector) set(t time.Time) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	d.last = t
+}
+
+func (d *fakeClockDetector) detectCount() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	return d.detects
+}
+
+// TestHandler_LogsCallerLastSoundAndConversation: with a VAD that knows when
+// it last heard speech, the turn logs end_detect_ms (last sound -> Sarvam's
+// end-of-speech) and since_last_speech_ms (last sound -> first audio); a
+// last sound older than the previous end-of-speech is never used. The
+// conversation is logged as [User]/[Agent] lines.
+func TestHandler_LogsCallerLastSoundAndConversation(t *testing.T) {
+	getLog := captureSlog(t)
+
+	fSTT := newFakeSTT()
+	fTTS := newFakeTTS()
+	vad := &fakeClockDetector{}
+
+	cfg := testConfig(fSTT, fTTS, &fakeLLM{tokens: []string{"Okay."}}, time.Hour, 0)
+	cfg.BargeIn = vad
+	h := NewHandler(context.Background(), "call1", cfg)
+
+	h.ProcessFrame(context.Background(), "call1", constFrame(quietAmplitude))
+	assert.Equal(t, 1, vad.detectCount(), "the VAD runs while listening too")
+
+	// Utterance 1: the VAD heard the caller just before Sarvam's END_SPEECH.
+	fSTT.results <- stt.Result{Signal: stt.SpeechStarted}
+	vad.set(time.Now())
+	fSTT.results <- stt.Result{Signal: stt.SpeechEnded}
+	fSTT.sendFinal("first")
+	require.Eventually(t, func() bool { return fTTS.spokenCount() == 1 }, time.Second, time.Millisecond)
+	playTurn(t, h, fTTS, 1, "Okay.")
+
+	// Utterance 2: Sarvam ends speech, but the VAD heard nothing new since
+	// utterance 1 -- its last sound is stale and must not be used.
+	fSTT.results <- stt.Result{Signal: stt.SpeechStarted}
+	fSTT.results <- stt.Result{Signal: stt.SpeechEnded}
+	fSTT.sendFinal("second")
+	require.Eventually(t, func() bool { return fTTS.spokenCount() == 2 }, time.Second, time.Millisecond)
+	playTurn(t, h, fTTS, 2, "Okay.")
+
+	lines := map[string]string{}
+
+	for _, line := range strings.Split(getLog().String(), "\n") {
+		for _, key := range []string{"gen=1", "gen=2"} {
+			for _, msg := range []string{"stt final transcript", "tts first audio"} {
+				if strings.Contains(line, key) && strings.Contains(line, msg) {
+					lines[key+" "+msg] = line
+				}
+			}
+		}
+	}
+
+	assert.Contains(t, lines["gen=1 stt final transcript"], "end_detect_ms=")
+	assert.Contains(t, lines["gen=1 tts first audio"], "since_last_speech_ms=")
+	assert.Contains(t, lines["gen=2 stt final transcript"], "endpoint_ms=", "Sarvam's own figure is still there")
+	assert.NotContains(t, lines["gen=2 stt final transcript"], "end_detect_ms=")
+	assert.NotContains(t, lines["gen=2 tts first audio"], "since_last_speech_ms=")
+
+	log := getLog().String()
+	assert.Contains(t, log, `[User] call_id=call1 text=first`)
+	assert.Contains(t, log, `[Agent] call_id=call1 gen=1 text=Okay. cut=false`)
+	assert.NotContains(t, log, "agent reply recorded")
 }

@@ -19,7 +19,7 @@ const riyaWorkflow = `{"nodes": [
 	{"id": "2", "type": "agentNode", "data": {"name": "Main Agenda and Questions", "prompt": "Ask the questions.",
 		"add_global_prompt": true, "tool_uuids": ["tr-1", "gone-2"]}},
 	{"id": "0", "type": "globalNode", "data": {"name": "Global Node", "prompt": "You are Riya."}},
-	{"id": "4", "type": "endCall", "data": {"name": "End Call", "prompt": "Say goodbye.", "add_global_prompt": false, "is_end": true}}
+	{"id": "4", "type": "endCall", "data": {"name": "End Call", "prompt": "Say goodbye.", "add_global_prompt": false, "is_end": true, "allow_interrupt": true}}
 ], "edges": [
 	{"source": "1", "target": "2", "data": {"label": "Move to Main Agenda", "condition": "When they engage."}},
 	{"source": "1", "target": "4", "data": {"label": "End call", "condition": "Wrong number."}},
@@ -50,8 +50,12 @@ func TestBuildWorkflowRiya(t *testing.T) {
 	require.Len(t, main.Tools, 1)
 	assert.Equal(t, agent.ToolTransfer, main.Tools[0].Kind)
 
+	assert.False(t, start.AllowInterrupt, "allow_interrupt false")
+	assert.False(t, main.AllowInterrupt, "allow_interrupt absent -> false, Dograh's default")
+
 	end := main.Edges[0].To
 	assert.True(t, end.End)
+	assert.True(t, end.AllowInterrupt)
 	assert.Equal(t, "Say goodbye.", end.Prompt, "add_global_prompt=false leaves the global prompt out")
 	assert.Same(t, end, start.Edges[1].To, "both End call edges lead to the same node")
 

@@ -95,14 +95,21 @@ Status, item by item — "live" means seen working on a real call:
   unit-tested; **not yet tried live**.
 - **Caller silence handling and call length** from the workflow's settings —
   done, unit-tested; not yet triggered live.
-- **Turn latency from the caller's end of speech** (`endpoint_ms`,
-  `since_speech_end_ms`) — done, unit-tested; not yet seen live.
+- **Turn latency from Sarvam's end of speech** (`endpoint_ms`,
+  `since_speech_end_ms`) — done, live (2026-09-30 and 2026-10-01 calls).
+- **Per-node interruption** (Dograh's `allow_interrupt`, under the
+  `BARGE_IN_ENABLED` master switch) — done, unit-tested; not yet tried live.
+- **Caller's last sound timed by TEN VAD while listening** (`end_detect_ms`,
+  `since_last_speech_ms`) — done, unit-tested; not yet seen live.
+- **Conversation lines** in the logs (`[User]`, `[Agent]`) — done,
+  unit-tested; not yet seen live.
 
 Not done yet:
 - **Step 3b:** `http_api` custom tools (e.g. web search, with bearer
   credentials from `external_credentials`), variable extraction, and writing
   each call to Dograh's `workflow_runs` so calls appear in the Dograh UI.
 - **Step 4:** knowledge base (Dograh's documents, pgvector).
-- Dograh features Vaani skips for now: per-node `allow_interrupt`,
+- Dograh features Vaani skips for now: muting the caller during queued
+  messages (tool messages, transition speech) regardless of the node,
   audio greetings and recordings, `delayed_start`, voicemail detection,
   pre-call fetch, context summarization, realtime (speech-to-speech) models.

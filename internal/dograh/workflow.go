@@ -35,6 +35,7 @@ type nodeData struct {
 	Prompt          string   `json:"prompt"`
 	IsStart         bool     `json:"is_start"`
 	IsEnd           bool     `json:"is_end"`
+	AllowInterrupt  bool     `json:"allow_interrupt"`   // absent = false, Dograh's default (dto.py)
 	AddGlobalPrompt *bool    `json:"add_global_prompt"` // Dograh's default: true
 	Greeting        string   `json:"greeting"`
 	GreetingType    string   `json:"greeting_type"`
@@ -113,7 +114,7 @@ func buildWorkflow(wf workflowJSON, vars map[string]any, tools []ToolRow, now ti
 		}
 
 		d := n.Data
-		node := &agent.Node{Name: d.Name, End: d.IsEnd}
+		node := &agent.Node{Name: d.Name, End: d.IsEnd, AllowInterrupt: d.AllowInterrupt}
 
 		var parts []string
 		if globalPrompt != "" && (d.AddGlobalPrompt == nil || *d.AddGlobalPrompt) {

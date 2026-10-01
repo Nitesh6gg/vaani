@@ -77,15 +77,23 @@ Barge-in while speaking: a per-call VAD -- TEN VAD (`VAD_MODE=ten`, vendored
 under `third_party/ten-vad/`, `internal/ai/agent/tenvad`) or an RMS energy
 gate -- watches the inbound audio; a sustained speech verdict cuts the turn
 (LLM stream and TTS connection cancelled, queue drained) and the caller's
-utterance becomes the next turn. `BARGE_IN_ENABLED=0` puts the detector in
-observe-only mode: transitions keep logging, nothing is ever cut. Full knob
-table in `docs/AI_PROVIDERS.md`; state machine in
+utterance becomes the next turn -- only at workflow nodes whose Dograh
+`allow_interrupt` is on; elsewhere the caller is ignored until the agent
+finishes. `BARGE_IN_ENABLED=0` puts the detector in observe-only mode:
+transitions keep logging, nothing is ever cut. Full knob table and the
+per-node rule in `docs/AI_PROVIDERS.md`; state machine in
 `internal/ai/agent/handler.go`.
 
 History: the conversation the LLM sees records only what the caller actually
 heard. A reply that plays out is recorded whole; one cut short (barge-in, dead
 TTS connection) is recorded only up to the sentence that was playing. Tool
 calls and their results are recorded ahead of the spoken reply.
+
+Conversation in the logs: each accepted caller transcript is logged as
+`[User] call_id=... text="..."`, and each agent reply -- exactly the part the
+caller heard, greeting, transition speech and tool messages included -- as
+`[Agent] call_id=... gen=N text="..." cut=false|true` once it has finished
+playing or been cut, so the two read in conversation order.
 
 ### Configured in Dograh
 
@@ -145,6 +153,13 @@ greeting -- are logged as `agent: workflow: ...` warnings and skipped.
   message, as pipecat's Google service does for a system-only context.
 - **End node:** the reply generated there is the closing line; the call
   hangs up once it has played (`agent ending call reason=end_call`).
+- **Interruption:** each node's `allow_interrupt` (absent = off, Dograh's
+  default) decides whether the caller can cut in while the agent speaks
+  there -- see "Barge-in configuration" in `docs/AI_PROVIDERS.md`. Each
+  `node transition` line shows the new node's setting and the effective
+  result with the `BARGE_IN_ENABLED` master switch applied
+  (`allow_interrupt=true interrupt=on`); `agent workflow loaded` shows the
+  same for the start node (`start_allow_interrupt`, `start_interrupt`).
 - Up to 5 LLM rounds per turn (`maxToolRounds`), so a model stuck calling
   functions can't keep the caller waiting indefinitely.
 

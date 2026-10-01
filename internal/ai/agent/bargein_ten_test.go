@@ -295,3 +295,26 @@ func TestHandler_ObserveOnlyNeverCuts(t *testing.T) {
 		"the detector's transition logging must survive in observe-only mode")
 	assert.NotContains(t, buf.String(), "agent barge-in detected")
 }
+
+func TestTenVadDetector_LastSpeechAtTracksSpeechHops(t *testing.T) {
+	speech := false
+	d := NewTenVadDetector("call1", func([]int16) (bool, error) { return speech, nil })
+
+	frame := make([]byte, 640)
+
+	d.Detect(frame)
+	assert.True(t, d.LastSpeechAt().IsZero(), "no speech heard yet")
+
+	speech = true
+	before := time.Now()
+	d.Detect(frame)
+	heard := d.LastSpeechAt()
+	assert.False(t, heard.Before(before), "a speech hop updates it")
+
+	speech = false
+	d.Detect(frame)
+	d.Detect(frame)
+	assert.Equal(t, heard, d.LastSpeechAt(), "silent hops leave it at the last speech")
+
+	var _ speechClock = d // the Handler's optional interface
+}

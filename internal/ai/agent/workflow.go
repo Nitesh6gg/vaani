@@ -16,7 +16,13 @@ type Node struct {
 	Greeting string
 	// End marks an end node: reaching it, the LLM says its closing line and
 	// the call hangs up once that has played.
-	End   bool
+	End bool
+	// AllowInterrupt is Dograh's allow_interrupt: whether the caller may cut
+	// in while the agent speaks at this node. When false their speech is
+	// ignored until the agent finishes (Dograh mutes the user). Only takes
+	// effect with barge-in enabled (Config.BargeInObserveOnly false).
+	AllowInterrupt bool
+
 	Tools []Tool
 	Edges []Edge
 }
@@ -30,6 +36,17 @@ type Edge struct {
 	// transition_speech).
 	Speech string
 	To     *Node
+}
+
+// InterruptMode is "on" when the caller can cut in while the agent speaks at
+// n: barge-in enabled (BARGE_IN_ENABLED, the master switch) and the node's
+// allow_interrupt on. For logs.
+func InterruptMode(bargeInEnabled bool, n *Node) string {
+	if bargeInEnabled && n.AllowInterrupt {
+		return "on"
+	}
+
+	return "off"
 }
 
 // toolDefs is what the LLM is offered while at n: its tools, then its edges.

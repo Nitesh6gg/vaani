@@ -111,20 +111,38 @@ startup -- changing any of them requires a restart.
 
 | Env | Meaning |
 |---|---|
-| `BARGE_IN_ENABLED` | `1` (default) = interruption on. `0` = never cut, two flavors: with `VAD_MODE=ten` the VAD still runs in observe-only mode and keeps logging `speech started`/`speech ended`; with `VAD_MODE=energy` barge-in is fully off (no-op detector). |
+| `BARGE_IN_ENABLED` | Master switch. `1` (default) = interruption on, **at workflow nodes whose `allow_interrupt` is on in Dograh** (see below). `0` = never cut, whatever the nodes say, two flavors: with `VAD_MODE=ten` the VAD still runs in observe-only mode and keeps logging `speech started`/`speech ended`; with `VAD_MODE=energy` barge-in is fully off (no-op detector). |
 | `VAD_MODE` | `energy` (default): RMS-threshold detector, no native dependency. `ten`: TEN VAD, a real neural VAD that tells speech from coughs/music/line noise (native library vendored under `third_party/ten-vad`; Linux/cgo only -- elsewhere, or if the library can't load, calls fall back to `energy` with a loud warning). |
 | `TEN_VAD_THRESHOLD` | TEN VAD speech-probability threshold in [0,1], default 0.5. Only used when `VAD_MODE=ten`. |
 | `BARGE_IN_RMS_FLOOR` | Energy detector's RMS speech threshold. Only used when `VAD_MODE=energy`. |
 | `BARGE_IN_GUARD_MS` | Ignores detection this long after playback starts, so the agent's own voice leaking into the mic can't immediately self-trigger. Default 300. |
 | `POST_CUT_SILENCE_MS` | After a cut, how long before a new turn is accepted: the cut flushes a junk partial-utterance transcript to STT ~0.5-1.5s later, and this gate drops exactly those while still catching the caller's real next utterance. Default 1200. |
 
+**Per node (Dograh's `allow_interrupt`).** Even with `BARGE_IN_ENABLED=1`, the
+caller can only cut in while the agent speaks at a workflow node whose
+`allow_interrupt` is on; a node without the field counts as off, Dograh's
+default. At other nodes the caller's speech is ignored until the agent
+finishes -- Dograh's `should_mute_user` (`pipecat_engine.py`). The node that
+counts is the one the conversation is at when the caller speaks. One
+difference from Dograh: Dograh also ignores the caller while its own queued
+messages play (a tool's custom message, an edge's transition speech) at any
+node; Vaani applies the current node's setting to those too. During a
+transfer's hold audio there is no barge-in at all, in both. The logs show
+which applies: `node transition ... allow_interrupt=true interrupt=on`
+(`interrupt` is the effective result, `off` whenever `BARGE_IN_ENABLED=0`),
+and `start_allow_interrupt`/`start_interrupt` on `agent workflow loaded` for
+the start node.
+
 While the agent is speaking, the active detector logs `speech started` /
 `speech ended` transitions (one per utterance boundary; per-hop verdicts are
-never logged), and a sustained interrupt fires `agent barge-in detected`,
-which cuts playback, cancels the in-flight LLM stream and TTS connection, and
-flushes queued audio -- after which the caller's utterance becomes the next
-turn. Turning `BARGE_IN_ENABLED` to `0` silences all of it for a quiet test
-run.
+never logged), and a sustained interrupt at an interruptible node fires
+`agent barge-in detected`, which cuts playback, cancels the in-flight LLM
+stream and TTS connection, and flushes queued audio -- after which the
+caller's utterance becomes the next turn. With `VAD_MODE=ten` the detector
+also runs while the agent is listening (for the latency fields below), so
+`speech started`/`speech ended` lines appear between replies too; that
+listening-time verdict never cuts anything. Turning `BARGE_IN_ENABLED` to
+`0` stops all cutting; with `VAD_MODE=energy` it also silences the logging.
 
 ## Turn latency in the logs
 
@@ -132,23 +150,39 @@ Per turn, all in milliseconds:
 
 | Log line | Field | From -> to |
 |---|---|---|
+| `stt final transcript` | `end_detect_ms` | the caller's last sound (TEN VAD) -> Sarvam's `END_SPEECH`: how long Sarvam took to decide they'd stopped |
 | `stt final transcript` | `endpoint_ms` | Sarvam's `END_SPEECH` -> its transcript |
 | `llm first token` | `latency_ms` | transcript accepted -> first LLM token |
 | `tts first audio` | `latency_ms` | transcript accepted -> first TTS audio received |
-| `tts first audio` | `since_speech_end_ms` | Sarvam's `END_SPEECH` -> first TTS audio received: the caller's wait |
+| `tts first audio` | `since_speech_end_ms` | Sarvam's `END_SPEECH` -> first TTS audio received |
+| `tts first audio` | `since_last_speech_ms` | the caller's last sound (TEN VAD) -> first TTS audio received: the closest figure to the caller's wait |
 | `turn complete` | `total_latency_ms` | transcript accepted -> the reply has fully played |
 
-`endpoint_ms` and `since_speech_end_ms` appear only on turns started by the
-caller speaking, and only when Sarvam sent `END_SPEECH` for that utterance --
-never borrowed from an earlier one (START_SPEECH clears it; the transcript
-consumes it even if it's dropped). They use the time `END_SPEECH` *arrived*,
-on this process's clock, not Sarvam's `occured_at` field: a sibling project
-measured Sarvam's clock ~3.9s off (`D:\go-agent-worker` ADR-017). Two things
-they leave out: `END_SPEECH` is Sarvam's *detection* time, which trails the
-caller's actual last sound (by ~400ms in that project's one measurement), and
-"first audio received" is when the first TTS chunk reached Vaani -- it goes
-out on the next 20ms tick. So the caller's real wait is somewhat longer than
-`since_speech_end_ms`.
+**Sarvam-based fields** (`endpoint_ms`, `since_speech_end_ms`) appear only
+on turns started by the caller speaking, and only when Sarvam sent
+`END_SPEECH` for that utterance -- never borrowed from an earlier one
+(START_SPEECH clears it; the transcript consumes it even if it's dropped).
+They use the time `END_SPEECH` *arrived*, on this process's clock, not
+Sarvam's `occured_at` field: a sibling project measured Sarvam's clock ~3.9s
+off (`D:\go-agent-worker` ADR-017). `END_SPEECH` is Sarvam's *detection*
+time, which trails the caller's actual last sound -- which is what the two
+VAD-based fields measure.
+
+**VAD-based fields** (`end_detect_ms`, `since_last_speech_ms`) need
+`VAD_MODE=ten` with the native library loaded (with or without
+`BARGE_IN_ENABLED`): TEN VAD then also runs
+while the agent is listening, on the same 20ms frames that go to Sarvam, and
+records when it last heard speech (any single 16ms hop). At `END_SPEECH` that
+time is taken as the caller's last sound -- but only if it is later than the
+previous `END_SPEECH` and later than when the agent last stopped speaking, so
+a stale value or the agent's own echo is never used (correlating two
+independently-timed signals after the fact broke twice in that sibling
+project, ADR-016). Otherwise both fields are left out for that turn. "Last
+sound" is when Vaani processed that audio, which trails the caller's mouth
+by the network path (plus the jitter buffer for RTP), and "first audio
+received" is when the first TTS chunk reached Vaani -- it goes out on the
+next 20ms tick. So the caller's real wait is somewhat longer than
+`since_last_speech_ms`, by roughly the network round trip.
 
 ## Open questions
 

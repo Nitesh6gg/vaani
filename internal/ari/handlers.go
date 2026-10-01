@@ -554,6 +554,8 @@ func (m *Manager) loadWorkflow(c *call) (*dograh.Workflow, error) {
 
 	slog.Info("agent workflow loaded", "call_id", c.ID, "workflow_id", m.cfg.DograhWorkflowID,
 		"start_node", wf.Start.Name, "opening", opening, "start_tools", toolNames(wf.Start),
+		"start_allow_interrupt", wf.Start.AllowInterrupt,
+		"start_interrupt", agent.InterruptMode(m.cfg.BargeInEnabled, wf.Start),
 		"idle_timeout_s", wf.IdleTimeout.Seconds(), "max_duration_s", wf.MaxDuration.Seconds())
 
 	// Never the keys.

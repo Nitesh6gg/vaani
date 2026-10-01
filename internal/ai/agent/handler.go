@@ -244,6 +244,11 @@ type Handler struct {
 	// by ProcessFrame's goroutine.
 	hold atomic.Pointer[holdPlayer]
 
+	// clock is Config.BargeIn when that detector can say when it last heard
+	// speech (TEN VAD); then it also runs while listening, so the caller's
+	// last sound before each STT end-of-speech is known. Nil otherwise.
+	clock speechClock
+
 	// node is the workflow node the conversation is at. Read by run() when a
 	// turn starts; moved by runLLMTurn's goroutine the moment the LLM takes
 	// an edge (as in Dograh, a transition sticks even if the caller then
@@ -285,6 +290,19 @@ type Handler struct {
 	// it understate what the caller experiences by that much.
 	speechEndAt     time.Time
 	turnSpeechEndAt time.Time
+	// lastSoundAt is the caller's last sound before that END_SPEECH, as the
+	// local VAD (clock) heard it -- only with a VAD that can tell (TEN VAD),
+	// and only when that sound provably belongs to this utterance: after the
+	// previous END_SPEECH (prevSpeechEndAt) and after the agent last stopped
+	// speaking (agentQuietSince), so a stale value or the agent's own echo
+	// is never used. Otherwise zero, and the figures built on it are left
+	// out (two independently-timed signals correlated after the fact broke
+	// twice in D:\go-agent-worker, ADR-016). turnLastSoundAt is the turn's
+	// copy, like turnSpeechEndAt.
+	lastSoundAt     time.Time
+	turnLastSoundAt time.Time
+	prevSpeechEndAt time.Time
+	agentQuietSince time.Time
 	// dropWarnedGen records which generation's outbound-buffer-full warning has
 	// already been logged, so an oversized reply that overflows the buffer logs
 	// once for the whole turn instead of once per dropped frame -- observed
@@ -362,6 +380,7 @@ func NewHandler(ctx context.Context, callID string, cfg Config) *Handler {
 	}
 
 	h.node.Store(cfg.Start)
+	h.clock, _ = cfg.BargeIn.(speechClock)
 
 	go h.readSTT()
 	go h.run()
@@ -400,6 +419,13 @@ func (h *Handler) ProcessFrame(_ context.Context, _ string, pcm []byte) [][]byte
 			h.cfg.Sink.Error("stt")
 		}
 
+		// The same frame Sarvam just got, so the VAD's "last speech" lines
+		// up with what Sarvam is endpointing. Only for timing (see
+		// lastSoundAt): the verdict is not used here.
+		if h.clock != nil {
+			h.cfg.BargeIn.Detect(pcm)
+		}
+
 		return nil
 
 	case StateThinking:
@@ -429,8 +455,11 @@ func (h *Handler) processSpeakingFrame(pcm []byte) [][]byte {
 	// logging VAD) the verdict changes nothing else.
 	detected := h.cfg.BargeIn.Detect(pcm)
 
+	// A cut needs barge-in enabled (the master switch) AND the current node
+	// to allow interruption (Dograh's allow_interrupt; otherwise the caller
+	// is muted while the agent speaks, as in Dograh's should_mute_user).
 	elapsed := time.Duration(time.Now().UnixNano() - h.speakingSince.Load())
-	if detected && !h.cfg.BargeInObserveOnly && elapsed >= h.cfg.BargeInGuard {
+	if detected && !h.cfg.BargeInObserveOnly && h.node.Load().AllowInterrupt && elapsed >= h.cfg.BargeInGuard {
 		// Order matters: flip state and flush BEFORE signaling run() to cut
 		// the turn, so the very next ProcessFrame call (20ms later) already
 		// resumes feeding STT live instead of re-detecting the same barge-in.
@@ -613,6 +642,7 @@ func (h *Handler) handleEvent(ev any) {
 		// into the front of the next turn's audio, and records whatever part
 		// of the reply actually played before the TTS went silent.
 		h.ttsBuf = nil
+		h.agentQuietSince = time.Now()
 		h.recordReply(true)
 
 		if h.ending {
@@ -636,14 +666,24 @@ func (h *Handler) post(ev any) {
 // switch silence detection off for the rest of the call.
 func (h *Handler) handleCallerSpeech(started bool) {
 	if started {
-		h.speechEndAt = time.Time{}
+		h.speechEndAt, h.lastSoundAt = time.Time{}, time.Time{}
 		h.stopIdleTimer()
 		h.idleCount = 0
 
 		return
 	}
 
-	h.speechEndAt = time.Now()
+	now := time.Now()
+	h.speechEndAt, h.lastSoundAt = now, time.Time{}
+
+	if h.clock != nil {
+		last := h.clock.LastSpeechAt()
+		if last.After(h.prevSpeechEndAt) && last.After(h.agentQuietSince) && !last.After(now) {
+			h.lastSoundAt = last
+		}
+	}
+
+	h.prevSpeechEndAt = now
 
 	if h.idleArmed && State(h.state.Load()) == StateListening {
 		h.startIdleTimer()
@@ -802,8 +842,8 @@ func (h *Handler) handleFinalTranscript(text string) {
 	// This transcript's own end-of-speech, if the STT sent one -- consumed
 	// here even if the transcript is dropped below, so it can never be
 	// attributed to a later utterance.
-	speechEnd := h.speechEndAt
-	h.speechEndAt = time.Time{}
+	speechEnd, lastSound := h.speechEndAt, h.lastSoundAt
+	h.speechEndAt, h.lastSoundAt = time.Time{}, time.Time{}
 
 	if time.Now().UnixNano() < h.silenceUntil.Load() {
 		slog.Debug("agent: dropping final transcript inside post-cut silence gate", "call_id", h.callID)
@@ -817,17 +857,24 @@ func (h *Handler) handleFinalTranscript(text string) {
 
 	h.history = append(h.history, llm.Message{Role: "user", Content: text})
 
+	slog.Info("[User]", "call_id", h.callID, "text", text)
+
 	args := []any{"call_id", h.callID, "gen", h.curGen + 1, "text", text}
 	if !speechEnd.IsZero() {
 		// Sarvam's end-of-speech detection -> its transcript.
 		args = append(args, "endpoint_ms", time.Since(speechEnd).Milliseconds())
+
+		if !lastSound.IsZero() {
+			// The caller's last sound (local VAD) -> Sarvam's end-of-speech.
+			args = append(args, "end_detect_ms", speechEnd.Sub(lastSound).Milliseconds())
+		}
 	}
 
 	slog.Info("stt final transcript", args...)
 
 	h.idleCount = 0
 	h.startTurn()
-	h.turnSpeechEndAt = speechEnd
+	h.turnSpeechEndAt, h.turnLastSoundAt = speechEnd, lastSound
 }
 
 // startTurn runs one LLM turn over the current history: after the caller
@@ -841,7 +888,7 @@ func (h *Handler) startTurn() {
 	h.curGen++
 	gen := h.curGen
 	h.turnStartedAt = time.Now()
-	h.turnSpeechEndAt = time.Time{} // handleFinalTranscript sets its own after this
+	h.turnSpeechEndAt, h.turnLastSoundAt = time.Time{}, time.Time{} // handleFinalTranscript sets its own after this
 	h.startTurnChunks()
 
 	if !h.openTTS(gen) {
@@ -1029,7 +1076,8 @@ func (h *Handler) takeEdge(ctx context.Context, ttsClient tts.Client, from *Node
 	}
 
 	slog.Info("node transition", "call_id", h.callID, "gen", gen,
-		"from", from.Name, "to", e.To.Name, "via", e.Def.Name)
+		"from", from.Name, "to", e.To.Name, "via", e.Def.Name,
+		"allow_interrupt", e.To.AllowInterrupt, "interrupt", InterruptMode(!h.cfg.BargeInObserveOnly, e.To))
 	h.node.Store(e.To)
 
 	return e.To, `{"status":"done"}`
@@ -1383,6 +1431,12 @@ func (h *Handler) handleTTSAudio(pcm []byte, gen, req uint64, text string) {
 			args = append(args, "since_speech_end_ms", time.Since(h.turnSpeechEndAt).Milliseconds())
 		}
 
+		if !h.turnLastSoundAt.IsZero() {
+			// From the caller's last sound (local VAD): the closest figure
+			// to the wait the caller experiences.
+			args = append(args, "since_last_speech_ms", time.Since(h.turnLastSoundAt).Milliseconds())
+		}
+
 		slog.Info("tts first audio", args...)
 
 		// Only start draining outbound to the caller once real audio has
@@ -1472,6 +1526,7 @@ func (h *Handler) finishTurn(gen uint64) {
 	slog.Info("turn complete", "call_id", h.callID, "gen", gen,
 		"total_latency_ms", time.Since(h.turnStartedAt).Milliseconds())
 
+	h.agentQuietSince = time.Now()
 	h.recordReply(false)
 	h.ttsBuf = nil
 
@@ -1525,8 +1580,9 @@ func (h *Handler) recordReply(cut bool) {
 	}
 
 	h.history = append(h.history, llm.Message{Role: "assistant", Content: text})
-	slog.Info("agent reply recorded", "call_id", h.callID, "gen", h.curGen,
-		"cut", cut, "chars", len([]rune(text)))
+	// Exactly what the caller heard of this reply (cut: only up to where it
+	// was interrupted).
+	slog.Info("[Agent]", "call_id", h.callID, "gen", h.curGen, "text", text, "cut", cut)
 }
 
 // startTurnChunks resets reply tracking at the start of a new turn.
@@ -1563,6 +1619,7 @@ func (h *Handler) handleBargeIn() {
 	}
 
 	h.curGen++ // invalidate the interrupted turn's in-flight audio/done events
+	h.agentQuietSince = time.Now()
 
 	// Keep only what the caller heard before cutting in. Safe to read
 	// playingReq here: processSpeakingFrame flipped state to Transcribing
