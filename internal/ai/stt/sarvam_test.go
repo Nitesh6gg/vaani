@@ -63,11 +63,43 @@ func TestSarvamClient_DialSendsExpectedQueryParamsAndHeader(t *testing.T) {
 		assert.Equal(t, []string{"transcribe"}, q["mode"])
 		assert.Equal(t, []string{"16000"}, q["sample_rate"])
 		assert.Equal(t, []string{"true"}, q["vad_signals"])
+		assert.Empty(t, q["flush_signal"], "flush_signal only when asked for")
 	case <-time.After(time.Second):
 		t.Fatal("server never observed a connection")
 	}
 
 	assert.Equal(t, "test-key", <-gotKey)
+}
+
+func TestSarvamClient_FlushSignal(t *testing.T) {
+	gotQuery := make(chan map[string][]string, 1)
+	gotMsg := make(chan string, 1)
+
+	srv := sttServer(t, func(conn *websocket.Conn, r *http.Request) {
+		gotQuery <- r.URL.Query()
+
+		_, data, err := conn.ReadMessage()
+		if err == nil {
+			gotMsg <- string(data)
+		}
+	})
+
+	c, err := NewSarvamClient(context.Background(), "call1", Config{
+		WSURL: wsURL(srv.URL), APIKey: "k", Model: "saaras:v4", FlushSignal: true,
+	})
+	require.NoError(t, err)
+	defer func() { _ = c.Close() }()
+
+	assert.Equal(t, []string{"true"}, (<-gotQuery)["flush_signal"])
+
+	require.NoError(t, c.Flush())
+
+	select {
+	case m := <-gotMsg:
+		assert.JSONEq(t, `{"type":"flush"}`, m, "the Sarvam SDK's SttFlushSignal")
+	case <-time.After(time.Second):
+		t.Fatal("no flush message received")
+	}
 }
 
 func TestSarvamClient_DialDefaultsLanguageToUnknown(t *testing.T) {

@@ -33,6 +33,10 @@ const (
 type Client interface {
 	// Feed sends one 20ms LE PCM16 frame to the provider.
 	Feed(pcm []byte) error
+	// Flush asks the provider to finalize what it has heard so far now,
+	// instead of waiting for its own end-of-speech detection (only honoured
+	// when the connection was opened with Config.FlushSignal).
+	Flush() error
 	// Results returns the channel of transcript events for this connection.
 	// Closed when the connection ends.
 	Results() <-chan Result
@@ -50,4 +54,10 @@ type Config struct {
 	// Language is Sarvam's language-code query param, e.g. "hi-IN". "unknown"
 	// (Sarvam's auto-detect) is used if empty.
 	Language string
+
+	// FlushSignal opens the connection with flush_signal=true, so Flush's
+	// {"type":"flush"} message forces a final transcript (Sarvam SDK:
+	// "flush the audio buffer and force finalize partial transcriptions";
+	// Dograh uses it on its local VAD's end of speech).
+	FlushSignal bool
 }

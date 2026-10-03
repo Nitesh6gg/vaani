@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/nitesh/vaani/internal/ai/llm"
 	"github.com/nitesh/vaani/internal/ai/stt"
@@ -154,6 +155,13 @@ type Config struct {
 	// (pipecat start_secs). Without it, a ~50ms burst (3 of 5 16ms TEN VAD
 	// hops) was enough: observed live, noise cut 6 of 7 replies in one call.
 	BargeInMinSpeech time.Duration
+	// STTFlushAfter, when set (STT_FLUSH_AFTER_MS), asks the STT to finalize
+	// once the local VAD has heard this much quiet after the caller spoke,
+	// instead of waiting for the STT's own end-of-speech detection (Sarvam:
+	// ~600-700ms, the largest part of the reply delay) -- Dograh does the
+	// same on its Silero VAD's 0.2s stop. Needs a VAD that tracks its last
+	// speech (TEN VAD) and an STT opened with stt.Config.FlushSignal. 0 = off.
+	STTFlushAfter time.Duration
 	// PostCutSilence: transcripts arriving this soon after an interruption
 	// pauses the reply are ignored -- they were already on their way, not
 	// what the caller is saying now. Junk later on is caught by content
@@ -256,6 +264,15 @@ type Handler struct {
 	// the reply is cut; quiet without one means it was noise and the reply
 	// resumes where it stopped (see handleBargeIn / handleResumeCheck).
 	paused atomic.Bool
+	// Early STT finalization (Config.STTFlushAfter). sttUttStart is when the
+	// STT reported the caller starting the current utterance (UnixNano; 0:
+	// none yet) and sttUtterance whether it has them mid-utterance (START
+	// seen, END not yet) -- both set by run(); sttFlushAt is when a flush was
+	// last sent, set by ProcessFrame and read by run() for the latency log.
+	sttUttStart  atomic.Int64
+	sttUtterance atomic.Bool
+	sttFlushAt   atomic.Int64
+
 	// replayPending is set by run() when it resumes a paused reply, telling
 	// ProcessFrame to restart the interrupted sentence (see sentFrames).
 	replayPending atomic.Bool
@@ -382,6 +399,9 @@ type Handler struct {
 	sentFrames       [][]byte
 	replaying        bool
 	replayIdx        int
+	// flushedUtt is the sttUttStart of the utterance already flushed, so
+	// each utterance is flushed at most once.
+	flushedUtt int64
 	// emptyTicks counts consecutive Speaking-state release ticks that found
 	// the outbound queue empty without ttsDeliveryDone set -- the drain
 	// dead-call safeguard in processSpeakingFrame. A counter, not a stored
@@ -462,6 +482,10 @@ func (h *Handler) ProcessFrame(_ context.Context, _ string, pcm []byte) [][]byte
 	// "हाँ जी" and "नहीं" with its first syllable missing.
 	if err := h.cfg.STT.Feed(pcm); err != nil {
 		h.cfg.Sink.Error("stt")
+	}
+
+	if h.cfg.STTFlushAfter > 0 && h.clock != nil {
+		h.maybeFlushSTT()
 	}
 
 	switch State(h.state.Load()) {
@@ -612,6 +636,45 @@ func (h *Handler) processSpeakingFrame(pcm []byte) [][]byte {
 	return nil
 }
 
+// sttFlushOnsetSlack: the VAD's last speech must be no older than this
+// before the STT reported the utterance starting, to count as part of it --
+// the STT's START_SPEECH lags the caller's first sound. If the VAD didn't
+// hear the utterance at all, nothing is flushed and the STT's own
+// end-of-speech decides, as without the feature.
+const sttFlushOnsetSlack = 500 * time.Millisecond
+
+// maybeFlushSTT asks the STT to finalize the current utterance once the
+// VAD has heard STTFlushAfter of quiet after it -- at most once per
+// utterance (ProcessFrame goroutine).
+func (h *Handler) maybeFlushSTT() {
+	utt := h.sttUttStart.Load()
+	if !h.sttUtterance.Load() || utt == 0 || utt == h.flushedUtt {
+		return
+	}
+
+	last := h.clock.LastSpeechAt()
+	if last.IsZero() || last.Before(time.Unix(0, utt).Add(-sttFlushOnsetSlack)) {
+		return // the VAD didn't hear this utterance
+	}
+
+	quiet := time.Since(last)
+	if quiet < h.cfg.STTFlushAfter {
+		return
+	}
+
+	h.flushedUtt = utt
+	h.sttFlushAt.Store(time.Now().UnixNano())
+
+	if err := h.cfg.STT.Flush(); err != nil {
+		h.cfg.Sink.Error("stt")
+		slog.Warn("stt flush failed", "call_id", h.callID, "error", err)
+
+		return
+	}
+
+	slog.Info("stt flush sent", "call_id", h.callID, "quiet_ms", quiet.Milliseconds())
+}
+
 // interruptible: the caller may cut in right now -- barge-in enabled (the
 // BARGE_IN_ENABLED master switch), the current node allows it (Dograh's
 // allow_interrupt; an end node never does), and the call isn't closing.
@@ -737,8 +800,10 @@ func (h *Handler) post(ev any) {
 // switch silence detection off for the rest of the call.
 func (h *Handler) handleCallerSpeech(started bool) {
 	h.callerSpeaking = started
+	h.sttUtterance.Store(started)
 
 	if started {
+		h.sttUttStart.Store(time.Now().UnixNano())
 		h.speechEndAt, h.lastSoundAt = time.Time{}, time.Time{}
 		h.stopIdleTimer()
 		h.idleCount = 0
@@ -920,6 +985,13 @@ func (h *Handler) handleFinalTranscript(text string) {
 	speechEnd, lastSound := h.speechEndAt, h.lastSoundAt
 	h.speechEndAt, h.lastSoundAt = time.Time{}, time.Time{}
 
+	// When an early-finalize flush was sent for this utterance (see
+	// maybeFlushSTT) -- consumed the same way.
+	var flushedAt time.Time
+	if f := h.sttFlushAt.Swap(0); f != 0 && f >= h.sttUttStart.Load() {
+		flushedAt = time.Unix(0, f)
+	}
+
 	if time.Now().UnixNano() < h.silenceUntil.Load() {
 		// Arrived too soon after the pause to be what the caller is saying
 		// now -- Sarvam needs ~0.7s after they stop just to send a transcript,
@@ -972,6 +1044,12 @@ func (h *Handler) handleFinalTranscript(text string) {
 			// The caller's last sound (local VAD) -> Sarvam's end-of-speech.
 			args = append(args, "end_detect_ms", speechEnd.Sub(lastSound).Milliseconds())
 		}
+	}
+
+	if !flushedAt.IsZero() {
+		// The early-finalize flush -> this transcript. With speechEnd absent,
+		// the transcript beat Sarvam's own end-of-speech: the flush worked.
+		args = append(args, "since_flush_ms", time.Since(flushedAt).Milliseconds())
 	}
 
 	slog.Info("stt final transcript", args...)
@@ -1687,17 +1765,33 @@ func (h *Handler) finishTurn(gen uint64) {
 func (h *Handler) recordReply(cut bool) {
 	played := h.playingReq.Load()
 
-	var b strings.Builder
+	var (
+		b    strings.Builder
+		last rune
+	)
 
 	for _, c := range h.turnChunks {
 		if cut && (played == 0 || c.req > played) {
 			break
 		}
 
-		// Plain concatenation: LLM chunks carry their own spacing, and pieces
-		// spoken on their own (transition speech, tool messages) are sent with
-		// a trailing space. Never insert one here -- a chunk can end mid-word.
+		// LLM chunks carry their own spacing, and pieces spoken on their own
+		// (transition speech, tool messages) are sent with a trailing space.
+		// The one gap left is between two LLM rounds (text before a tool
+		// call, then the reply after it): a round's first token has no
+		// leading space ("नमस्ते।Thank you", live). So add one after a
+		// sentence end or comma only -- never elsewhere, as a chunk can end
+		// mid-word.
+		first, _ := utf8.DecodeRuneInString(c.text)
+		if (sentenceDelimiters[last] || last == ',') && first != utf8.RuneError && !unicode.IsSpace(first) {
+			b.WriteByte(' ')
+		}
+
 		b.WriteString(c.text)
+
+		if r, _ := utf8.DecodeLastRuneInString(c.text); r != utf8.RuneError {
+			last = r
+		}
 	}
 
 	h.turnChunks = nil

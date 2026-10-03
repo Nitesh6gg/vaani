@@ -122,6 +122,11 @@ type Config struct {
 	// default 200 -- Dograh's live setting, pipecat's VAD start_secs 0.2).
 	// See internal/ai/agent.Config.BargeInMinSpeech.
 	BargeInMinSpeech time.Duration
+	// STTFlushAfter (STT_FLUSH_AFTER_MS, default 0 = off): once TEN VAD has
+	// heard this much quiet after the caller spoke, ask Sarvam to finalize
+	// the transcript now instead of waiting for its own end-of-speech
+	// (~600-700ms). Experimental -- see internal/ai/agent.Config.STTFlushAfter.
+	STTFlushAfter time.Duration
 	// PostCutSilence is how long after an interruption pauses the reply
 	// transcripts are ignored. See internal/ai/agent.Config.PostCutSilence.
 	PostCutSilence time.Duration
@@ -280,6 +285,17 @@ func Load() (Config, error) {
 	}
 
 	cfg.BargeInMinSpeech = time.Duration(bargeInMinSpeechMS) * time.Millisecond
+
+	sttFlushAfterMS, err := getEnvInt("STT_FLUSH_AFTER_MS", 0)
+	if err != nil {
+		return Config{}, err
+	}
+
+	if sttFlushAfterMS < 0 {
+		return Config{}, fmt.Errorf("config: STT_FLUSH_AFTER_MS must be >= 0 (0 = off), got %d", sttFlushAfterMS)
+	}
+
+	cfg.STTFlushAfter = time.Duration(sttFlushAfterMS) * time.Millisecond
 
 	// 300ms: transcripts this soon after an interruption pauses the reply
 	// were already on their way (Sarvam needs ~0.7s after the caller stops

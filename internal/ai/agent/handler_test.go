@@ -40,6 +40,7 @@ func captureSlog(t *testing.T) func() *bytes.Buffer {
 type fakeSTT struct {
 	mu      sync.Mutex
 	fed     [][]byte
+	flushes int
 	results chan stt.Result
 	closed  bool
 }
@@ -58,6 +59,22 @@ func (f *fakeSTT) Feed(pcm []byte) error {
 }
 
 func (f *fakeSTT) Results() <-chan stt.Result { return f.results }
+
+func (f *fakeSTT) Flush() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.flushes++
+
+	return nil
+}
+
+func (f *fakeSTT) flushCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.flushes
+}
 
 func (f *fakeSTT) Close() error {
 	f.mu.Lock()
@@ -261,6 +278,7 @@ func TestHandler_GreetingIsSpokenWithoutWaitingForCaller(t *testing.T) {
 	fTTS.done <- gen
 	drainUntilListening(t, h)
 
+	require.Eventually(t, func() bool { return len(h.history) == 1 }, time.Second, time.Millisecond)
 	assert.Equal(t, []llm.Message{{Role: "assistant", Content: "Hi, this side Shubh."}}, h.history,
 		"the greeting must be recorded so the LLM doesn't redundantly re-greet")
 }
@@ -299,6 +317,7 @@ func TestHandler_FullyPlayedReplyIsRecordedInHistory(t *testing.T) {
 
 	drainUntilListening(t, h)
 
+	require.Eventually(t, func() bool { return len(h.history) == 2 }, time.Second, time.Millisecond)
 	assert.Equal(t, []llm.Message{
 		{Role: "user", Content: "hi"},
 		{Role: "assistant", Content: "Hello there. How are you?"},
@@ -681,6 +700,78 @@ func TestRecordReplyJoinsChunksAsSpoken(t *testing.T) {
 
 	h.recordReply(false)
 	assert.Equal(t, "चलिए मुख्य विषय पर बात करते हैं। सड़क और बिजली, या कानून व्यवस्था? Next one.", h.history[0].Content)
+
+	// Two LLM rounds (text before end_call, then the end node's reply): the
+	// second round's first token has no leading space (live: "नमस्ते।Thank").
+	h.turnChunks = []spokenChunk{
+		{req: 1, text: "आपका दिन शुभ हो। नमस्ते।"},
+		{req: 2, text: "Thank you for the call."},
+	}
+
+	h.recordReply(false)
+	assert.Equal(t, "आपका दिन शुभ हो। नमस्ते। Thank you for the call.", h.history[1].Content)
+}
+
+func TestHandler_STTFlushAfterQuiet(t *testing.T) {
+	getLog := captureSlog(t)
+
+	fSTT := newFakeSTT()
+	vad := &fakeClockDetector{}
+
+	cfg := testConfig(fSTT, newFakeTTS(), &fakeLLM{tokens: []string{"Okay."}}, time.Hour, 0)
+	cfg.BargeIn = vad
+	cfg.STTFlushAfter = 300 * time.Millisecond
+	h := NewHandler(context.Background(), "call1", cfg)
+
+	tick := func() { h.ProcessFrame(context.Background(), "call1", constFrame(quietAmplitude)) }
+	startUtterance := func() {
+		prev := h.sttUttStart.Load()
+		fSTT.results <- stt.Result{Signal: stt.SpeechStarted}
+		require.Eventually(t, func() bool { return h.sttUtterance.Load() && h.sttUttStart.Load() != prev }, time.Second, time.Millisecond)
+	}
+
+	vad.set(time.Now().Add(-time.Second))
+	tick()
+	assert.Zero(t, fSTT.flushCount(), "no utterance in progress")
+
+	startUtterance()
+	vad.set(time.Now())
+	tick()
+	assert.Zero(t, fSTT.flushCount(), "the caller is still speaking")
+
+	vad.set(time.Now().Add(-350 * time.Millisecond))
+	tick()
+	assert.Equal(t, 1, fSTT.flushCount(), "300ms of quiet after speech the VAD heard")
+	tick()
+	assert.Equal(t, 1, fSTT.flushCount(), "once per utterance")
+
+	fSTT.sendFinal("जी बिल्कुल")
+	require.Eventually(t, func() bool { return strings.Contains(getLog().String(), "since_flush_ms=") }, time.Second, time.Millisecond)
+
+	fSTT.results <- stt.Result{Signal: stt.SpeechEnded}
+	startUtterance()
+	vad.set(time.Now().Add(-2 * time.Second))
+	tick()
+	assert.Equal(t, 1, fSTT.flushCount(), "the VAD never heard this utterance: Sarvam decides")
+
+	vad.set(time.Now().Add(-350 * time.Millisecond))
+	tick()
+	assert.Equal(t, 2, fSTT.flushCount(), "a new utterance can be flushed")
+}
+
+func TestHandler_STTFlushOffByDefault(t *testing.T) {
+	fSTT := newFakeSTT()
+	vad := &fakeClockDetector{}
+
+	cfg := testConfig(fSTT, newFakeTTS(), &fakeLLM{}, time.Hour, 0)
+	cfg.BargeIn = vad
+	h := NewHandler(context.Background(), "call1", cfg)
+
+	fSTT.results <- stt.Result{Signal: stt.SpeechStarted}
+	require.Eventually(t, h.sttUtterance.Load, time.Second, time.Millisecond)
+	vad.set(time.Now().Add(-time.Second / 2))
+	h.ProcessFrame(context.Background(), "call1", constFrame(quietAmplitude))
+	assert.Zero(t, fSTT.flushCount())
 }
 
 func TestHandler_SeparatelySpokenPiecesEndWithASpace(t *testing.T) {
@@ -926,6 +1017,9 @@ func TestHandler_ToolRoundTrip(t *testing.T) {
 
 	playTurn(t, h, fTTS, 1, "Let me check.", " It is done.")
 
+	// finishTurn flips the state to Listening just before it records the
+	// reply (same goroutine), so wait for the history rather than the state.
+	require.Eventually(t, func() bool { return len(h.history) == 4 }, time.Second, time.Millisecond)
 	assert.Equal(t, []llm.Message{
 		{Role: "user", Content: "check my pin"},
 		{Role: "assistant", ToolCalls: []llm.ToolCall{call}},

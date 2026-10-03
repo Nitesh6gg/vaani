@@ -85,6 +85,30 @@ logs what it resolved to, never the keys:
   while the agent speaks, but able to confirm a pause at an interruptible
   node -- Dograh has the same exposure); and Sarvam now receives the whole
   call's audio, whose effect on Sarvam's billing hasn't been checked.
+- **Early finalization (experimental, `STT_FLUSH_AFTER_MS`, off by
+  default).** Sarvam decides by itself when the caller has stopped
+  (`END_SPEECH`), which took ~600-700ms in live calls (`end_detect_ms`) --
+  the largest part of the reply delay. Dograh doesn't wait for it: it opens
+  the connection with `flush_signal=true` and, when its local Silero VAD
+  hears 0.2s of silence, sends `{"type":"flush"}`, which the Sarvam SDK
+  documents as "flush the audio buffer and force finalize partial
+  transcriptions" (`patches/pipecat_sarvam_stt.py`,
+  `sarvamai/types/stt_flush_signal.py`). With `STT_FLUSH_AFTER_MS` set
+  (e.g. 400) and `VAD_MODE=ten`, Vaani does the same: once Sarvam has
+  reported the caller speaking (`START_SPEECH`) and TEN VAD has heard that
+  much quiet after speech that belongs to this utterance, it sends one
+  flush (`stt flush sent quiet_ms=...`). If TEN VAD didn't hear the
+  utterance, nothing is sent and Sarvam decides as before. Still to be
+  confirmed live: Dograh turns Sarvam's own `vad_signals` off when it uses
+  flush, while Vaani keeps them (they drive silence handling and some
+  latency fields), so whether Sarvam honours the flush with them on is
+  exactly what the test shows -- a transcript logged with `since_flush_ms`
+  and no `endpoint_ms` arrived before Sarvam's own end-of-speech, i.e. the
+  flush worked. The risk: a caller pausing mid-sentence for longer than
+  the setting has their sentence split; the first part becomes the turn
+  and the rest is logged as `transcript ignored: the agent is thinking`
+  (Dograh's pipeline gathers several transcripts into one turn; Vaani
+  doesn't).
 - If the STT connection can't be opened (after a few quick retries), the call
   currently falls back to `LoopbackHandler` (the caller hears their own
   voice) rather than being hung up -- logged as
@@ -250,6 +274,7 @@ Per turn, all in milliseconds:
 |---|---|---|
 | `stt final transcript` | `end_detect_ms` | the caller's last sound (TEN VAD) -> Sarvam's `END_SPEECH`: how long Sarvam took to decide they'd stopped |
 | `stt final transcript` | `endpoint_ms` | Sarvam's `END_SPEECH` -> its transcript |
+| `stt final transcript` | `since_flush_ms` | the early-finalize flush -> this transcript (only with `STT_FLUSH_AFTER_MS`) |
 | `llm first token` | `latency_ms` | transcript accepted -> first LLM token |
 | `tts first audio` | `latency_ms` | transcript accepted -> first TTS audio received |
 | `tts first audio` | `since_speech_end_ms` | Sarvam's `END_SPEECH` -> first TTS audio received |

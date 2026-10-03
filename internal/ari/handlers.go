@@ -612,6 +612,9 @@ func (m *Manager) newAgentHandler(c *call) media.Handler {
 			APIKey:   svc.STT.APIKey,
 			Model:    svc.STT.Model,
 			Language: svc.STT.Language,
+			// Only when early finalization is on: whether flush_signal changes
+			// anything else in Sarvam's behaviour is unverified.
+			FlushSignal: m.cfg.STTFlushAfter > 0,
 		})
 	})
 	if err != nil {
@@ -653,6 +656,7 @@ func (m *Manager) newAgentHandler(c *call) media.Handler {
 		BargeInObserveOnly: !m.cfg.BargeInEnabled,
 		BargeInGuard:       m.cfg.BargeInGuard,
 		BargeInMinSpeech:   m.cfg.BargeInMinSpeech,
+		STTFlushAfter:      m.cfg.STTFlushAfter,
 		PostCutSilence:     m.cfg.PostCutSilence,
 		Sink:               metrics.AgentSink{},
 	})

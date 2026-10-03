@@ -104,6 +104,10 @@ func (c *sarvamClient) dial(ctx context.Context) (*websocket.Conn, error) {
 	q.Set("sample_rate", strconv.Itoa(sarvamSampleRate))
 	q.Set("vad_signals", "true")
 
+	if c.cfg.FlushSignal {
+		q.Set("flush_signal", "true")
+	}
+
 	endpoint := c.cfg.WSURL + "?" + q.Encode()
 	header := http.Header{}
 	header.Set("Api-Subscription-Key", c.cfg.APIKey)
@@ -188,6 +192,27 @@ func (c *sarvamClient) Feed(pcm []byte) error {
 	if err != nil {
 		c.invalidate(conn)
 		return fmt.Errorf("stt: send: %w", err)
+	}
+
+	return nil
+}
+
+// Flush sends {"type":"flush"} (the Sarvam SDK's SttFlushSignal), asking
+// Sarvam to finalize the current utterance now. Same no-retry rule as Feed.
+func (c *sarvamClient) Flush() error {
+	conn := c.getConn()
+	if conn == nil {
+		c.triggerReconnect()
+		return fmt.Errorf("stt: not connected")
+	}
+
+	c.writeMu.Lock()
+	err := conn.WriteJSON(map[string]string{"type": "flush"})
+	c.writeMu.Unlock()
+
+	if err != nil {
+		c.invalidate(conn)
+		return fmt.Errorf("stt: send flush: %w", err)
 	}
 
 	return nil

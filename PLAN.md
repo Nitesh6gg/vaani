@@ -132,7 +132,17 @@ Status, item by item — "live" means seen working on a real call:
      which a 300ms speech trigger outran -- the first syllable never
      reached Sarvam. Now the STT is fed continuously, as in Dograh, and a
      transcript said entirely over the agent is discarded and logged.
-     Unit-tested, **not yet tried live**.
+  5. Tried live (16:55 and 16:58, 2026-10-01): "महंगाई" said over the agent
+     came through whole; remarks said over a non-interruptible reply were
+     ignored as intended. Remaining issues are short answers misheard or
+     misread ("आप" for AAP as "हाँ" / "you") and two prompt issues on the
+     Dograh side. Fixed in Vaani: a missing space between two LLM rounds
+     in the recorded reply ("नमस्ते।Thank").
+- **Early STT finalization** (`STT_FLUSH_AFTER_MS`, off by default): flush
+  Sarvam on TEN VAD's end of speech instead of waiting ~600-700ms for
+  Sarvam's own, as Dograh does — built and unit-tested, **not yet tried
+  live**; whether Sarvam honours the flush with `vad_signals` on is what
+  the first live test shows.
 
 Not done yet:
 - **Step 3b:** `http_api` custom tools (e.g. web search, with bearer
