@@ -1,7 +1,7 @@
 // Package dograh reads agent configuration straight from a self-hosted
 // Dograh deployment's Postgres database, so the Dograh visual editor stays
-// the single place where agents are configured. Read-only: Vaani never writes
-// to Dograh's tables.
+// the single place where agents are configured. The only writes are each
+// call's record (workflow_runs, see run.go), as Dograh itself makes them.
 package dograh
 
 import (
@@ -66,13 +66,14 @@ type ToolRow struct {
 func (s *Store) Workflow(ctx context.Context, workflowID int, callVars map[string]any) (*Workflow, []string, error) {
 	var (
 		defJSON, defVars, wfVars, defConfig, userConfig string
+		defID                                           int64
 		orgID                                           *int64
 	)
 
 	// The models come from the workflow owner's user_configurations, as
 	// Dograh does for telephony calls (ari_manager.py: workflow.user_id).
 	err := s.pool.QueryRow(ctx, `
-		SELECT d.workflow_json::text, COALESCE(d.template_context_variables::text, ''),
+		SELECT d.id, d.workflow_json::text, COALESCE(d.template_context_variables::text, ''),
 			COALESCE(w.template_context_variables::text, ''),
 			COALESCE(d.workflow_configurations::text, ''), w.organization_id,
 			COALESCE((SELECT configuration::text FROM user_configurations
@@ -80,7 +81,7 @@ func (s *Store) Workflow(ctx context.Context, workflowID int, callVars map[strin
 		FROM workflows w
 		JOIN workflow_definitions d ON d.id = COALESCE(w.released_definition_id,
 			(SELECT id FROM workflow_definitions WHERE workflow_id = w.id AND is_current LIMIT 1))
-		WHERE w.id = $1`, workflowID).Scan(&defJSON, &defVars, &wfVars, &defConfig, &orgID, &userConfig)
+		WHERE w.id = $1`, workflowID).Scan(&defID, &defJSON, &defVars, &wfVars, &defConfig, &orgID, &userConfig)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil, fmt.Errorf("dograh: workflow %d not found or has no published definition", workflowID)
 	}
@@ -125,13 +126,17 @@ func (s *Store) Workflow(ctx context.Context, workflowID int, callVars map[strin
 		warnings = append(warnings, warn)
 	}
 
-	return &Workflow{Start: start, Services: services, IdleTimeout: idle, MaxDuration: maxDuration}, warnings, nil
+	return &Workflow{ID: workflowID, DefinitionID: defID, OrgID: orgID,
+		Start: start, Services: services, IdleTimeout: idle, MaxDuration: maxDuration}, warnings, nil
 }
 
 // Workflow is what one call runs.
 type Workflow struct {
-	Start    *agent.Node
-	Services Services
+	ID           int
+	DefinitionID int64  // the definition version this call runs
+	OrgID        *int64 // the workflow's organization
+	Start        *agent.Node
+	Services     Services
 	// From the workflow's settings (see callLimits); 0 disables.
 	IdleTimeout time.Duration
 	MaxDuration time.Duration

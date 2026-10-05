@@ -109,8 +109,9 @@ logged with `cut=true` as the call closes.
 ### Configured in Dograh
 
 Everything that defines *the agent* is read from a self-hosted Dograh's
-Postgres (`internal/dograh`) -- the visual editor stays Dograh's; Vaani only
-reads its tables, never writes. On every call, before the STT connection
+Postgres (`internal/dograh`) -- the visual editor stays Dograh's. The only
+writes are each call's own record (see "Call history in Dograh" below). On
+every call, before the STT connection
 opens, `Manager.loadWorkflow` (3s timeout) loads workflow `DOGRAH_WORKFLOW_ID`:
 
 - **Which version:** the published definition (`workflows.released_definition_id`),
@@ -261,6 +262,57 @@ Both mirror Dograh, with its settings from the workflow's Settings page
 This is separate from `MAX_CALL_DURATION_SECONDS` in `.env`: that one is a
 transport-level backstop (off by default) that tears the call down the
 moment it's reached, whatever is playing, and applies in every mode.
+
+### Call history in Dograh
+
+Every agent call is recorded in Dograh's `workflow_runs`, the way Dograh
+records its own ARI calls, so it appears in Dograh's call list and run page
+(`Manager.recordRun`, `internal/dograh/run.go`). Writing it never affects the
+call: failures are logged (`dograh run: ...`) and the call carries on.
+
+- **At call start** (once the workflow has loaded; in the background): a row
+  as Dograh's `ari_manager.py` creates it -- name `ARI Inbound <caller>`,
+  mode `ari`, call type `inbound`, the published definition, initial context
+  `{caller_number, called_number, direction: inbound, provider: ari}`,
+  gathered context `{call_id}` -- with state `running`. Log:
+  `dograh run created run_id=...`.
+- **During the call**, `agent.CallLog` collects the events Dograh's run page
+  shows (`realtime_feedback_events`, shaped as Dograh's logs buffer stores
+  them -- timestamp, turn, node):
+  - `rtf-node-transition` at the start node and on every edge taken;
+  - `rtf-user-transcription` for each caller turn (the `[User]` line; each
+    one starts a new turn);
+  - `rtf-bot-text` for each reply as heard (the `[Agent]` line -- greeting,
+    transition speech and tool messages included, as one entry);
+  - `rtf-function-call-start` / `-end` for every function the LLM calls,
+    tools and edges alike (Dograh registers both as functions).
+- **When the agent leaves the call** (hangup, or a transfer handing the
+  caller over), as Dograh's `on_pipeline_finished` and its completion job:
+  - **How it ended** (`call_disposition`), whichever of these happened
+    first: `user_qualified` (End node reached), `end_call_tool`,
+    `transfer_call`, `user_idle_max_duration_exceeded` (caller silent
+    twice), `call_duration_exceeded`; if none did, `user_hangup`.
+    `mapped_call_disposition` is that, mapped through the organization's
+    `DISPOSITION_CODE_MAPPING` if it has one, and is added to the workflow's
+    `call_disposition_codes` (for the call list's filter).
+  - Gathered context, merged into the row's: `nodes_visited`,
+    `call_disposition`, `mapped_call_disposition`, `call_tags` (the
+    disposition, plus `user_speech` if the caller said anything).
+  - `call_duration_seconds` in `usage_info` and `cost_info` (where the call
+    list reads the duration), whole seconds from when the agent started.
+  - `logs.realtime_feedback_events`, `is_completed`, state `completed`.
+  - **Recording and transcript**, uploaded to Dograh's MinIO (`MINIO_*`,
+    `internal/dograh/storage.go`, S3 Signature V4 as the MinIO client signs)
+    at Dograh's paths, `recordings/<run id>.wav` and
+    `transcripts/<run id>.txt`, with `storage_backend` `minio`. The
+    recording is one mono 16kHz track, caller and agent mixed
+    (`media.MixRecorder`, around the agent's handler -- as Dograh's is
+    mono); the transcript is Dograh's text format, `[timestamp] User: ...` /
+    `[timestamp] Agent: ...`, one line per event above.
+  - Log: `dograh run completed run_id=... disposition=...`.
+- **Not done** (Dograh's completion job, which Vaani can't run): cost
+  calculation, QA, integrations/webhooks. LLM/TTS/STT usage in `usage_info`
+  is left empty. Variable extraction is Step 3b part 3.
 
 ## Operability endpoints
 

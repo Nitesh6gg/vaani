@@ -153,10 +153,16 @@ Status, item by item — "live" means seen working on a real call:
   from `external_credentials`) — done, unit-tested against a local HTTP
   server; **not yet tried live**.
 
+- **Calls in Dograh's call history** (Step 3b part 2): each call written to
+  `workflow_runs` as Dograh writes its own (events for the run page,
+  disposition, duration), with the mixed recording and the transcript
+  uploaded to Dograh's MinIO — done, unit-tested (the MinIO signature
+  against Dograh's own MinIO client); **not yet tried live**, and the SQL
+  hasn't run against a real Dograh database yet.
+
 Not done yet:
-- **Step 3b, the rest:** variable extraction, and writing each call to
-  Dograh's `workflow_runs` so calls appear in the Dograh UI (recording and
-  transcript stored in Dograh's MinIO).
+- **Step 3b part 3:** variable extraction (survey answers saved to the
+  run's gathered context).
 - **Step 4:** knowledge base (Dograh's documents, pgvector).
 - Dograh features Vaani skips for now: muting the caller during queued
   messages (tool messages, transition speech) regardless of the node,

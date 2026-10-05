@@ -103,6 +103,16 @@ type Config struct {
 	DograhDBURL      string
 	DograhWorkflowID int
 
+	// Dograh's MinIO, where each call's recording and transcript are
+	// uploaded for its call history -- the same MINIO_* settings (and
+	// defaults) as Dograh's own environment. MinioEndpoint empty: no uploads
+	// (the call is still recorded in workflow_runs).
+	MinioEndpoint  string // host:port
+	MinioAccessKey string
+	MinioSecretKey string
+	MinioBucket    string
+	MinioSecure    bool
+
 	// BargeInEnabled toggles caller-interrupts-agent detection (internal/ai/agent).
 	// When false, internal/ari wires in a no-op detector instead of EnergyDetector
 	// so the agent talks over any inbound audio until it finishes its turn --
@@ -170,6 +180,11 @@ func Load() (Config, error) {
 		MediaEncapsulation:  getEnv("MEDIA_ENCAPSULATION", "rtp"),
 		DebugAudio:          getEnv("DEBUG_AUDIO", "") == "1",
 		DograhDBURL:         getEnv("DOGRAH_DB_URL", ""),
+		MinioEndpoint:       getEnv("MINIO_ENDPOINT", ""),
+		MinioAccessKey:      getEnv("MINIO_ACCESS_KEY", ""),
+		MinioSecretKey:      getEnv("MINIO_SECRET_KEY", ""),
+		MinioBucket:         getEnv("MINIO_BUCKET", "voice-audio"),
+		MinioSecure:         strings.EqualFold(getEnv("MINIO_SECURE", "false"), "true"),
 		BargeInEnabled:      getEnv("BARGE_IN_ENABLED", "1") == "1",
 		VadMode:             getEnv("VAD_MODE", "energy"),
 	}
@@ -329,6 +344,14 @@ func Load() (Config, error) {
 		if cfg.DograhWorkflowID <= 0 {
 			return Config{}, fmt.Errorf("config: DOGRAH_WORKFLOW_ID must be set when APP_MODE=agent (the Dograh workflow the agent runs)")
 		}
+
+		if cfg.MinioEndpoint == "" {
+			slog.Warn("MINIO_ENDPOINT not set; call recordings and transcripts won't be uploaded to Dograh's MinIO")
+		}
+	}
+
+	if cfg.MinioEndpoint != "" && (cfg.MinioAccessKey == "" || cfg.MinioSecretKey == "") {
+		return Config{}, fmt.Errorf("config: MINIO_ACCESS_KEY and MINIO_SECRET_KEY must be set with MINIO_ENDPOINT")
 	}
 
 	// getEnv treats an explicitly-empty env var as unset, so these dev defaults

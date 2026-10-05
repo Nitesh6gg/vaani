@@ -169,6 +169,8 @@ type Config struct {
 	PostCutSilence time.Duration
 
 	Sink Sink
+	// Log, if set, records the call for Dograh's call history (see CallLog).
+	Log *CallLog
 }
 
 type finalTranscriptEvent struct{ text string }
@@ -293,6 +295,8 @@ type Handler struct {
 	node atomic.Pointer[Node]
 
 	events chan any
+	// done is closed when run() has returned: nothing more is logged.
+	done chan struct{}
 
 	// run()-owned only.
 	tts        tts.Client
@@ -429,6 +433,7 @@ func NewHandler(ctx context.Context, callID string, cfg Config) *Handler {
 		cfg:      cfg,
 		baseCtx:  ctx,
 		events:   make(chan any, 8),
+		done:     make(chan struct{}),
 		outbound: make(chan outFrame, outboundBufferFrames),
 	}
 	h.state.Store(int32(StateListening))
@@ -439,6 +444,7 @@ func NewHandler(ctx context.Context, callID string, cfg Config) *Handler {
 	}
 
 	h.node.Store(cfg.Start)
+	cfg.Log.NodeEntered(cfg.Start)
 	h.clock, _ = cfg.BargeIn.(speechClock)
 
 	go h.readSTT()
@@ -457,6 +463,10 @@ func NewHandler(ctx context.Context, callID string, cfg Config) *Handler {
 
 // State reports the current conversation state.
 func (h *Handler) State() State { return State(h.state.Load()) }
+
+// Done is closed once the agent has stopped (its context ended) and logged
+// its last words: Config.Log is then complete.
+func (h *Handler) Done() <-chan struct{} { return h.done }
 
 // Close ends the STT connection. The current TTS connection (if any) and the
 // background goroutines are cleaned up when the call's context is cancelled,
@@ -714,6 +724,7 @@ func (h *Handler) readSTT() {
 }
 
 func (h *Handler) run() {
+	defer close(h.done)
 	defer h.stopIdleTimer()
 
 	if h.cfg.MaxDuration > 0 {
@@ -767,6 +778,7 @@ func (h *Handler) handleEvent(ev any) {
 	case maxDurationEvent:
 		slog.Info("max call duration reached; ending the call", "call_id", h.callID,
 			"max_duration_s", int(h.cfg.MaxDuration.Seconds()))
+		h.cfg.Log.Ending(EndReasonMaxDuration)
 		h.endCall("max_call_duration")
 	case ttsPlaybackDoneEvent:
 		h.finishTurn(h.curGen)
@@ -872,6 +884,7 @@ func (h *Handler) handleIdle(seq uint64) {
 		prompt = idleFinalPrompt
 		h.ending, h.endReason = true, "caller_silent"
 		h.closing.Store(true)
+		h.cfg.Log.Ending(EndReasonCallerSilent)
 	}
 
 	slog.Info("caller silent", "call_id", h.callID, "times", h.idleCount,
@@ -1034,6 +1047,7 @@ func (h *Handler) handleFinalTranscript(text string) {
 	h.history = append(h.history, llm.Message{Role: "user", Content: text})
 
 	slog.Info("[User]", "call_id", h.callID, "text", text)
+	h.cfg.Log.UserSaid(text)
 
 	args := []any{"call_id", h.callID, "gen", h.curGen + 1, "text", text}
 	if !speechEnd.IsZero() {
@@ -1207,11 +1221,15 @@ func (h *Handler) runLLMTurn(ctx context.Context, history []llm.Message, ttsClie
 				action toolAction
 			)
 
+			h.cfg.Log.FunctionStarted(call.Function.Name, call.ID)
+
 			if e := node.edge(call.Function.Name); e != nil {
 				node, result = h.takeEdge(ctx, ttsClient, node, e, gen)
 			} else {
 				result, action = h.runTool(ctx, ttsClient, node, call, gen)
 			}
+
+			h.cfg.Log.FunctionEnded(call.Function.Name, call.ID, result)
 
 			msg := llm.Message{Role: "tool", ToolCallID: call.ID, Content: result}
 			history = append(history, msg)
@@ -1282,9 +1300,11 @@ func (h *Handler) takeEdge(ctx context.Context, ttsClient tts.Client, from *Node
 		"from", from.Name, "to", e.To.Name, "via", e.Def.Name,
 		"allow_interrupt", e.To.AllowInterrupt, "interrupt", InterruptMode(!h.cfg.BargeInObserveOnly, e.To))
 	h.node.Store(e.To)
+	h.cfg.Log.NodeEntered(e.To)
 
 	if e.To.End {
 		h.closing.Store(true) // Dograh mutes the caller once the end node is reached
+		h.cfg.Log.Ending(EndReasonEndNode)
 	}
 
 	return e.To, `{"status":"done"}`
@@ -1320,6 +1340,7 @@ func (h *Handler) runTool(ctx context.Context, ttsClient tts.Client, node *Node,
 		_ = json.Unmarshal([]byte(call.Function.Arguments), &args)
 		slog.Info("end call requested", "call_id", h.callID, "gen", gen, "reason", args.Reason)
 		h.closing.Store(true) // no interrupting the goodbye, as in Dograh
+		h.cfg.Log.Ending(EndReasonEndCallTool)
 
 		return `{"status":"success","action":"ending_call"}`, actionEndCall
 	case ToolTransfer:
@@ -1399,6 +1420,7 @@ func (h *Handler) transfer(ctx context.Context, t Tool, gen uint64) (string, too
 	}
 
 	slog.Info("call transferred", "call_id", h.callID, "gen", gen, "destination", t.Destination)
+	h.cfg.Log.Ending(EndReasonTransfer)
 
 	return `{"status":"success","action":"transferred"}`, actionTransferred
 }
@@ -1810,6 +1832,7 @@ func (h *Handler) recordReply(cut bool) {
 	// Exactly what the caller heard of this reply (cut: only up to where it
 	// was interrupted).
 	slog.Info("[Agent]", "call_id", h.callID, "gen", h.curGen, "text", text, "cut", cut)
+	h.cfg.Log.AgentSaid(text)
 }
 
 // startTurnChunks resets reply tracking at the start of a new turn.

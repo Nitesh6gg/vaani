@@ -3,6 +3,7 @@ package media
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -115,7 +116,7 @@ func (w *wavFile) close() {
 	}
 }
 
-func writeWavHeader(f *os.File, dataBytes int) error {
+func writeWavHeader(f io.Writer, dataBytes int) error {
 	byteRate := SampleRate * wavNumChannels * wavBitsPerSample / 8
 	blockAlign := wavNumChannels * wavBitsPerSample / 8
 	riffSize := wavHeaderSize - 8 + dataBytes

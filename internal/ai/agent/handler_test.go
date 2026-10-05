@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -1039,10 +1040,14 @@ func TestHandler_EndCallHangsUpAfterGoodbyePlays(t *testing.T) {
 
 	var hangups atomic.Int32
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	cfg := testConfig(fSTT, fTTS, fLLM, 0, 0)
-	cfg.Start = &Node{Tools: []Tool{{Def: llm.FunctionDef{Name: "end_call"}, Kind: ToolEndCall}}}
+	cfg.Start = &Node{ID: "n1", Name: "Start", Tools: []Tool{{Def: llm.FunctionDef{Name: "end_call"}, Kind: ToolEndCall}}}
 	cfg.Hangup = func() { hangups.Add(1) }
-	h := NewHandler(context.Background(), "call1", cfg)
+	cfg.Log = &CallLog{}
+	h := NewHandler(ctx, "call1", cfg)
 
 	fSTT.sendFinal("bye")
 	require.Eventually(t, func() bool { return fTTS.spokenCount() == 1 }, time.Second, time.Millisecond)
@@ -1056,6 +1061,27 @@ func TestHandler_EndCallHangsUpAfterGoodbyePlays(t *testing.T) {
 
 	require.Eventually(t, func() bool { return hangups.Load() == 1 }, time.Second, time.Millisecond)
 	assert.Equal(t, 1, fLLM.streamCalls(), "the LLM must not be asked again after end_call")
+
+	// The call log, complete once the agent has stopped.
+	cancel()
+	<-h.Done()
+
+	s := cfg.Log.Summary()
+	assert.Equal(t, EndReasonEndCallTool, s.EndReason)
+	assert.Equal(t, []string{"Start"}, s.NodesVisited)
+
+	var types []string
+	for _, e := range s.Events {
+		types = append(types, fmt.Sprintf("%s %v %v", e.Type, e.Payload["text"], e.Payload["function_name"]))
+	}
+
+	assert.Equal(t, []string{
+		"rtf-node-transition <nil> <nil>",
+		"rtf-user-transcription bye <nil>",
+		"rtf-function-call-start <nil> end_call",
+		"rtf-function-call-end <nil> end_call",
+		"rtf-bot-text Goodbye. <nil>",
+	}, types)
 }
 
 // TestHandler_UnknownToolReturnsErrorToLLM: a hallucinated tool name must not

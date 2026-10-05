@@ -40,10 +40,19 @@ models and keys are all configured there (see "Configured in Dograh" in
 `docs/ARCHITECTURE.md`). In Vaani's `.env`:
 
 - `DOGRAH_DB_URL` -- Dograh's Postgres, e.g.
-  `postgresql://user:pass@host:5432/dograh`. Vaani only reads from it.
-  Checked at startup (10s): unreachable = the server doesn't start.
+  `postgresql://user:pass@host:5432/dograh`. Vaani reads the workflow from
+  it and writes each call's record to `workflow_runs` (and adds disposition
+  codes to `workflows.call_disposition_codes`), so the user needs INSERT and
+  UPDATE on those two tables. Checked at startup (10s): unreachable = the
+  server doesn't start.
 - `DOGRAH_WORKFLOW_ID` -- the workflow to run: the number in its editor URL
   (`/workflow/19` -> `19`).
+- `MINIO_ENDPOINT`, `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY`, `MINIO_BUCKET`
+  (default `voice-audio`), `MINIO_SECURE` (default `false`) -- Dograh's
+  MinIO, for each call's recording and transcript: copy the values from
+  Dograh's own environment, with `MINIO_ENDPOINT` as `host:port` reachable
+  from Vaani. Without `MINIO_ENDPOINT` calls still appear in Dograh's call
+  history, without recording or transcript.
 
 No `LLM_*` or `SARVAM_*` settings -- they were removed; if still present in
 an old `.env` they're ignored.

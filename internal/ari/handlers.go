@@ -162,9 +162,14 @@ type Manager struct {
 	cl    ari.Client
 	cfg   config.Config
 	ports *media.PortAllocator
-	// store reads agent tools from Dograh's database; nil when DOGRAH_DB_URL
-	// isn't set (the agent then runs without tools).
-	store *dograh.Store
+	// store reads the agent's workflow from Dograh's database and records
+	// each call there; nil when DOGRAH_DB_URL isn't set. storage is Dograh's
+	// MinIO for recordings and transcripts; nil = no uploads.
+	store   *dograh.Store
+	storage *dograh.Storage
+	// runs counts calls whose Dograh run is still being written, so
+	// shutdown can let them finish.
+	runs sync.WaitGroup
 
 	// holdAudio/beepAudio are the transfer sounds (see assets), 16kHz PCM.
 	holdAudio []byte
@@ -176,13 +181,14 @@ type Manager struct {
 	transfers map[string]*pendingTransfer // keyed by the ringing transfer destination's channel ID
 }
 
-// NewManager creates a call Manager bound to cl. store may be nil.
-func NewManager(cl ari.Client, cfg config.Config, ports *media.PortAllocator, store *dograh.Store) *Manager {
+// NewManager creates a call Manager bound to cl. store and storage may be nil.
+func NewManager(cl ari.Client, cfg config.Config, ports *media.PortAllocator, store *dograh.Store, storage *dograh.Storage) *Manager {
 	m := &Manager{
 		cl:        cl,
 		cfg:       cfg,
 		ports:     ports,
 		store:     store,
+		storage:   storage,
 		pending:   make(map[string]*call),
 		active:    make(map[string]*call),
 		transfers: make(map[string]*pendingTransfer),
@@ -214,6 +220,8 @@ func (m *Manager) Run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			m.teardownAll()
+			m.runs.Wait() // the calls' Dograh records (bounded by finishRun's timeout)
+
 			return
 		case evt, ok := <-sub.Events():
 			if !ok {
@@ -628,8 +636,9 @@ func (m *Manager) newAgentHandler(c *call) media.Handler {
 	// cutting. BARGE_IN_ENABLED then only decides whether the detector's
 	// verdict is allowed to cut playback (see agent.Config.BargeInObserveOnly).
 	bargeIn := m.newBargeInDetector(callID)
+	callLog := &agent.CallLog{}
 
-	return agent.NewHandler(ctx, callID, agent.Config{
+	h := agent.NewHandler(ctx, callID, agent.Config{
 		STT: sttClient,
 		NewTTS: func() (tts.Client, error) {
 			return dialWithRetry(ctx, callID, "tts connect", func() (tts.Client, error) {
@@ -660,7 +669,66 @@ func (m *Manager) newAgentHandler(c *call) media.Handler {
 		STTFlushAfter:      m.cfg.STTFlushAfter,
 		PostCutSilence:     m.cfg.PostCutSilence,
 		Sink:               metrics.AgentSink{},
+		Log:                callLog,
 	})
+
+	rec := media.NewMixRecorder(h)
+
+	m.runs.Add(1)
+
+	go m.recordRun(c, wf, callLog, rec, h.Done())
+
+	return rec
+}
+
+// recordRun records call c in Dograh's call history (workflow_runs), as
+// Dograh does for its own calls: the run is created now and completed once
+// the agent has left the call (hangup or transfer) -- with the conversation,
+// how it ended, and the recording and transcript uploaded to Dograh's MinIO.
+// Failures are logged; the call itself is never affected.
+func (m *Manager) recordRun(c *call, wf *dograh.Workflow, callLog *agent.CallLog, rec *media.MixRecorder, agentDone <-chan struct{}) {
+	defer m.runs.Done()
+
+	started := time.Now()
+
+	// Not the call's context: the record is completed after the call ends.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	runID, err := m.store.StartRun(ctx, wf, dograh.RunCall{
+		CallID: c.ID, CallerNumber: c.Info.CallerNumber, CalledNumber: c.Info.CalledNumber,
+	})
+
+	cancel()
+
+	if err != nil {
+		slog.Warn("dograh run: not created; this call won't appear in Dograh", "call_id", c.ID, "error", err)
+		return
+	}
+
+	slog.Info("dograh run created", "call_id", c.ID, "run_id", runID, "workflow_id", wf.ID)
+
+	<-agentDone
+
+	ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	summary := callLog.Summary()
+	recording := rec.WAV()
+
+	err = m.store.FinishRun(ctx, wf, runID, dograh.RunEnd{
+		Summary: summary, Duration: time.Since(started), Recording: recording,
+	}, m.storage)
+	if err != nil {
+		slog.Warn("dograh run: completing it failed", "call_id", c.ID, "run_id", runID, "error", err)
+		return
+	}
+
+	reason := summary.EndReason
+	if reason == "" {
+		reason = agent.EndReasonUserHangup
+	}
+
+	slog.Info("dograh run completed", "call_id", c.ID, "run_id", runID, "disposition", reason,
+		"events", len(summary.Events), "recording_bytes", len(recording), "minio", m.storage != nil)
 }
 
 // newBargeInDetector builds the caller-interrupt detector for one call.

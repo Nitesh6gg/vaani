@@ -90,8 +90,15 @@ func run() error {
 		slog.Info("connected to dograh database", "workflow_id", cfg.DograhWorkflowID)
 	}
 
+	// Dograh's MinIO, for call recordings and transcripts; nil = no uploads.
+	var storage *dograh.Storage
+	if cfg.MinioEndpoint != "" {
+		storage = &dograh.Storage{Endpoint: cfg.MinioEndpoint, AccessKey: cfg.MinioAccessKey,
+			SecretKey: cfg.MinioSecretKey, Bucket: cfg.MinioBucket, Secure: cfg.MinioSecure}
+	}
+
 	ports := media.NewPortAllocator(cfg.MediaPortBase, cfg.MediaPortCount)
-	mgr := vaaniari.NewManager(cl, cfg, ports, store)
+	mgr := vaaniari.NewManager(cl, cfg, ports, store, storage)
 
 	slog.Info("vaani running", "metrics_addr", cfg.MetricsAddr, "media_ip", cfg.MediaIP, "app_mode", cfg.AppMode)
 

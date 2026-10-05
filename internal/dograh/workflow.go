@@ -118,7 +118,7 @@ func buildWorkflow(wf workflowJSON, vars map[string]any, tools []ToolRow, now ti
 		}
 
 		d := n.Data
-		node := &agent.Node{Name: d.Name, End: d.IsEnd, AllowInterrupt: d.AllowInterrupt}
+		node := &agent.Node{ID: n.ID, Name: d.Name, End: d.IsEnd, AllowInterrupt: d.AllowInterrupt}
 
 		var parts []string
 		if globalPrompt != "" && (d.AddGlobalPrompt == nil || *d.AddGlobalPrompt) {

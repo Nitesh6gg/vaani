@@ -7,6 +7,7 @@ import "github.com/nitesh/vaani/internal/ai/llm"
 // function, exactly like Dograh's engine: each node brings its own system
 // prompt and tools, and history carries over.
 type Node struct {
+	ID   string // Dograh's node id, for the call log
 	Name string
 	// Prompt is the complete system prompt while at this node (Dograh: the
 	// global prompt + the node's own, variables already filled in).
