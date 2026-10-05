@@ -194,3 +194,59 @@ func clearEnv(t *testing.T, keys ...string) {
 		})
 	}
 }
+
+// TestNormalizeMinioEndpoint pins the tolerance for both real production
+// misconfigurations: pasting MINIO_PUBLIC_ENDPOINT ("https://host/storage")
+// and prepending a scheme ("http:host:port"). The uploader adds the scheme
+// itself, so the value must reduce to bare host:port -- anything that can't
+// be reduced is a startup-time error, not a per-call upload failure.
+func TestNormalizeMinioEndpoint(t *testing.T) {
+	cases := []struct {
+		name    string
+		in      string
+		want    string
+		changed bool
+		wantErr bool
+	}{
+		{"bare host:port unchanged", "192.168.26.130:18900", "192.168.26.130:18900", false, false},
+		{"scheme with slashes stripped", "http://192.168.26.130:18900", "192.168.26.130:18900", true, false},
+		{"scheme without slashes stripped", "http:192.168.26.130:18900", "192.168.26.130:18900", true, false},
+		{"public endpoint value fully reduced", "https://agent.go2market.in/storage", "agent.go2market.in", true, false},
+		{"trailing-slash path stripped", "localhost:9000/", "localhost:9000", true, false},
+		{"uppercase scheme stripped", "HTTP://h:9000", "h:9000", true, false},
+		{"bare hostname accepted without port", "minio.internal", "minio.internal", false, false},
+		{"bracketed ipv6 kept", "[::1]:9000", "[::1]:9000", false, false},
+		{"scheme-only rejected", "http://", "", false, true},
+		{"colon soup rejected", ":::", "", false, true},
+		{"spaces rejected", "host :9000", "", false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, changed, err := normalizeMinioEndpoint(tc.in)
+
+			if tc.wantErr {
+				require.Error(t, err)
+
+				return
+			}
+
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+			assert.Equal(t, tc.changed, changed)
+		})
+	}
+}
+
+func TestLoad_MinioEndpointNormalized(t *testing.T) {
+	restoreWD := chdir(t, t.TempDir())
+	defer restoreWD()
+
+	t.Setenv("MINIO_ENDPOINT", "http://h:9000/x")
+	t.Setenv("MINIO_ACCESS_KEY", "k")
+	t.Setenv("MINIO_SECRET_KEY", "s")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+
+	assert.Equal(t, "h:9000", cfg.MinioEndpoint)
+}

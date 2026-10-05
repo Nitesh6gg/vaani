@@ -2,8 +2,10 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -350,6 +352,20 @@ func Load() (Config, error) {
 		}
 	}
 
+	if cfg.MinioEndpoint != "" {
+		normalized, changed, err := normalizeMinioEndpoint(cfg.MinioEndpoint)
+		if err != nil {
+			return Config{}, err
+		}
+
+		if changed {
+			slog.Warn("MINIO_ENDPOINT normalized; the uploader adds the scheme itself, so the value must be bare host:port",
+				"raw", cfg.MinioEndpoint, "endpoint", normalized)
+		}
+
+		cfg.MinioEndpoint = normalized
+	}
+
 	if cfg.MinioEndpoint != "" && (cfg.MinioAccessKey == "" || cfg.MinioSecretKey == "") {
 		return Config{}, fmt.Errorf("config: MINIO_ACCESS_KEY and MINIO_SECRET_KEY must be set with MINIO_ENDPOINT")
 	}
@@ -366,6 +382,58 @@ func Load() (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// normalizeMinioEndpoint reduces a MINIO_ENDPOINT value to the bare
+// "host:port" (or bare host) the uploader builds URLs around. Both real
+// misconfigurations observed in production are tolerated here rather than
+// producing a malformed per-call upload URL: pasting the public
+// MINIO_PUBLIC_ENDPOINT value ("https://host/storage") and prepending a
+// scheme "for clarity" ("http:host:port"). changed reports whether anything
+// was stripped (the caller warns); an error means the remainder is
+// structurally unusable and Load must fail fast instead of failing every
+// call's upload.
+func normalizeMinioEndpoint(raw string) (endpoint string, changed bool, err error) {
+	v := strings.TrimSpace(raw)
+
+	// Order matters: "http://" before "http:", or the shorter prefix would
+	// leave "//..." behind.
+	for _, p := range []string{"http://", "https://", "http:", "https:"} {
+		if len(v) >= len(p) && strings.EqualFold(v[:len(p)], p) {
+			v = v[len(p):]
+			changed = true
+
+			break
+		}
+	}
+
+	if i := strings.IndexByte(v, '/'); i >= 0 {
+		v = v[:i]
+		changed = true
+	}
+
+	v = strings.TrimSpace(v)
+
+	if v == "" {
+		return "", changed, fmt.Errorf("config: MINIO_ENDPOINT must be a bare host:port (e.g. 192.168.26.130:18900), got %q", raw)
+	}
+
+	if strings.ContainsAny(v, " \t") {
+		return "", changed, fmt.Errorf("config: MINIO_ENDPOINT must be a bare host:port (e.g. 192.168.26.130:18900), got %q", raw)
+	}
+
+	if _, _, serr := net.SplitHostPort(v); serr != nil {
+		// A bare hostname without a port is fine -- it just produces a
+		// port-80 URL. Anything else SplitHostPort rejects (colon soup,
+		// unbracketed IPv6) is a real config error.
+		var addrErr *net.AddrError
+
+		if !errors.As(serr, &addrErr) || addrErr.Err != "missing port in address" {
+			return "", changed, fmt.Errorf("config: MINIO_ENDPOINT must be a bare host:port (e.g. 192.168.26.130:18900), got %q", raw)
+		}
+	}
+
+	return v, changed, nil
 }
 
 // loadDotenv searches the working directory and its parents (up to the filesystem
