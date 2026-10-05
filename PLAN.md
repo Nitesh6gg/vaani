@@ -138,11 +138,16 @@ Status, item by item — "live" means seen working on a real call:
      misread ("आप" for AAP as "हाँ" / "you") and two prompt issues on the
      Dograh side. Fixed in Vaani: a missing space between two LLM rounds
      in the recorded reply ("नमस्ते।Thank").
-- **Early STT finalization** (`STT_FLUSH_AFTER_MS`, off by default): flush
+- **Early STT finalization** (`STT_FLUSH_AFTER_MS`, default 400 since
+  2026-10-05, `0` = off; needs `VAD_MODE=ten`): flush
   Sarvam on TEN VAD's end of speech instead of waiting ~600-700ms for
-  Sarvam's own, as Dograh does — built and unit-tested, **not yet tried
-  live**; whether Sarvam honours the flush with `vad_signals` on is what
-  the first live test shows.
+  Sarvam's own, as Dograh does — **confirmed live at 400ms** (2026-10-03,
+  2026-10-05): Sarvam honours the flush with `vad_signals` on, answering
+  with `END_SPEECH` ~30-90ms later; `end_detect_ms` ~430-520 (was
+  ~580-720), replies ~0.2-0.3s sooner (`since_last_speech_ms` ~0.94-1.21s),
+  no split sentences seen. Unlike Dograh (which then waits 0.6s to gather
+  more speech into the turn), Vaani has no gathering window, so a long
+  mid-sentence pause can split a sentence.
 
 Not done yet:
 - **Step 3b:** `http_api` custom tools (e.g. web search, with bearer

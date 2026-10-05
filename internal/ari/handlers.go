@@ -612,9 +612,10 @@ func (m *Manager) newAgentHandler(c *call) media.Handler {
 			APIKey:   svc.STT.APIKey,
 			Model:    svc.STT.Model,
 			Language: svc.STT.Language,
-			// Only when early finalization is on: whether flush_signal changes
-			// anything else in Sarvam's behaviour is unverified.
-			FlushSignal: m.cfg.STTFlushAfter > 0,
+			// Only when a flush can actually be sent: early finalization on
+			// and TEN VAD (which tells when the caller stopped) selected.
+			// Otherwise the connection stays exactly as before.
+			FlushSignal: m.cfg.STTFlushAfter > 0 && m.cfg.VadMode == "ten",
 		})
 	})
 	if err != nil {

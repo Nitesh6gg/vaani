@@ -85,30 +85,44 @@ logs what it resolved to, never the keys:
   while the agent speaks, but able to confirm a pause at an interruptible
   node -- Dograh has the same exposure); and Sarvam now receives the whole
   call's audio, whose effect on Sarvam's billing hasn't been checked.
-- **Early finalization (experimental, `STT_FLUSH_AFTER_MS`, off by
-  default).** Sarvam decides by itself when the caller has stopped
+- **Early finalization (`STT_FLUSH_AFTER_MS`, default 400; `0` turns it
+  off; only with `VAD_MODE=ten`).** Sarvam decides by itself when the caller has stopped
   (`END_SPEECH`), which took ~600-700ms in live calls (`end_detect_ms`) --
   the largest part of the reply delay. Dograh doesn't wait for it: it opens
   the connection with `flush_signal=true` and, when its local Silero VAD
   hears 0.2s of silence, sends `{"type":"flush"}`, which the Sarvam SDK
   documents as "flush the audio buffer and force finalize partial
   transcriptions" (`patches/pipecat_sarvam_stt.py`,
-  `sarvamai/types/stt_flush_signal.py`). With `STT_FLUSH_AFTER_MS` set
-  (e.g. 400) and `VAD_MODE=ten`, Vaani does the same: once Sarvam has
+  `sarvamai/types/stt_flush_signal.py`). With `STT_FLUSH_AFTER_MS` above 0
+  and `VAD_MODE=ten`, Vaani does the same (without TEN VAD it can't tell
+  when the caller stopped, so the connection isn't even opened with
+  `flush_signal`): once Sarvam has
   reported the caller speaking (`START_SPEECH`) and TEN VAD has heard that
   much quiet after speech that belongs to this utterance, it sends one
   flush (`stt flush sent quiet_ms=...`). If TEN VAD didn't hear the
-  utterance, nothing is sent and Sarvam decides as before. Still to be
-  confirmed live: Dograh turns Sarvam's own `vad_signals` off when it uses
-  flush, while Vaani keeps them (they drive silence handling and some
-  latency fields), so whether Sarvam honours the flush with them on is
-  exactly what the test shows -- a transcript logged with `since_flush_ms`
-  and no `endpoint_ms` arrived before Sarvam's own end-of-speech, i.e. the
-  flush worked. The risk: a caller pausing mid-sentence for longer than
-  the setting has their sentence split; the first part becomes the turn
-  and the rest is logged as `transcript ignored: the agent is thinking`
-  (Dograh's pipeline gathers several transcripts into one turn; Vaani
-  doesn't).
+  utterance, nothing is sent and Sarvam decides as before.
+
+  **Confirmed live at 400ms (2026-10-03 and 2026-10-05).** Dograh turns
+  Sarvam's own `vad_signals` off when it uses flush; Vaani keeps them on
+  (they drive silence handling and some latency fields), and Sarvam
+  honours the flush anyway: it answers with its `END_SPEECH` signal within
+  ~30-90ms of the flush (`since_flush_ms` minus `endpoint_ms`), then the
+  transcript. So `endpoint_ms` still appears; the evidence is `END_SPEECH`
+  arriving right after the flush -- `end_detect_ms` ~430-520 instead of
+  ~580-720 before. Result: the reply starts ~0.2-0.3s sooner
+  (`since_last_speech_ms` ~0.94-1.21s, from ~1.3-1.4s).
+
+  **How Dograh compares.** Dograh always flushes, on every call (no
+  setting), when its Silero VAD hears 0.2s of silence. But its turn-end
+  rule (pipecat's `SpeechTimeoutUserTurnStopStrategy`, default
+  `user_speech_timeout=0.6`) then waits 0.6s more in case the caller says
+  more, gathering every transcript in that window into one turn, before
+  starting the LLM -- ~0.8s after the caller's last sound. Vaani at 400ms
+  starts it ~0.5s after, sooner than Dograh, but has no such window: a
+  caller pausing mid-sentence for longer than the setting has the sentence
+  split -- the first part becomes the turn and the rest is logged as
+  `transcript ignored: the agent is thinking`. None seen in the live tests
+  so far (including a 1.3s sentence with pauses in it).
 - If the STT connection can't be opened (after a few quick retries), the call
   currently falls back to `LoopbackHandler` (the caller hears their own
   voice) rather than being hung up -- logged as
