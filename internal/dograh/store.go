@@ -48,6 +48,9 @@ type ToolRow struct {
 	Description string
 	Category    string
 	Definition  json.RawMessage
+	// Credential is the active external_credentials row of the tool's
+	// organization named by its config's credential_uuid, if any.
+	Credential *Credential
 }
 
 // Workflow loads Dograh workflow workflowID for one call and returns its
@@ -192,17 +195,23 @@ func templateVars(s string) map[string]any {
 	return vars
 }
 
-// tools returns the active tools among uuids that belong to orgID.
+// tools returns the active tools among uuids that belong to orgID, each with
+// its credential: same organization and active, as Dograh's
+// get_credential_by_uuid looks it up.
 func (s *Store) tools(ctx context.Context, uuids []string, orgID *int64) ([]ToolRow, error) {
 	if len(uuids) == 0 {
 		return nil, nil
 	}
 
 	rows, err := s.pool.Query(ctx, `
-		SELECT tool_uuid, name, COALESCE(description, ''), category::text, definition::text
-		FROM tools
-		WHERE tool_uuid = ANY($1) AND organization_id IS NOT DISTINCT FROM $2
-			AND status::text = 'active'`, uuids, orgID)
+		SELECT t.tool_uuid, t.name, COALESCE(t.description, ''), t.category::text, t.definition::text,
+			c.credential_type::text, c.credential_data::text
+		FROM tools t
+		LEFT JOIN external_credentials c
+			ON c.credential_uuid = t.definition->'config'->>'credential_uuid'
+			AND c.organization_id = $2 AND c.is_active
+		WHERE t.tool_uuid = ANY($1) AND t.organization_id IS NOT DISTINCT FROM $2
+			AND t.status::text = 'active'`, uuids, orgID)
 	if err != nil {
 		return nil, fmt.Errorf("dograh: query tools: %w", err)
 	}
@@ -212,15 +221,24 @@ func (s *Store) tools(ctx context.Context, uuids []string, orgID *int64) ([]Tool
 
 	for rows.Next() {
 		var (
-			r   ToolRow
-			def string
+			r                 ToolRow
+			def               string
+			credType, credDat *string
 		)
 
-		if err := rows.Scan(&r.UUID, &r.Name, &r.Description, &r.Category, &def); err != nil {
+		if err := rows.Scan(&r.UUID, &r.Name, &r.Description, &r.Category, &def, &credType, &credDat); err != nil {
 			return nil, fmt.Errorf("dograh: scan tool: %w", err)
 		}
 
 		r.Definition = json.RawMessage(def)
+
+		if credType != nil {
+			r.Credential = &Credential{Type: *credType}
+			if credDat != nil {
+				r.Credential.Data = json.RawMessage(*credDat)
+			}
+		}
+
 		out = append(out, r)
 	}
 

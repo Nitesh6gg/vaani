@@ -149,10 +149,14 @@ Status, item by item — "live" means seen working on a real call:
   more speech into the turn), Vaani has no gathering window, so a long
   mid-sentence pause can split a sentence.
 
+- **`http_api` custom tools** (Step 3b part 1; e.g. web search, credentials
+  from `external_credentials`) — done, unit-tested against a local HTTP
+  server; **not yet tried live**.
+
 Not done yet:
-- **Step 3b:** `http_api` custom tools (e.g. web search, with bearer
-  credentials from `external_credentials`), variable extraction, and writing
-  each call to Dograh's `workflow_runs` so calls appear in the Dograh UI.
+- **Step 3b, the rest:** variable extraction, and writing each call to
+  Dograh's `workflow_runs` so calls appear in the Dograh UI (recording and
+  transcript stored in Dograh's MinIO).
 - **Step 4:** knowledge base (Dograh's documents, pgvector).
 - Dograh features Vaani skips for now: muting the caller during queued
   messages (tool messages, transition speech) regardless of the node,

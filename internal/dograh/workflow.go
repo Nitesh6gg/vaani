@@ -89,10 +89,14 @@ func buildWorkflow(wf workflowJSON, vars map[string]any, tools []ToolRow, now ti
 	byUUID := make(map[string]agent.Tool, len(tools))
 
 	for _, r := range tools {
-		t, err := buildTool(r)
+		t, warn, err := buildTool(r)
 		if err != nil {
 			warnings = append(warnings, err.Error())
 			continue
+		}
+
+		if warn != "" {
+			warnings = append(warnings, warn)
 		}
 
 		byUUID[r.UUID] = t

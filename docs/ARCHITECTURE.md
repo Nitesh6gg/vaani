@@ -128,7 +128,9 @@ opens, `Manager.loadWorkflow` (3s timeout) loads workflow `DOGRAH_WORKFLOW_ID`:
   missing variable becomes empty text. (Dograh renders on entering each
   node, so `{{current_time}}` there can be minutes later on a long call.)
 - **Tools:** the rows of `tools` referenced by the nodes' `tool_uuids`,
-  limited to active ones in the workflow's organization (Dograh's own lookup).
+  limited to active ones in the workflow's organization (Dograh's own lookup),
+  each with the `external_credentials` row its `credential_uuid` names (same
+  organization, active).
 - **Models and keys:** see "Where the models come from" in
   `docs/AI_PROVIDERS.md`.
 - **Call limits:** `max_user_idle_timeout` and `max_call_duration` from the
@@ -139,8 +141,10 @@ node, the owner has no model configuration, a provider Vaani can't run --
 the call is hung up (`agent: loading the dograh workflow failed; hanging up`
 with the reason). There is deliberately no fallback to `.env` settings.
 Problems that shouldn't stop a call -- a tool that's missing, archived, of a
-category Vaani doesn't run yet (e.g. `http_api`) or misconfigured, an audio
-greeting -- are logged as `agent: workflow: ...` warnings and skipped.
+category Vaani doesn't run yet (e.g. `calculator`) or misconfigured, an audio
+greeting -- are logged as `agent: workflow: ...` warnings and skipped. An
+`http_api` tool whose credential is missing or inactive is kept and called
+without it, as Dograh does, with a warning.
 
 ### Workflow walk
 
@@ -184,7 +188,8 @@ Supported Dograh tool categories (`internal/dograh/tools.go`). Tool function
 names follow Dograh's rule: lowercase, runs of characters outside `a-z0-9_`
 become one `_`, trimmed ("Transfer Call to Support Team" ->
 `transfer_call_to_support_team`). A tool's custom message (`messageType`
-"custom") is spoken before it acts. An unknown function name gets an error
+"custom"; for `http_api`, `customMessage` unless `customMessageType` is
+"audio") is spoken before it acts. An unknown function name gets an error
 result the LLM can react to.
 
 - **`end_call`:** the LLM is not asked again, and the call hangs up once
@@ -211,6 +216,29 @@ result the LLM can react to.
   Both sounds are 8kHz mono 16-bit WAVs embedded at build time and upsampled
   to 16kHz; if one can't be decoded the server logs a warning at startup and
   that sound is silence.
+- **`http_api`** (e.g. web search; `internal/dograh/httptool.go`, ported
+  from Dograh's `custom_tool.py` and `credential_auth.py`):
+  - **Function parameters:** from the tool's `parameters` (`name`, `type`
+    string/number/boolean/array/object, `description`, `required` -- default
+    true); an array's items and an object's fields come from `item_schema`,
+    one level deep.
+  - **Request:** `method` (default POST) to `url` with the config's
+    `headers`, over the shared HTTP client. POST/PUT/PATCH send the LLM's
+    arguments as a JSON body (`{}` if none); GET/DELETE send them as query
+    parameters, added to any already in the URL.
+  - **Credential:** `bearer_token` -> `Authorization: Bearer <token>`;
+    `api_key` -> `<header_name, default X-API-Key>: <api_key>`;
+    `basic_auth` -> `Authorization: Basic <base64 user:password>`;
+    `custom_header` -> `<header_name, default X-Custom>: <header_value>`.
+  - **Timeout:** `timeout_ms`, default 5000. The agent's own 10s limit per
+    tool call still applies on top.
+  - **Result sent to the LLM** (Dograh's): any HTTP status is
+    `{"status":"success","status_code":N,"data":<the JSON reply, else
+    {"raw_response":"<text>"}>}`; a failure is `{"status":"error","error":
+    "Request timed out after 5.0 seconds"}` or `"Request failed: ..."`.
+    Only the first 1 MiB of a reply is read (Dograh reads it all).
+  - Logs: `tool call` with the arguments, then `tool result` with the
+    duration and result.
 
 ### Caller silence and call length
 

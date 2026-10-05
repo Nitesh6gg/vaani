@@ -34,26 +34,37 @@ type toolConfig struct {
 	// transfer_call
 	Destination string   `json:"destination"`
 	Timeout     *float64 `json:"timeout"` // seconds; Dograh's default is 30
+
+	// http_api (custom_tool.py). Its spoken message is customMessage unless
+	// customMessageType is "audio" -- not messageType, which it doesn't use.
+	CustomMessageType string            `json:"customMessageType"`
+	Method            string            `json:"method"`
+	URL               string            `json:"url"`
+	Headers           map[string]string `json:"headers"`
+	CredentialUUID    string            `json:"credential_uuid"`
+	TimeoutMS         *float64          `json:"timeout_ms"`
+	Parameters        []toolParam       `json:"parameters"`
 }
 
-// errUnsupported marks a tool category Vaani can't run yet (e.g. http_api
-// before custom tools are implemented): skipped with a warning, not fatal.
+// errUnsupported marks a tool category Vaani can't run yet: skipped with a
+// warning, not fatal.
 var errUnsupported = errors.New("tool category not supported yet")
 
-// buildTool turns one tools row into an agent tool.
-func buildTool(r ToolRow) (agent.Tool, error) {
+// buildTool turns one tools row into an agent tool. warning is a problem that
+// doesn't stop the tool from being used (logged, like Dograh does).
+func buildTool(r ToolRow) (t agent.Tool, warning string, err error) {
 	var def struct {
 		Config toolConfig `json:"config"`
 	}
 
 	if len(r.Definition) > 0 {
 		if err := json.Unmarshal(r.Definition, &def); err != nil {
-			return agent.Tool{}, fmt.Errorf("tool %q (%s): bad definition: %w", r.Name, r.UUID, err)
+			return agent.Tool{}, "", fmt.Errorf("tool %q (%s): bad definition: %w", r.Name, r.UUID, err)
 		}
 	}
 
 	cfg := def.Config
-	t := agent.Tool{
+	t = agent.Tool{
 		Def: llm.FunctionDef{
 			Name:        FunctionName(r.Name),
 			Description: r.Description,
@@ -87,7 +98,7 @@ func buildTool(r ToolRow) (agent.Tool, error) {
 		}
 	case CategoryTransferCall:
 		if strings.TrimSpace(cfg.Destination) == "" {
-			return agent.Tool{}, fmt.Errorf("transfer tool %q (%s) has no destination", r.Name, r.UUID)
+			return agent.Tool{}, "", fmt.Errorf("transfer tool %q (%s) has no destination", r.Name, r.UUID)
 		}
 
 		t.Kind = agent.ToolTransfer
@@ -96,11 +107,64 @@ func buildTool(r ToolRow) (agent.Tool, error) {
 		if cfg.Timeout != nil && *cfg.Timeout > 0 {
 			t.Timeout = time.Duration(*cfg.Timeout * float64(time.Second))
 		}
+	case CategoryHTTPAPI:
+		return buildHTTPTool(r, cfg, t)
 	default:
-		return agent.Tool{}, fmt.Errorf("tool %q (category %s): %w", r.Name, r.Category, errUnsupported)
+		return agent.Tool{}, "", fmt.Errorf("tool %q (category %s): %w", r.Name, r.Category, errUnsupported)
 	}
 
-	return t, nil
+	return t, "", nil
+}
+
+// buildHTTPTool finishes an http_api tool. A credential that's missing,
+// inactive or unreadable is a warning, not an error: Dograh then sends the
+// request without it.
+func buildHTTPTool(r ToolRow, cfg toolConfig, t agent.Tool) (agent.Tool, string, error) {
+	if strings.TrimSpace(cfg.URL) == "" {
+		return agent.Tool{}, "", fmt.Errorf("http tool %q (%s) has no url", r.Name, r.UUID)
+	}
+
+	h := httpTool{
+		method:  strings.ToUpper(cfg.Method),
+		url:     cfg.URL,
+		headers: map[string]string{},
+		timeout: defaultHTTPToolTimeout,
+	}
+
+	if h.method == "" {
+		h.method = "POST"
+	}
+
+	if cfg.TimeoutMS != nil && *cfg.TimeoutMS > 0 {
+		h.timeout = time.Duration(*cfg.TimeoutMS * float64(time.Millisecond))
+	}
+
+	for k, v := range cfg.Headers {
+		h.headers[k] = v
+	}
+
+	var warning string
+
+	if cfg.CredentialUUID != "" {
+		if r.Credential == nil {
+			warning = fmt.Sprintf("http tool %q (%s): credential %s not found or not active; calling without it", r.Name, r.UUID, cfg.CredentialUUID)
+		} else if name, value, ok, err := authHeader(*r.Credential); err != nil {
+			warning = fmt.Sprintf("http tool %q (%s): credential %s: %v; calling without it", r.Name, r.UUID, cfg.CredentialUUID, err)
+		} else if ok {
+			h.headers[name] = value
+		}
+	}
+
+	t.Message = cfg.CustomMessage
+	if cfg.CustomMessageType == "audio" { // recordings aren't supported yet
+		t.Message = ""
+	}
+
+	t.Kind = agent.ToolFunction
+	t.Def.Parameters = httpToolSchema(cfg.Parameters)
+	t.Run = h.run
+
+	return t, warning, nil
 }
 
 var (

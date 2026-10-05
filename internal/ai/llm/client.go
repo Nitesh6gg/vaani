@@ -12,10 +12,10 @@ import (
 	"strings"
 )
 
-// sharedHTTPClient is the one global client for every LLM request, per
-// CLAUDE.md invariant #5: MaxIdleConnsPerHost=200, HTTP/2, never a per-request
-// client.
-var sharedHTTPClient = &http.Client{
+// SharedHTTPClient is the one global client for every outbound HTTP request
+// (LLM, and Dograh http_api tools), per CLAUDE.md invariant #5:
+// MaxIdleConnsPerHost=200, HTTP/2, never a per-request client.
+var SharedHTTPClient = &http.Client{
 	Transport: &http.Transport{
 		MaxIdleConnsPerHost: 200,
 		ForceAttemptHTTP2:   true,
@@ -129,7 +129,7 @@ func (c *Client) Stream(ctx context.Context, messages []Message, tools []Tool, o
 	req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	req.Header.Set("Accept", "text/event-stream")
 
-	resp, err := sharedHTTPClient.Do(req)
+	resp, err := SharedHTTPClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("llm: request: %w", err)
 	}
