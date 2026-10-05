@@ -65,30 +65,8 @@ type RunEnd struct {
 func (s *Store) FinishRun(ctx context.Context, wf *Workflow, runID int64, end RunEnd, storage *Storage) error {
 	sum := end.Summary
 
-	// end_call_with_reason: the disposition is why the call ended, mapped
-	// through the organization's DISPOSITION_CODE_MAPPING, and becomes a
-	// call tag; on_pipeline_finished then tags any caller speech.
-	reason := sum.EndReason
-	if reason == "" {
-		reason = agent.EndReasonUserHangup
-	}
-
-	mapped := s.mapDisposition(ctx, wf.OrgID, reason)
-
-	tags := []string{reason}
-	if sum.UserSpoke {
-		tags = append(tags, "user_speech")
-	}
-
-	visited := sum.NodesVisited
-	if visited == nil {
-		visited = []string{}
-	}
-
-	gathered, _ := json.Marshal(map[string]any{
-		"nodes_visited": visited, "call_disposition": reason,
-		"mapped_call_disposition": mapped, "call_tags": tags,
-	})
+	g, mapped := gatheredContext(sum, func(v string) string { return s.mapDisposition(ctx, wf.OrgID, v) })
+	gathered, _ := json.Marshal(g)
 
 	// pipeline_metrics_aggregator: whole seconds; Dograh's cost job copies it
 	// into cost_info, which is where its call list reads the duration.
@@ -162,6 +140,68 @@ func (s *Store) FinishRun(ctx context.Context, wf *Workflow, runID int64, end Ru
 	}
 
 	return errors.Join(errs...)
+}
+
+// gatheredContext is what the call adds to the run's gathered_context, as
+// Dograh's engine builds it: nodes_visited; the extracted variables, at the
+// top level and under extracted_variables; the disposition
+// (end_call_with_reason) -- an extracted call_disposition if there is one,
+// else why the call ended -- and mapDisposition's mapping of it; and the
+// call tags: the disposition, user_speech if the caller said anything, then
+// (on_pipeline_finished) the value of every tag_* variable.
+func gatheredContext(sum agent.CallSummary, mapDisposition func(string) string) (g map[string]any, mapped string) {
+	visited := sum.NodesVisited
+	if visited == nil {
+		visited = []string{}
+	}
+
+	g = map[string]any{"nodes_visited": visited}
+
+	if sum.Extracted != nil {
+		for k, v := range sum.Extracted {
+			g[k] = v
+		}
+
+		g["extracted_variables"] = sum.Extracted
+	}
+
+	// An extracted one counts only as non-empty text (Dograh: any truthy value).
+	d, extracted := sum.Extracted["call_disposition"].(string)
+	if extracted && d != "" {
+		g["extracted_call_disposition"] = d
+	} else if d = sum.EndReason; d == "" {
+		d = agent.EndReasonUserHangup
+	}
+
+	mapped = mapDisposition(d)
+	g["call_disposition"] = d
+	g["mapped_call_disposition"] = mapped
+
+	tags := []any{d}
+	if sum.UserSpoke {
+		tags = append(tags, "user_speech")
+	}
+
+	// Dograh's own check compares the key, not the value, with the tags.
+	for _, k := range sum.ExtractedKeys {
+		if strings.HasPrefix(k, "tag_") && !containsTag(tags, k) {
+			tags = append(tags, sum.Extracted[k])
+		}
+	}
+
+	g["call_tags"] = tags
+
+	return g, mapped
+}
+
+func containsTag(tags []any, s string) bool {
+	for _, t := range tags {
+		if t == s {
+			return true
+		}
+	}
+
+	return false
 }
 
 // mapDisposition is Dograh's apply_disposition_mapping: the organization's

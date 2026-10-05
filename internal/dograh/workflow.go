@@ -40,6 +40,15 @@ type nodeData struct {
 	Greeting        string   `json:"greeting"`
 	GreetingType    string   `json:"greeting_type"`
 	ToolUUIDs       []string `json:"tool_uuids"`
+
+	// Variable extraction (dto.py: extraction_enabled defaults to false).
+	ExtractionEnabled   bool   `json:"extraction_enabled"`
+	ExtractionPrompt    string `json:"extraction_prompt"`
+	ExtractionVariables []struct {
+		Name   string  `json:"name"`
+		Type   string  `json:"type"`
+		Prompt *string `json:"prompt"`
+	} `json:"extraction_variables"`
 }
 
 const globalNodeType = "globalNode"
@@ -130,6 +139,28 @@ func buildWorkflow(wf workflowJSON, vars map[string]any, tools []ToolRow, now ti
 		}
 
 		node.Prompt = strings.Join(parts, "\n\n")
+
+		// Dograh extracts only when enabled and there's something to extract;
+		// prompts get the call's {{variables}} (a missing one stays missing).
+		if d.ExtractionEnabled && len(d.ExtractionVariables) > 0 {
+			x := &agent.Extraction{Prompt: render(d.ExtractionPrompt)}
+
+			for _, v := range d.ExtractionVariables {
+				ev := agent.ExtractionVar{Name: v.Name, Type: v.Type}
+				if v.Prompt != nil {
+					p := *v.Prompt
+					if p != "" {
+						p = render(p)
+					}
+
+					ev.Prompt = &p
+				}
+
+				x.Vars = append(x.Vars, ev)
+			}
+
+			node.Extraction = x
+		}
 
 		for _, u := range d.ToolUUIDs {
 			if t, ok := byUUID[u]; ok {

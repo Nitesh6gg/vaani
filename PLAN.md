@@ -160,9 +160,15 @@ Status, item by item — "live" means seen working on a real call:
   against Dograh's own MinIO client); **not yet tried live**, and the SQL
   hasn't run against a real Dograh database yet.
 
-Not done yet:
-- **Step 3b part 3:** variable extraction (survey answers saved to the
-  run's gathered context).
+- **Variable extraction** (Step 3b part 3; survey answers): a node's
+  `extraction_variables` are pulled from the conversation by the call's own
+  LLM, on leaving the node and again for the ending node at call end, with
+  Dograh's exact prompts and JSON-parsing fallbacks, merged into the run's
+  `gathered_context` — done, unit-tested (prompt text, tool-response
+  formatting, JSON-reply parsing all checked against Dograh's own code);
+  **not yet tried live**.
+
+**Step 3b is done.** Not done yet:
 - **Step 4:** knowledge base (Dograh's documents, pgvector).
 - Dograh features Vaani skips for now: muting the caller during queued
   messages (tool messages, transition speech) regardless of the node,

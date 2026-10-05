@@ -50,6 +50,8 @@ type CallLog struct {
 	visited   []string
 	reason    string
 	userSpoke bool
+	extracted map[string]any // nil until an extraction has returned
+	keys      []string       // extracted's keys, in the order they first came
 }
 
 // CallSummary is everything a CallLog recorded.
@@ -58,6 +60,10 @@ type CallSummary struct {
 	NodesVisited []string
 	EndReason    string // "" until something ended the call: then it's a caller hangup
 	UserSpoke    bool   // the caller said anything that became a turn
+	// Extracted is every variable extraction's result merged, later ones
+	// winning (nil: none returned); ExtractedKeys its keys in arrival order.
+	Extracted     map[string]any
+	ExtractedKeys []string
 }
 
 // Timestamp formats as Python's isoformat() on a UTC datetime, which is
@@ -175,15 +181,48 @@ func (l *CallLog) Ending(reason string) {
 	}
 }
 
+// Extracted merges one variable extraction's result (keys in the order the
+// LLM wrote them), as Dograh updates gathered_context with it.
+func (l *CallLog) Extracted(vars map[string]any, keys []string) {
+	if l == nil {
+		return
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if l.extracted == nil {
+		l.extracted = map[string]any{}
+	}
+
+	for _, k := range keys {
+		if _, seen := l.extracted[k]; !seen {
+			l.keys = append(l.keys, k)
+		}
+
+		l.extracted[k] = vars[k]
+	}
+}
+
 // Summary returns a copy of everything recorded so far.
 func (l *CallLog) Summary() CallSummary {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	return CallSummary{
-		Events:       append([]LogEvent(nil), l.events...),
-		NodesVisited: append([]string(nil), l.visited...),
-		EndReason:    l.reason,
-		UserSpoke:    l.userSpoke,
+	s := CallSummary{
+		Events:        append([]LogEvent(nil), l.events...),
+		NodesVisited:  append([]string(nil), l.visited...),
+		EndReason:     l.reason,
+		UserSpoke:     l.userSpoke,
+		ExtractedKeys: append([]string(nil), l.keys...),
 	}
+
+	if l.extracted != nil {
+		s.Extracted = make(map[string]any, len(l.extracted))
+		for k, v := range l.extracted {
+			s.Extracted[k] = v
+		}
+	}
+
+	return s
 }

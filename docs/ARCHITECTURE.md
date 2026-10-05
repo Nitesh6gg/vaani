@@ -295,9 +295,12 @@ call: failures are logged (`dograh run: ...`) and the call carries on.
     `mapped_call_disposition` is that, mapped through the organization's
     `DISPOSITION_CODE_MAPPING` if it has one, and is added to the workflow's
     `call_disposition_codes` (for the call list's filter).
-  - Gathered context, merged into the row's: `nodes_visited`,
-    `call_disposition`, `mapped_call_disposition`, `call_tags` (the
-    disposition, plus `user_speech` if the caller said anything).
+  - Gathered context, merged into the row's: `nodes_visited`, the extracted
+    variables (see below) at the top level and under `extracted_variables`,
+    `call_disposition` (an extracted `call_disposition` wins over the reason
+    above, as `extracted_call_disposition`), `mapped_call_disposition`,
+    `call_tags` (the disposition, `user_speech` if the caller said anything,
+    then every extracted `tag_*` variable's value).
   - `call_duration_seconds` in `usage_info` and `cost_info` (where the call
     list reads the duration), whole seconds from when the agent started.
   - `logs.realtime_feedback_events`, `is_completed`, state `completed`.
@@ -309,10 +312,44 @@ call: failures are logged (`dograh run: ...`) and the call carries on.
     (`media.MixRecorder`, around the agent's handler -- as Dograh's is
     mono); the transcript is Dograh's text format, `[timestamp] User: ...` /
     `[timestamp] Agent: ...`, one line per event above.
-  - Log: `dograh run completed run_id=... disposition=...`.
+  - Log: `dograh run completed run_id=... disposition=... variables=N`.
 - **Not done** (Dograh's completion job, which Vaani can't run): cost
   calculation, QA, integrations/webhooks. LLM/TTS/STT usage in `usage_info`
-  is left empty. Variable extraction is Step 3b part 3.
+  is left empty.
+
+### Variable extraction
+
+Ported from Dograh's `pipecat_engine_variable_extractor.py`
+(`internal/ai/agent/extract.go`): a node with `extraction_enabled` and at
+least one `extraction_variables` entry has its variables pulled from the
+conversation so far, using the call's own LLM, at the same two moments
+Dograh does:
+
+- **Leaving the node**, the moment an edge is taken -- in the background, so
+  it never delays the transition speech or the next turn.
+- **The node the call ends at**, once every background extraction already
+  running has finished (bounded by `extractionTimeout`, 30s, as Dograh's
+  `_await_pending_extractions`) -- after `Handler.Done()`, before the run's
+  `gathered_context` is written, so this one's result is always included.
+
+Each run is a plain completion on the call's own LLM (no tools offered),
+sent Dograh's exact two messages: a system prompt ("You are an assistant
+tasked with extracting structured data...") plus the node's own
+`extraction_prompt`, and a user message listing the variables (`- name
+(VariableType.type): prompt`) followed by the conversation so far --
+`user:`/`assistant:` lines, and each tool's result as `[Tool Response:
+name]` (an `http_api` tool's `data` field if it has one, truncated at 2000
+characters; an edge's `{"status":"done"}` left out, as Dograh does). The
+reply is parsed as JSON (allowing a ```` ```json ```` block or surrounding
+text, Dograh's `parse_llm_json`); anything else is dropped with a warning,
+never fed into `gathered_context` as junk. Variables from multiple
+extractions merge key by key, a later one overwriting an earlier value for
+the same key (so the end-of-call extraction's view of the whole call can
+correct an earlier node's). A background extraction starting in the
+narrow window after the call has already finished (the handler's goroutine
+can be mid-turn for a few statements past the call ending) is refused
+rather than run unobserved, logged as `variable extraction skipped: the
+call already finished`.
 
 ## Operability endpoints
 

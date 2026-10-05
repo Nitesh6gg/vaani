@@ -23,9 +23,28 @@ type Node struct {
 	// ignored until the agent finishes (Dograh mutes the user). Only takes
 	// effect with barge-in enabled (Config.BargeInObserveOnly false).
 	AllowInterrupt bool
+	// Extraction, if set, is Dograh's variable extraction for this node: run
+	// when the conversation leaves the node and, for the node the call ends
+	// at, when the call ends (see extract.go).
+	Extraction *Extraction
 
 	Tools []Tool
 	Edges []Edge
+}
+
+// Extraction is a node's extraction_prompt and extraction_variables, with
+// {{variables}} already filled in.
+type Extraction struct {
+	Prompt string
+	Vars   []ExtractionVar
+}
+
+// ExtractionVar is one variable to extract. Type is Dograh's string, number
+// or boolean; Prompt is nil when the variable has none.
+type ExtractionVar struct {
+	Name   string
+	Type   string
+	Prompt *string
 }
 
 // Edge is a transition out of a node, offered to the LLM as a function with

@@ -676,7 +676,7 @@ func (m *Manager) newAgentHandler(c *call) media.Handler {
 
 	m.runs.Add(1)
 
-	go m.recordRun(c, wf, callLog, rec, h.Done())
+	go m.recordRun(c, wf, callLog, rec, h)
 
 	return rec
 }
@@ -684,9 +684,10 @@ func (m *Manager) newAgentHandler(c *call) media.Handler {
 // recordRun records call c in Dograh's call history (workflow_runs), as
 // Dograh does for its own calls: the run is created now and completed once
 // the agent has left the call (hangup or transfer) -- with the conversation,
-// how it ended, and the recording and transcript uploaded to Dograh's MinIO.
-// Failures are logged; the call itself is never affected.
-func (m *Manager) recordRun(c *call, wf *dograh.Workflow, callLog *agent.CallLog, rec *media.MixRecorder, agentDone <-chan struct{}) {
+// the variables extracted, how it ended, and the recording and transcript
+// uploaded to Dograh's MinIO. Failures are logged; the call itself is never
+// affected.
+func (m *Manager) recordRun(c *call, wf *dograh.Workflow, callLog *agent.CallLog, rec *media.MixRecorder, h *agent.Handler) {
 	defer m.runs.Done()
 
 	started := time.Now()
@@ -706,7 +707,13 @@ func (m *Manager) recordRun(c *call, wf *dograh.Workflow, callLog *agent.CallLog
 
 	slog.Info("dograh run created", "call_id", c.ID, "run_id", runID, "workflow_id", wf.ID)
 
-	<-agentDone
+	<-h.Done()
+
+	duration := time.Since(started)
+
+	// Dograh extracts the last node's variables as the call ends, after any
+	// still running from earlier nodes (each bounded by its own timeout).
+	h.FinishExtraction(context.Background())
 
 	ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -715,7 +722,7 @@ func (m *Manager) recordRun(c *call, wf *dograh.Workflow, callLog *agent.CallLog
 	recording := rec.WAV()
 
 	err = m.store.FinishRun(ctx, wf, runID, dograh.RunEnd{
-		Summary: summary, Duration: time.Since(started), Recording: recording,
+		Summary: summary, Duration: duration, Recording: recording,
 	}, m.storage)
 	if err != nil {
 		slog.Warn("dograh run: completing it failed", "call_id", c.ID, "run_id", runID, "error", err)
@@ -728,7 +735,8 @@ func (m *Manager) recordRun(c *call, wf *dograh.Workflow, callLog *agent.CallLog
 	}
 
 	slog.Info("dograh run completed", "call_id", c.ID, "run_id", runID, "disposition", reason,
-		"events", len(summary.Events), "recording_bytes", len(recording), "minio", m.storage != nil)
+		"events", len(summary.Events), "variables", len(summary.Extracted),
+		"recording_bytes", len(recording), "minio", m.storage != nil)
 }
 
 // newBargeInDetector builds the caller-interrupt detector for one call.

@@ -81,6 +81,33 @@ func TestBuildWorkflowGreetingAndErrors(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestBuildWorkflowExtraction(t *testing.T) {
+	wf, err := parseWorkflow([]byte(`{"nodes": [
+		{"id": "1", "type": "startCall", "data": {"name": "Start", "is_start": true,
+			"extraction_enabled": true, "extraction_prompt": "Survey for {{city}}.",
+			"extraction_variables": [
+				{"name": "party", "type": "string", "prompt": "which party, {{city}} resident"},
+				{"name": "age", "type": "number", "prompt": null}
+			]}},
+		{"id": "2", "type": "agentNode", "data": {"name": "No extraction", "extraction_enabled": true}},
+		{"id": "3", "type": "agentNode", "data": {"name": "Disabled", "extraction_enabled": false,
+			"extraction_variables": [{"name": "x", "type": "string"}]}}
+	], "edges": []}`))
+	require.NoError(t, err)
+
+	start, _, err := buildWorkflow(wf, map[string]any{"city": "Delhi"}, nil, time.Now())
+	require.NoError(t, err)
+
+	require.NotNil(t, start.Extraction)
+	assert.Equal(t, "Survey for Delhi.", start.Extraction.Prompt)
+	require.Len(t, start.Extraction.Vars, 2)
+	assert.Equal(t, "party", start.Extraction.Vars[0].Name)
+	assert.Equal(t, "string", start.Extraction.Vars[0].Type)
+	require.NotNil(t, start.Extraction.Vars[0].Prompt)
+	assert.Equal(t, "which party, Delhi resident", *start.Extraction.Vars[0].Prompt)
+	assert.Nil(t, start.Extraction.Vars[1].Prompt, "a null prompt stays nil, not rendered to empty")
+}
+
 func TestCallLimits(t *testing.T) {
 	cases := []struct {
 		name      string

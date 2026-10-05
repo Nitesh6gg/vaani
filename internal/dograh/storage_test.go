@@ -48,6 +48,64 @@ func TestTranscriptTextMatchesDograh(t *testing.T) {
 	assert.Empty(t, transcriptText(nil))
 }
 
+func TestGatheredContextMatchesDograh(t *testing.T) {
+	mapping := map[string]string{"user_hangup": "HU", "interested": "INT"}
+	mapFn := func(v string) string {
+		if m, ok := mapping[v]; ok {
+			return m
+		}
+
+		return v
+	}
+
+	cases := []struct {
+		name   string
+		sum    agent.CallSummary
+		want   map[string]any
+		mapped string
+	}{
+		{
+			name: "no extraction, caller hung up",
+			sum:  agent.CallSummary{NodesVisited: []string{"Start"}},
+			want: map[string]any{"nodes_visited": []string{"Start"}, "call_disposition": "user_hangup",
+				"mapped_call_disposition": "HU", "call_tags": []any{"user_hangup"}},
+			mapped: "HU",
+		},
+		{
+			name: "extracted variables, disposition and tags",
+			sum: agent.CallSummary{
+				NodesVisited: []string{"Start", "End"}, EndReason: "user_qualified", UserSpoke: true,
+				Extracted:     map[string]any{"party": "AAP", "call_disposition": "interested", "tag_x": "voter"},
+				ExtractedKeys: []string{"party", "call_disposition", "tag_x"},
+			},
+			want: map[string]any{
+				"nodes_visited": []string{"Start", "End"},
+				"party":         "AAP", "call_disposition": "interested", "tag_x": "voter",
+				"extracted_variables":        map[string]any{"party": "AAP", "call_disposition": "interested", "tag_x": "voter"},
+				"extracted_call_disposition": "interested",
+				"mapped_call_disposition":    "INT",
+				"call_tags":                  []any{"interested", "user_speech", "voter"},
+			},
+			mapped: "INT",
+		},
+		{
+			name: "an empty extracted disposition falls back to why the call ended",
+			sum: agent.CallSummary{EndReason: "end_call_tool",
+				Extracted: map[string]any{"call_disposition": ""}, ExtractedKeys: []string{"call_disposition"}},
+			want: map[string]any{"nodes_visited": []string{}, "call_disposition": "end_call_tool",
+				"extracted_variables":     map[string]any{"call_disposition": ""},
+				"mapped_call_disposition": "end_call_tool", "call_tags": []any{"end_call_tool"}},
+			mapped: "end_call_tool",
+		},
+	}
+
+	for _, tc := range cases {
+		g, mapped := gatheredContext(tc.sum, mapFn)
+		assert.Equal(t, tc.want, g, tc.name)
+		assert.Equal(t, tc.mapped, mapped, tc.name)
+	}
+}
+
 func TestStoragePut(t *testing.T) {
 	var got struct{ path, contentType, auth, body string }
 

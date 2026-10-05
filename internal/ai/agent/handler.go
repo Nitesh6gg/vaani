@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unicode"
@@ -297,6 +298,15 @@ type Handler struct {
 	events chan any
 	// done is closed when run() has returned: nothing more is logged.
 	done chan struct{}
+	// extracting holds a channel per background variable extraction, closed
+	// when it finishes (see startExtraction / FinishExtraction); extractDone
+	// is set once FinishExtraction has taken its final snapshot, so a
+	// straggling startExtraction call racing the very end of the call is
+	// refused instead of silently launching a goroutine nothing then waits
+	// for or folds into the call's record.
+	extractMu   sync.Mutex
+	extracting  []chan struct{}
+	extractDone bool
 
 	// run()-owned only.
 	tts        tts.Client
@@ -1224,6 +1234,8 @@ func (h *Handler) runLLMTurn(ctx context.Context, history []llm.Message, ttsClie
 			h.cfg.Log.FunctionStarted(call.Function.Name, call.ID)
 
 			if e := node.edge(call.Function.Name); e != nil {
+				// Dograh extracts the node's variables as the conversation leaves it.
+				h.startExtraction(node, append([]llm.Message(nil), history...))
 				node, result = h.takeEdge(ctx, ttsClient, node, e, gen)
 			} else {
 				result, action = h.runTool(ctx, ttsClient, node, call, gen)
