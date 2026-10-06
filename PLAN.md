@@ -180,8 +180,11 @@ Status, item by item — "live" means seen working on a real call:
   (completion written before uploads, each step its own budget, shutdown
   writes the completion); log timestamps now UTC with milliseconds. See
   "Failure handling" in `docs/ARCHITECTURE.md` — unit-tested; **not yet
-  tried live**, and `go test -race ./...` must be run on Linux (this
-  Windows toolchain can't).
+  tried live**. `go test -race -count=3 ./...` passes on the Linux server
+  (2026-10-06), all 12 packages; it first found races only in test code
+  (tests reading the handler's run()-owned fields or the fakes' records
+  unlocked, and an unlocked log buffer), fixed. Run it there after any
+  concurrency change -- this Windows toolchain can't.
 
 Not done yet:
 - **Step 4:** knowledge base (Dograh's documents, pgvector).
