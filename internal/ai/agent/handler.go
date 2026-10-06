@@ -215,6 +215,12 @@ type resumeCheckEvent struct{ seq uint64 }    // is a paused reply's interruptio
 type idleEvent struct{ seq uint64 }
 type maxDurationEvent struct{}
 
+// genDuration is a duration measured for one generation.
+type genDuration struct {
+	gen uint64
+	d   time.Duration
+}
+
 // Handler implements media.Handler: Sarvam STT -> LLM -> Sarvam TTS with local
 // barge-in detection. See docs/AUDIO_PIPELINE.md's Handler Contract and
 // docs/AI_PROVIDERS.md.
@@ -389,6 +395,15 @@ type Handler struct {
 	// hangs up once the reply has played out.
 	turnToolMsgs    []llm.Message
 	hangupAfterTurn bool
+	// turn counts the caller's accepted turns (the log's turn=); turnTTFA and
+	// turnReplyLatency are the current reply's first-audio timings, logged on
+	// its turn.agent line (zero: not measured).
+	turn             int
+	turnTTFA         time.Duration
+	turnReplyLatency time.Duration
+	// ttft is the LLM's time to first token for a generation, written by the
+	// turn goroutine and read by run() for the turn.agent line.
+	ttft atomic.Pointer[genDuration]
 
 	// Caller-silence clock (Config.IdleTimeout), mirroring pipecat's
 	// UserIdleController: armed each time the agent finishes speaking,
@@ -430,8 +445,10 @@ type Handler struct {
 	replaying        bool
 	replayIdx        int
 	// flushedUtt is the sttUttStart of the utterance already flushed, so
-	// each utterance is flushed at most once.
-	flushedUtt int64
+	// each utterance is flushed at most once; flushSkipLogged the one whose
+	// skipped flush was already logged.
+	flushedUtt      int64
+	flushSkipLogged int64
 	// emptyTicks counts consecutive Speaking-state release ticks that found
 	// the outbound queue empty without ttsDeliveryDone set -- the drain
 	// dead-call safeguard in processSpeakingFrame. A counter, not a stored
@@ -492,6 +509,15 @@ func NewHandler(ctx context.Context, callID string, cfg Config) *Handler {
 
 // State reports the current conversation state.
 func (h *Handler) State() State { return State(h.state.Load()) }
+
+// nodeName is the current workflow node's name, for log lines ("" if none).
+func (h *Handler) nodeName() string {
+	if n := h.node.Load(); n != nil {
+		return n.Name
+	}
+
+	return ""
+}
 
 // Done is closed once the agent has stopped (its context ended) and logged
 // its last words: Config.Log is then complete.
@@ -688,7 +714,21 @@ func (h *Handler) maybeFlushSTT() {
 
 	last := h.clock.LastSpeechAt()
 	if last.IsZero() || last.Before(time.Unix(0, utt).Add(-sttFlushOnsetSlack)) {
-		return // the VAD didn't hear this utterance
+		// The VAD didn't hear this utterance: no flush, the STT's own
+		// end-of-speech decides. Logged once per utterance -- this is what a
+		// slow reply with no stt.flush line comes from.
+		if h.flushSkipLogged != utt {
+			h.flushSkipLogged = utt
+			args := []any{"call_id", h.callID, "event", "stt.flush_skipped", "why", "vad_missed_onset"}
+
+			if !last.IsZero() {
+				args = append(args, "vad_last_speech_before_onset_ms", time.Unix(0, utt).Sub(last).Milliseconds())
+			}
+
+			slog.Debug("stt flush skipped: the VAD didn't hear this utterance", args...)
+		}
+
+		return
 	}
 
 	quiet := time.Since(last)
@@ -701,12 +741,12 @@ func (h *Handler) maybeFlushSTT() {
 
 	if err := h.cfg.STT.Flush(); err != nil {
 		h.cfg.Sink.Error("stt")
-		slog.Warn("stt flush failed", "call_id", h.callID, "error", err)
+		slog.Warn("stt flush failed", "call_id", h.callID, "event", "stt.error", "error", err)
 
 		return
 	}
 
-	slog.Info("stt flush sent", "call_id", h.callID, "quiet_ms", quiet.Milliseconds())
+	slog.Debug("stt flush sent", "call_id", h.callID, "event", "stt.flush", "quiet_ms", quiet.Milliseconds())
 }
 
 // interruptible: the caller may cut in right now -- barge-in enabled (the
@@ -799,7 +839,7 @@ func (h *Handler) handleEvent(ev any) {
 	case greetingEvent:
 		h.handleGreeting()
 	case openingEvent:
-		slog.Info("agent opening (llm speaks first)", "call_id", h.callID)
+		slog.Debug("agent opening (llm speaks first)", "call_id", h.callID, "event", "agent.opening")
 		h.startTurn()
 	case callerSpeechEvent:
 		h.handleCallerSpeech(e.started)
@@ -808,7 +848,7 @@ func (h *Handler) handleEvent(ev any) {
 	case idleEvent:
 		h.handleIdle(e.seq)
 	case maxDurationEvent:
-		slog.Info("max call duration reached; ending the call", "call_id", h.callID,
+		slog.Info("max call duration reached; ending the call", "call_id", h.callID, "event", "call.max_duration",
 			"max_duration_s", int(h.cfg.MaxDuration.Seconds()))
 		h.cfg.Log.Ending(EndReasonMaxDuration)
 		h.endCall("max_call_duration")
@@ -847,10 +887,22 @@ func (h *Handler) handleCallerSpeech(started bool) {
 	h.sttUtterance.Store(started)
 
 	if started {
-		h.sttUttStart.Store(time.Now().UnixNano())
+		now := time.Now()
+		h.sttUttStart.Store(now.UnixNano())
 		h.speechEndAt, h.lastSoundAt = time.Time{}, time.Time{}
 		h.stopIdleTimer()
 		h.idleCount = 0
+
+		// The STT's own onset, against the local VAD's last speech: the
+		// early flush needs the two to agree (see maybeFlushSTT).
+		args := []any{"call_id", h.callID, "event", "stt.speech_started", "state", State(h.state.Load()).String()}
+		if h.clock != nil {
+			if last := h.clock.LastSpeechAt(); !last.IsZero() {
+				args = append(args, "vad_last_speech_ago_ms", now.Sub(last).Milliseconds())
+			}
+		}
+
+		slog.Debug("stt speech started", args...)
 
 		return
 	}
@@ -858,12 +910,18 @@ func (h *Handler) handleCallerSpeech(started bool) {
 	now := time.Now()
 	h.speechEndAt, h.lastSoundAt = now, time.Time{}
 
+	args := []any{"call_id", h.callID, "event", "stt.speech_ended",
+		"utterance_ms", now.Sub(time.Unix(0, h.sttUttStart.Load())).Milliseconds()}
+
 	if h.clock != nil {
 		last := h.clock.LastSpeechAt()
 		if last.After(h.prevSpeechEndAt) && last.After(h.agentQuietSince) && !last.After(now) {
 			h.lastSoundAt = last
+			args = append(args, "end_detect_ms", now.Sub(last).Milliseconds())
 		}
 	}
+
+	slog.Debug("stt speech ended", args...)
 
 	h.prevSpeechEndAt = now
 
@@ -919,7 +977,7 @@ func (h *Handler) handleIdle(seq uint64) {
 		h.cfg.Log.Ending(EndReasonCallerSilent)
 	}
 
-	slog.Info("caller silent", "call_id", h.callID, "times", h.idleCount,
+	slog.Info("caller silent", "call_id", h.callID, "event", "caller.silent", "times", h.idleCount,
 		"idle_timeout_s", h.cfg.IdleTimeout.Seconds(), "ending_call", h.ending)
 
 	h.history = append(h.history, llm.Message{Role: "user", Content: prompt})
@@ -952,7 +1010,7 @@ func (h *Handler) hangup() {
 	}
 
 	slog.Info("agent ending call", "call_id", h.callID, "gen", h.curGen, "reason", reason, "event", "call.ended_by_agent",
-		"node", h.node.Load().Name)
+		"node", h.nodeName())
 
 	if h.cfg.Hangup != nil {
 		go h.cfg.Hangup() // ARI REST call; never block the event loop on it
@@ -971,7 +1029,7 @@ func (h *Handler) openTTS(gen uint64) bool {
 	if err != nil {
 		h.cfg.Sink.Error("tts_open")
 		h.state.Store(int32(StateListening))
-		slog.Error("tts open failed", "call_id", h.callID, "gen", gen, "error", err)
+		slog.Error("tts open failed", "call_id", h.callID, "event", "tts.error", "gen", gen, "error", err)
 
 		return false
 	}
@@ -996,7 +1054,7 @@ func (h *Handler) handleGreeting() {
 	h.turnStartedAt = time.Now()
 	h.startTurnChunks()
 
-	slog.Info("agent greeting", "call_id", h.callID, "gen", gen, "text", h.cfg.Start.Greeting)
+	slog.Debug("agent greeting", "call_id", h.callID, "event", "agent.greeting", "gen", gen, "text", h.cfg.Start.Greeting)
 
 	if !h.openTTS(gen) {
 		return
@@ -1043,7 +1101,8 @@ func (h *Handler) handleFinalTranscript(text string) {
 		// now -- Sarvam needs ~0.7s after they stop just to send a transcript,
 		// so this one was already on its way. It neither confirms the
 		// interruption nor starts a turn.
-		slog.Info("transcript ignored: too soon after an interruption", "call_id", h.callID, "text", text)
+		slog.Info("transcript ignored: too soon after an interruption", "call_id", h.callID, "text", text,
+			"event", "stt.transcript.ignored", "why", "post_cut")
 		return
 	}
 
@@ -1051,14 +1110,16 @@ func (h *Handler) handleFinalTranscript(text string) {
 		if junkTranscript(text) {
 			// A lone letter is what noise transcribes to (commit 249a6c4) --
 			// not confirmation that the caller is talking.
-			slog.Info("transcript ignored: too short to be speech", "call_id", h.callID, "text", text)
+			slog.Info("transcript ignored: too short to be speech", "call_id", h.callID, "text", text,
+				"event", "stt.transcript.ignored", "why", "junk")
 			return
 		}
 
 		if h.closing.Load() {
 			// The call started ending while paused: the caller is muted from
 			// here on, as in Dograh -- let the goodbye finish.
-			slog.Info("transcript ignored: the call is ending", "call_id", h.callID, "text", text)
+			slog.Info("transcript ignored: the call is ending", "call_id", h.callID, "text", text,
+				"event", "stt.transcript.ignored", "why", "closing")
 			h.resumeReply("call ending")
 
 			return
@@ -1074,16 +1135,18 @@ func (h *Handler) handleFinalTranscript(text string) {
 	switch s := State(h.state.Load()); s {
 	case StateThinking, StateSpeaking:
 		slog.Info("transcript ignored: the agent is "+s.String(), "call_id", h.callID, "text", text,
-			"event", "stt.transcript.ignored")
+			"event", "stt.transcript.ignored", "why", "agent_"+s.String())
 		return
 	}
 
 	h.history = append(h.history, llm.Message{Role: "user", Content: text})
-
-	slog.Info("[User]", "call_id", h.callID, "text", text)
 	h.cfg.Log.UserSaid(text)
+	h.turn++
 
-	args := []any{"call_id", h.callID, "gen", h.curGen + 1, "text", text}
+	// One line per caller turn: what they said and how long the STT took
+	// to deliver it.
+	args := []any{"call_id", h.callID, "event", "turn.user", "turn", h.turn, "node", h.nodeName(),
+		"gen", h.curGen + 1, "text", text}
 	if !speechEnd.IsZero() {
 		// Sarvam's end-of-speech detection -> its transcript.
 		args = append(args, "endpoint_ms", time.Since(speechEnd).Milliseconds())
@@ -1100,7 +1163,7 @@ func (h *Handler) handleFinalTranscript(text string) {
 		args = append(args, "since_flush_ms", time.Since(flushedAt).Milliseconds())
 	}
 
-	slog.Info("stt final transcript", append(args, slog.String("event", "stt.transcript.final"))...)
+	slog.Info("caller turn", args...)
 
 	h.idleCount = 0
 	h.startTurn()
@@ -1200,7 +1263,8 @@ func (h *Handler) runLLMTurn(ctx context.Context, history []llm.Message, ttsClie
 		calls, err = h.cfg.LLM.Stream(ctx, requestMessages(node, history), node.toolDefs(), func(tok string) {
 			if firstTokenAt.IsZero() {
 				firstTokenAt = time.Now()
-				slog.Info("llm first token", "call_id", h.callID, "gen", gen,
+				h.ttft.Store(&genDuration{gen: gen, d: firstTokenAt.Sub(turnStartedAt)})
+				slog.Debug("llm first token", "call_id", h.callID, "gen", gen, "event", "llm.first_token",
 					"latency_ms", firstTokenAt.Sub(turnStartedAt).Milliseconds())
 			}
 
@@ -1215,7 +1279,7 @@ func (h *Handler) runLLMTurn(ctx context.Context, history []llm.Message, ttsClie
 			// Cancelled by barge-in or call teardown; a barge-in already
 			// called Cancel on this exact ttsClient, so no further Speak calls
 			// for gen are possible and there's nothing to end.
-			slog.Info("llm turn cancelled", "call_id", h.callID, "gen", gen,
+			slog.Debug("llm turn cancelled", "call_id", h.callID, "gen", gen, "event", "llm.cancelled",
 				"duration_ms", time.Since(turnStartedAt).Milliseconds())
 
 			return
@@ -1237,7 +1301,7 @@ func (h *Handler) runLLMTurn(ctx context.Context, history []llm.Message, ttsClie
 
 		if round == maxToolRounds-1 {
 			slog.Warn("llm tool round limit reached; ending turn", "call_id", h.callID, "gen", gen,
-				"rounds", maxToolRounds)
+				"event", "llm.tool_round_limit", "rounds", maxToolRounds)
 
 			break
 		}
@@ -1275,7 +1339,7 @@ func (h *Handler) runLLMTurn(ctx context.Context, history []llm.Message, ttsClie
 		}
 
 		if ctx.Err() != nil {
-			slog.Info("llm turn cancelled during tool call", "call_id", h.callID, "gen", gen)
+			slog.Debug("llm turn cancelled during tool call", "call_id", h.callID, "gen", gen, "event", "llm.cancelled")
 
 			// end_call already ran (the call is recorded as ending and the
 			// caller muted for interruptions): the call must still end, not
@@ -1299,10 +1363,10 @@ func (h *Handler) runLLMTurn(ctx context.Context, history []llm.Message, ttsClie
 	endCall = endCall || node.End
 
 	if err == nil {
-		slog.Info("llm turn complete", "call_id", h.callID, "gen", gen,
+		slog.Debug("llm turn complete", "call_id", h.callID, "gen", gen, "event", "llm.done",
 			"duration_ms", time.Since(turnStartedAt).Milliseconds())
 	} else {
-		slog.Warn("llm turn error", "call_id", h.callID, "gen", gen,
+		slog.Error("llm turn error", "call_id", h.callID, "gen", gen, "event", "llm.error",
 			"duration_ms", time.Since(turnStartedAt).Milliseconds(), "error", err)
 	}
 
@@ -1361,11 +1425,11 @@ func (h *Handler) takeEdge(ctx context.Context, ttsClient tts.Client, from *Node
 func (h *Handler) runTool(ctx context.Context, ttsClient tts.Client, node *Node, call llm.ToolCall, gen uint64) (string, toolAction) {
 	t, ok := node.tool(call.Function.Name)
 	if !ok {
-		slog.Warn("llm called an unknown tool", "call_id", h.callID, "gen", gen, "tool", call.Function.Name)
+		slog.Warn("llm called an unknown tool", "call_id", h.callID, "gen", gen, "event", "tool.unknown", "tool", call.Function.Name)
 		return toolErrorResult(fmt.Errorf("unknown tool %q", call.Function.Name)), actionNone
 	}
 
-	slog.Info("tool call", "call_id", h.callID, "gen", gen, "tool", call.Function.Name,
+	slog.Info("tool call", "call_id", h.callID, "gen", gen, "event", "tool.call", "tool", call.Function.Name,
 		"args", truncate(call.Function.Arguments, 200))
 
 	if t.Message != "" {
@@ -1382,7 +1446,7 @@ func (h *Handler) runTool(ctx context.Context, ttsClient tts.Client, node *Node,
 		}
 
 		_ = json.Unmarshal([]byte(call.Function.Arguments), &args)
-		slog.Info("end call requested", "call_id", h.callID, "gen", gen, "reason", args.Reason)
+		slog.Info("end call requested", "call_id", h.callID, "gen", gen, "event", "tool.end_call", "reason", args.Reason)
 		h.closing.Store(true) // no interrupting the goodbye, as in Dograh
 		h.cfg.Log.Ending(EndReasonEndCallTool)
 
@@ -1402,13 +1466,13 @@ func (h *Handler) runTool(ctx context.Context, ttsClient tts.Client, node *Node,
 
 	result, err := t.Run(tctx, json.RawMessage(call.Function.Arguments))
 	if err != nil {
-		slog.Warn("tool failed", "call_id", h.callID, "gen", gen, "tool", call.Function.Name,
+		slog.Error("tool failed", "call_id", h.callID, "gen", gen, "event", "tool.error", "tool", call.Function.Name,
 			"duration_ms", time.Since(start).Milliseconds(), "error", err)
 
 		return toolErrorResult(err), actionNone
 	}
 
-	slog.Info("tool result", "call_id", h.callID, "gen", gen, "tool", call.Function.Name,
+	slog.Info("tool result", "call_id", h.callID, "gen", gen, "event", "tool.result", "tool", call.Function.Name,
 		"duration_ms", time.Since(start).Milliseconds(), "result", truncate(result, 200))
 
 	return result, actionNone
@@ -1432,7 +1496,7 @@ func (h *Handler) transfer(ctx context.Context, t Tool, gen uint64) (string, too
 		timeout = defaultTransferTimeout
 	}
 
-	slog.Info("transfer dialing", "call_id", h.callID, "gen", gen,
+	slog.Info("transfer dialing", "call_id", h.callID, "gen", gen, "event", "transfer.dialing",
 		"destination", t.Destination, "timeout_s", int(timeout.Seconds()))
 
 	h.hold.Store(&holdPlayer{pcm: h.cfg.HoldAudio, loop: true, waitForMessage: t.Message != ""})
@@ -1442,13 +1506,13 @@ func (h *Handler) transfer(ctx context.Context, t Tool, gen uint64) (string, too
 	connect, err := h.cfg.Transfer(ctx, t.Destination, timeout)
 	if err != nil {
 		h.hold.Store(nil)
-		slog.Warn("transfer failed", "call_id", h.callID, "gen", gen, "destination", t.Destination,
+		slog.Warn("transfer failed", "call_id", h.callID, "gen", gen, "event", "transfer.failed", "destination", t.Destination,
 			"after_ms", time.Since(start).Milliseconds(), "error", err)
 
 		return transferFailed(err.Error()), actionNone
 	}
 
-	slog.Info("transfer answered", "call_id", h.callID, "gen", gen, "destination", t.Destination,
+	slog.Info("transfer answered", "call_id", h.callID, "gen", gen, "event", "transfer.answered", "destination", t.Destination,
 		"after_ms", time.Since(start).Milliseconds())
 
 	// Beep, and let it finish playing before the handover cuts this leg off.
@@ -1458,12 +1522,12 @@ func (h *Handler) transfer(ctx context.Context, t Tool, gen uint64) (string, too
 
 	if err := connect(); err != nil {
 		h.hold.Store(nil)
-		slog.Warn("transfer handover failed", "call_id", h.callID, "gen", gen, "error", err)
+		slog.Warn("transfer handover failed", "call_id", h.callID, "gen", gen, "event", "transfer.failed", "error", err)
 
 		return transferFailed(err.Error()), actionNone
 	}
 
-	slog.Info("call transferred", "call_id", h.callID, "gen", gen, "destination", t.Destination)
+	slog.Info("call transferred", "call_id", h.callID, "gen", gen, "event", "transfer.connected", "destination", t.Destination)
 	h.cfg.Log.Ending(EndReasonTransfer)
 
 	return `{"status":"success","action":"transferred"}`, actionTransferred
@@ -1585,12 +1649,12 @@ func (h *Handler) sendToTTS(ctx context.Context, ttsClient tts.Client, text stri
 			return
 		}
 
-		slog.Warn("tts speak failed", "call_id", h.callID, "gen", gen, "error", err)
+		slog.Warn("tts speak failed", "call_id", h.callID, "gen", gen, "event", "tts.error", "error", err)
 
 		return
 	}
 
-	slog.Info("tts speak", "call_id", h.callID, "gen", gen, "chars", len([]rune(text)))
+	slog.Debug("tts speak", "call_id", h.callID, "gen", gen, "event", "tts.speak", "chars", len([]rune(text)))
 	// The Thinking -> Speaking transition happens in handleTTSAudio, once real
 	// audio for gen actually arrives -- not here, when text is merely sent.
 	// Flipping here left a silence gap exactly as long as Sarvam's
@@ -1696,12 +1760,12 @@ func (h *Handler) handleTTSClosed(conn uint64) {
 
 	switch State(h.state.Load()) {
 	case StateThinking:
-		slog.Warn("tts connection lost before the reply's audio; ending the turn", "call_id", h.callID, "gen", h.curGen)
+		slog.Warn("tts connection lost before the reply's audio; ending the turn", "call_id", h.callID, "event", "tts.lost", "gen", h.curGen)
 		h.cfg.Sink.Error("tts_closed")
 		h.cancelTurn()
 		h.finishTurn(h.curGen)
 	case StateSpeaking:
-		slog.Warn("tts connection lost mid-reply; playing what arrived, then ending the turn", "call_id", h.callID, "gen", h.curGen)
+		slog.Warn("tts connection lost mid-reply; playing what arrived, then ending the turn", "call_id", h.callID, "event", "tts.lost", "gen", h.curGen)
 		h.cfg.Sink.Error("tts_closed")
 		h.cancelTurn()
 		h.ttsDeliveryDone.Store(true) // no more audio is coming for this generation
@@ -1737,20 +1801,27 @@ func (h *Handler) handleTTSAudio(pcm []byte, gen, req uint64, text string) {
 
 	if h.ttfaLoggedGen != gen {
 		h.ttfaLoggedGen = gen
-		args := []any{"call_id", h.callID, "gen", gen, "latency_ms", time.Since(h.turnStartedAt).Milliseconds()}
+		h.turnTTFA = time.Since(h.turnStartedAt)
+		args := []any{"call_id", h.callID, "gen", gen, "event", "tts.first_audio", "latency_ms", h.turnTTFA.Milliseconds()}
 		if !h.turnSpeechEndAt.IsZero() {
 			// The caller's wait, from Sarvam's end-of-speech detection to the
 			// reply's first audio (see speechEndAt for what it leaves out).
-			args = append(args, "since_speech_end_ms", time.Since(h.turnSpeechEndAt).Milliseconds())
+			h.turnReplyLatency = time.Since(h.turnSpeechEndAt)
+			args = append(args, "since_speech_end_ms", h.turnReplyLatency.Milliseconds())
 		}
 
 		if !h.turnLastSoundAt.IsZero() {
 			// From the caller's last sound (local VAD): the closest figure
-			// to the wait the caller experiences.
-			args = append(args, "since_last_speech_ms", time.Since(h.turnLastSoundAt).Milliseconds())
+			// to the wait the caller experiences -- preferred when known.
+			h.turnReplyLatency = time.Since(h.turnLastSoundAt)
+			args = append(args, "since_last_speech_ms", h.turnReplyLatency.Milliseconds())
 		}
 
-		slog.Info("tts first audio", args...)
+		if h.turnReplyLatency > 0 {
+			h.cfg.Log.ReplyLatency(h.turnReplyLatency)
+		}
+
+		slog.Debug("tts first audio", args...)
 
 		// Only start draining outbound to the caller once real audio has
 		// actually arrived -- see sendToTTS's comment for why this doesn't
@@ -1807,7 +1878,7 @@ func (h *Handler) handleTTSDone(gen uint64) {
 		return // a barge-in already moved past this generation
 	}
 
-	slog.Info("tts delivery complete", "call_id", h.callID, "gen", gen,
+	slog.Debug("tts delivery complete", "call_id", h.callID, "gen", gen, "event", "tts.delivered",
 		"delivery_latency_ms", time.Since(h.turnStartedAt).Milliseconds())
 
 	switch State(h.state.Load()) {
@@ -1836,7 +1907,7 @@ func (h *Handler) finishTurn(gen uint64) {
 		h.state.Store(int32(StateListening))
 	}
 
-	slog.Info("turn complete", "call_id", h.callID, "gen", gen, "event", "agent.turn.completed",
+	slog.Debug("turn complete", "call_id", h.callID, "gen", gen, "event", "agent.turn.completed",
 		"total_latency_ms", time.Since(h.turnStartedAt).Milliseconds())
 
 	h.agentQuietSince = time.Now()
@@ -1912,9 +1983,23 @@ func (h *Handler) recordReply(cut bool) {
 	}
 
 	h.history = append(h.history, llm.Message{Role: "assistant", Content: text})
-	// Exactly what the caller heard of this reply (cut: only up to where it
-	// was interrupted).
-	slog.Info("[Agent]", "call_id", h.callID, "gen", h.curGen, "text", text, "cut", cut)
+	// One line per agent reply: exactly what the caller heard of it (cut:
+	// only up to where it was interrupted), with the turn's timings.
+	args := []any{"call_id", h.callID, "event", "turn.agent", "turn", h.turn, "node", h.nodeName(),
+		"gen", h.curGen, "cut", cut, "text", text}
+	if t := h.ttft.Load(); t != nil && t.gen == h.curGen {
+		args = append(args, "llm_ttft_ms", t.d.Milliseconds())
+	}
+
+	if h.turnTTFA > 0 {
+		args = append(args, "tts_ttfa_ms", h.turnTTFA.Milliseconds())
+	}
+
+	if h.turnReplyLatency > 0 {
+		args = append(args, "reply_latency_ms", h.turnReplyLatency.Milliseconds())
+	}
+
+	slog.Info("agent turn", args...)
 	h.cfg.Log.AgentSaid(text)
 }
 
@@ -1923,6 +2008,7 @@ func (h *Handler) startTurnChunks() {
 	h.turnChunks = nil
 	h.turnToolMsgs = nil
 	h.hangupAfterTurn = false
+	h.turnTTFA, h.turnReplyLatency = 0, 0
 	h.playingReq.Store(0)
 }
 

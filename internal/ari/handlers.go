@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
+	"slices"
 	"sync"
 	"time"
 
@@ -59,7 +61,7 @@ func dialWithRetry[T any](ctx context.Context, callID, what string, dial func() 
 			break
 		}
 
-		slog.Warn("agent: connect failed, retrying", "call_id", callID, "what", what, "attempt", attempt, "error", err)
+		slog.Warn("agent: connect failed, retrying", "call_id", callID, "event", "provider.retry", "what", what, "attempt", attempt, "error", err)
 
 		select {
 		case <-time.After(delay):
@@ -249,9 +251,11 @@ func (m *Manager) Run(ctx context.Context) {
 				// Clearing") from carrier drops, busy/congestion, and
 				// Asterisk-initiated kicks (e.g. its AudioSocket read
 				// timeout) -- without it, every teardown looks identical.
-				slog.Info("channel destroyed",
-					"call_id", e.Channel.ID,
-					"cause", e.Cause, "cause_txt", e.CauseTxt, "event", "call.destroyed")
+				// channel_id is whichever leg this is; call_id the call it
+				// belongs to (when it's still known), so the line groups with
+				// the call's others.
+				slog.Info("channel destroyed", "call_id", m.callIDFor(e.Channel.ID), "channel_id", e.Channel.ID,
+					"cause", e.Cause, "cause_txt", e.CauseTxt, "event", "channel.destroyed")
 				m.onTransferLegDestroyed(e)
 			}
 		}
@@ -285,6 +289,24 @@ func (m *Manager) watchConnectivity(ctx context.Context) {
 			up = now
 		}
 	}
+}
+
+// callIDFor is the call a channel belongs to (caller, externalMedia or
+// transfer leg), or the channel id itself once the call is no longer
+// tracked -- a caller channel's id is its call's id anyway.
+func (m *Manager) callIDFor(channelID string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if c := m.active[channelID]; c != nil {
+		return c.ID
+	}
+
+	if c := m.pending[channelID]; c != nil {
+		return c.ID
+	}
+
+	return channelID
 }
 
 // hasCalls reports whether any call is currently tracked (bridged or staged).
@@ -334,7 +356,7 @@ func (m *Manager) startCall(ctx context.Context, e *ari.StasisStart) {
 	channel := m.cl.Channel().Get(e.Key(ari.ChannelKey, id))
 
 	if err := channel.Answer(); err != nil {
-		slog.Error("failed to answer channel", "call_id", id, "error", err)
+		slog.Error("failed to answer channel", "call_id", id, "event", "call.setup_failed", "step", "answer", "error", err)
 		// A channel we failed to answer is still live in Stasis; leaving it
 		// without hanging it up would strand it in the dialplan.
 		hangupChannel(m.cl, id, id)
@@ -344,7 +366,7 @@ func (m *Manager) startCall(ctx context.Context, e *ari.StasisStart) {
 
 	port, err := m.ports.Alloc()
 	if err != nil {
-		slog.Error("failed to allocate media port", "call_id", id, "error", err)
+		slog.Error("failed to allocate media port", "call_id", id, "event", "call.setup_failed", "step", "port", "error", err)
 		_ = channel.Hangup()
 
 		return
@@ -377,7 +399,7 @@ func (m *Manager) startCall(ctx context.Context, e *ari.StasisStart) {
 	}
 
 	if err != nil {
-		slog.Error("failed to bind media socket", "call_id", id, "port", port, "encapsulation", encap, "error", err)
+		slog.Error("failed to bind media socket", "call_id", id, "event", "call.setup_failed", "step", "bind", "port", port, "encapsulation", encap, "error", err)
 
 		m.ports.Free(port)
 		metrics.MediaPortsInUse.Set(float64(m.ports.InUse()))
@@ -413,7 +435,7 @@ func (m *Manager) startCall(ctx context.Context, e *ari.StasisStart) {
 	// active map (c is the same object); teardown stops it.
 	if m.cfg.MaxCallDuration > 0 {
 		c.maxDur = time.AfterFunc(m.cfg.MaxCallDuration, func() {
-			slog.Warn("max call duration reached; hanging up", "call_id", id,
+			slog.Warn("max call duration reached; hanging up", "call_id", id, "event", "call.max_duration_backstop",
 				"external_id", externalID, "max_seconds", int(m.cfg.MaxCallDuration.Seconds()))
 			m.teardown(c)
 		})
@@ -445,7 +467,7 @@ func (m *Manager) startCall(ctx context.Context, e *ari.StasisStart) {
 	}
 
 	if err != nil {
-		slog.Error("failed to create externalMedia channel", "call_id", id, "error", err)
+		slog.Error("failed to create externalMedia channel", "call_id", id, "event", "call.setup_failed", "step", "external_media", "error", err)
 
 		m.mu.Lock()
 		delete(m.pending, externalID)
@@ -474,14 +496,14 @@ func (m *Manager) completeBridge(c *call) {
 
 	bh, err := m.cl.Bridge().Create(bridgeKey, "mixing", bridgeKey.ID)
 	if err != nil {
-		slog.Error("failed to create bridge", "call_id", c.ID, "error", err)
+		slog.Error("failed to create bridge", "call_id", c.ID, "event", "call.setup_failed", "step", "bridge", "error", err)
 		m.abort(c)
 
 		return
 	}
 
 	if err := bh.AddChannel(c.ID); err != nil {
-		slog.Error("failed to add caller to bridge", "call_id", c.ID, "error", err)
+		slog.Error("failed to add caller to bridge", "call_id", c.ID, "event", "call.setup_failed", "step", "bridge_caller", "error", err)
 		deleteBridge(c.ID, bh)
 		m.abort(c)
 
@@ -489,7 +511,7 @@ func (m *Manager) completeBridge(c *call) {
 	}
 
 	if err := bh.AddChannel(c.ExternalID); err != nil {
-		slog.Error("failed to add externalMedia channel to bridge", "call_id", c.ID, "error", err)
+		slog.Error("failed to add externalMedia channel to bridge", "call_id", c.ID, "event", "call.setup_failed", "step", "bridge_media", "error", err)
 		deleteBridge(c.ID, bh)
 		m.abort(c)
 
@@ -512,7 +534,7 @@ func (m *Manager) completeBridge(c *call) {
 	m.mu.Unlock()
 
 	metrics.CallsActive.Inc()
-	slog.Info("call bridged",
+	slog.Info("call bridged", "event", "call.bridged",
 		"call_id", c.ID, "external_id", c.ExternalID, "port", c.Port,
 		"caller_number", c.Info.CallerNumber, "called_number", c.Info.CalledNumber, "direction", c.Info.Direction)
 
@@ -568,7 +590,7 @@ func (m *Manager) loadWorkflow(c *call) (*dograh.Workflow, error) {
 	}
 
 	for _, w := range warnings {
-		slog.Warn("agent: workflow: "+w, "call_id", c.ID, "workflow_id", m.cfg.DograhWorkflowID)
+		slog.Warn("agent: workflow: "+w, "call_id", c.ID, "component", "dograh", "event", "workflow.warning", "workflow_id", m.cfg.DograhWorkflowID)
 	}
 
 	opening := "llm"
@@ -576,7 +598,7 @@ func (m *Manager) loadWorkflow(c *call) (*dograh.Workflow, error) {
 		opening = "greeting"
 	}
 
-	slog.Info("agent workflow loaded", "call_id", c.ID, "workflow_id", m.cfg.DograhWorkflowID, "event", "workflow.loaded",
+	slog.Info("agent workflow loaded", "call_id", c.ID, "component", "dograh", "event", "workflow.loaded", "workflow_id", m.cfg.DograhWorkflowID,
 		"start_node", wf.Start.Name, "opening", opening, "start_tools", toolNames(wf.Start),
 		"start_allow_interrupt", wf.Start.AllowInterrupt,
 		"start_interrupt", agent.InterruptMode(m.cfg.BargeInEnabled, wf.Start),
@@ -584,7 +606,7 @@ func (m *Manager) loadWorkflow(c *call) (*dograh.Workflow, error) {
 
 	// Never the keys.
 	s := wf.Services
-	slog.Info("agent models", "call_id", c.ID, "event", "agent.configured",
+	slog.Info("agent models", "call_id", c.ID, "component", "agent", "event", "agent.configured",
 		"llm", s.LLM.Provider+"/"+s.LLM.Model, "llm_url", s.LLM.BaseURL,
 		"stt", "sarvam/"+s.STT.Model, "stt_language", s.STT.Language,
 		"tts", "sarvam/"+s.TTS.Model, "tts_voice", s.TTS.Voice, "tts_language", s.TTS.Language)
@@ -621,7 +643,7 @@ func (m *Manager) newAgentHandler(c *call) media.Handler {
 	// the call rather than run a blank agent. Silence until the hangup lands.
 	wf, err := m.loadWorkflow(c)
 	if err != nil {
-		slog.Error("agent: loading the dograh workflow failed; hanging up", "call_id", callID,
+		slog.Error("agent: loading the dograh workflow failed; hanging up", "call_id", callID, "component", "dograh", "event", "workflow.load_failed",
 			"workflow_id", m.cfg.DograhWorkflowID, "error", err)
 
 		go hangupChannel(m.cl, callID, callID)
@@ -643,7 +665,7 @@ func (m *Manager) newAgentHandler(c *call) media.Handler {
 		})
 	})
 	if err != nil {
-		slog.Error("agent: STT connect failed after retries, falling back to loopback", "call_id", callID, "error", err)
+		slog.Error("agent: STT connect failed after retries, falling back to loopback", "call_id", callID, "component", "stt", "event", "stt.connect_failed", "error", err)
 		return nil
 	}
 
@@ -684,13 +706,16 @@ func (m *Manager) newAgentHandler(c *call) media.Handler {
 		BargeInMinSpeech:   m.cfg.BargeInMinSpeech,
 		STTFlushAfter:      m.cfg.STTFlushAfter,
 		PostCutSilence:     m.cfg.PostCutSilence,
-		Sink:               metrics.AgentSink{},
+		Sink:               agent.Sinks(metrics.AgentSink{}, callLog),
 		Log:                callLog,
 	})
 
 	rec := media.NewMixRecorder(h)
 
 	m.runs.Add(1)
+	// recordRun logs about this call after its teardown: keep its trace_id
+	// (and run_id) on those lines until it's done.
+	config.HoldCallTrace(callID)
 
 	go m.recordRun(c, wf, callLog, rec, h)
 
@@ -705,6 +730,7 @@ func (m *Manager) newAgentHandler(c *call) media.Handler {
 // affected.
 func (m *Manager) recordRun(c *call, wf *dograh.Workflow, callLog *agent.CallLog, rec *media.MixRecorder, h *agent.Handler) {
 	defer m.runs.Done()
+	defer config.UnregisterCallTrace(c.ID) // HoldCallTrace in newAgentHandler
 
 	started := time.Now()
 
@@ -714,11 +740,13 @@ func (m *Manager) recordRun(c *call, wf *dograh.Workflow, callLog *agent.CallLog
 		CallID: c.ID, CallerNumber: c.Info.CallerNumber, CalledNumber: c.Info.CalledNumber,
 	})
 	if err != nil {
-		slog.Warn("dograh run: not created; this call won't appear in Dograh", "call_id", c.ID, "error", err)
-		return
+		slog.Error("dograh run: not created; this call won't appear in Dograh", "call_id", c.ID,
+			"component", "dograh", "event", "run.create_failed", "error", err)
+	} else {
+		config.SetCallRunID(c.ID, runID) // every later line of this call carries run_id
+		slog.Info("dograh run created", "call_id", c.ID, "component", "dograh", "event", "run.created",
+			"workflow_id", wf.ID)
 	}
-
-	slog.Info("dograh run created", "call_id", c.ID, "run_id", runID, "workflow_id", wf.ID, "event", "run.created")
 
 	<-h.Done()
 
@@ -738,16 +766,7 @@ func (m *Manager) recordRun(c *call, wf *dograh.Workflow, callLog *agent.CallLog
 	if rec.Truncated() {
 		metrics.RecordingTruncated.Inc()
 		slog.Warn("call recording hit its size cap; the end of the call is missing from it",
-			"call_id", c.ID, "run_id", runID, "recording_bytes", len(recording))
-	}
-
-	// FinishRun bounds each of its steps itself.
-	err = m.store.FinishRun(context.Background(), wf, runID, dograh.RunEnd{
-		Summary: summary, Duration: duration, Recording: recording,
-	}, m.storage)
-	if err != nil {
-		slog.Warn("dograh run: completing it failed", "call_id", c.ID, "run_id", runID, "error", err)
-		return
+			"call_id", c.ID, "component", "media", "event", "recording.truncated", "recording_bytes", len(recording))
 	}
 
 	reason := summary.EndReason
@@ -755,9 +774,63 @@ func (m *Manager) recordRun(c *call, wf *dograh.Workflow, callLog *agent.CallLog
 		reason = agent.EndReasonUserHangup
 	}
 
-	slog.Info("dograh run completed", "call_id", c.ID, "run_id", runID, "disposition", reason,
-		"events", len(summary.Events), "variables", len(summary.Extracted),
-		"recording_bytes", len(recording), "minio", m.storage != nil, "event", "run.completed")
+	logCallSummary(c, duration, reason, summary, len(recording))
+
+	if runID == 0 {
+		return // not created; already logged
+	}
+
+	// FinishRun bounds each of its steps itself.
+	err = m.store.FinishRun(context.Background(), wf, runID, dograh.RunEnd{
+		Summary: summary, Duration: duration, Recording: recording,
+	}, m.storage)
+	if err != nil {
+		slog.Error("dograh run: completing it failed", "call_id", c.ID, "component", "dograh",
+			"event", "run.complete_failed", "error", err)
+
+		return
+	}
+
+	slog.Info("dograh run completed", "call_id", c.ID, "component", "dograh", "event", "run.completed",
+		"disposition", reason, "events", len(summary.Events), "variables", len(summary.Extracted),
+		"recording_bytes", len(recording), "minio", m.storage != nil)
+}
+
+// logCallSummary writes the call's one summary line: what to chart and alert
+// on (duration, turns, reply latency, interruptions, errors, outcome).
+func logCallSummary(c *call, duration time.Duration, disposition string, s agent.CallSummary, recordingBytes int) {
+	args := []any{"call_id", c.ID, "component", "agent", "event", "call.summary",
+		"duration_s", int(math.Round(duration.Seconds())), "disposition", disposition,
+		"user_turns", s.UserTurns, "agent_replies", s.AgentReplies,
+		"bargeins", s.BargeIns, "pauses", s.Pauses, "false_interruptions", s.FalseInterruptions,
+		"nodes", s.NodesVisited, "variables", len(s.Extracted), "recording_bytes", recordingBytes}
+
+	if p50, p95, ok := percentiles(s.ReplyLatenciesMS); ok {
+		args = append(args, "reply_latency_p50_ms", p50, "reply_latency_p95_ms", p95)
+	}
+
+	if len(s.Errors) > 0 {
+		args = append(args, "errors", s.Errors)
+	}
+
+	slog.Info("call summary", args...)
+}
+
+// percentiles returns the 50th and 95th percentile (nearest rank) of v.
+func percentiles(v []int64) (p50, p95 int64, ok bool) {
+	if len(v) == 0 {
+		return 0, 0, false
+	}
+
+	s := slices.Clone(v)
+	slices.Sort(s)
+
+	rank := func(p float64) int64 {
+		i := int(math.Ceil(p*float64(len(s)))) - 1
+		return s[max(0, min(i, len(s)-1))]
+	}
+
+	return rank(0.50), rank(0.95), true
 }
 
 // newBargeInDetector builds the caller-interrupt detector for one call.
@@ -772,7 +845,7 @@ func (m *Manager) newBargeInDetector(callID string) agent.BargeInDetector {
 	if m.cfg.VadMode == "ten" {
 		det, err := tenvad.NewBargeInDetector(callID, m.cfg.TenVadThreshold)
 		if err != nil {
-			slog.Warn("agent: TEN VAD unavailable, falling back to the energy detector",
+			slog.Warn("agent: TEN VAD unavailable, falling back to the energy detector", "component", "vad", "event", "vad.fallback",
 				"call_id", callID, "error", err)
 		} else {
 			mode := "cutting"
@@ -781,7 +854,7 @@ func (m *Manager) newBargeInDetector(callID string) agent.BargeInDetector {
 			}
 
 			slog.Info("agent: barge-in detector: TEN VAD",
-				"call_id", callID, "threshold", m.cfg.TenVadThreshold,
+				"call_id", callID, "component", "vad", "event", "vad.configured", "threshold", m.cfg.TenVadThreshold,
 				"ten_vad_version", tenvad.Version(), "mode", mode)
 
 			return det
@@ -835,7 +908,7 @@ func (m *Manager) startRTPMedia(c *call) {
 	m.mu.Unlock()
 
 	c.SetState(session.StateMediaActive)
-	slog.Info("rtp media plane running", "call_id", c.ID, "port", c.Port)
+	slog.Info("rtp media plane running", "call_id", c.ID, "component", "media", "event", "media.started", "port", c.Port)
 
 	go m.watchMediaDead(c, cm.Dead())
 	cm.Run(c.mediaCtx) // already on its own goroutine
@@ -851,7 +924,7 @@ func (m *Manager) startRTPMedia(c *call) {
 func (m *Manager) watchMediaDead(c *call, dead <-chan struct{}) {
 	select {
 	case <-dead:
-		slog.Warn("hanging up call: media dead, no inbound audio past MEDIA_DEAD_TIMEOUT_SECONDS", "call_id", c.ID)
+		slog.Warn("hanging up call: media dead, no inbound audio past MEDIA_DEAD_TIMEOUT_SECONDS", "call_id", c.ID, "component", "media", "event", "media.dead")
 		m.teardown(c)
 	case <-c.mediaCtx.Done(): // hangup, or the media plane was stopped by a transfer
 	}
@@ -877,7 +950,7 @@ func (m *Manager) startAudioSocketMedia(c *call) {
 		// Either genuinely timed out, or the listener was closed by a concurrent
 		// teardown (e.g. the caller hung up before Asterisk connected) -- either
 		// way, Teardown's once-guard makes calling it here safe and idempotent.
-		slog.Warn("audiosocket connection never arrived", "call_id", c.ID, "error", err)
+		slog.Warn("audiosocket connection never arrived", "call_id", c.ID, "component", "media", "event", "media.no_connection", "error", err)
 		m.teardown(c)
 
 		return
@@ -913,7 +986,7 @@ func (m *Manager) startAudioSocketMedia(c *call) {
 	m.mu.Unlock()
 
 	c.SetState(session.StateMediaActive)
-	slog.Info("audiosocket connected, media plane running", "call_id", c.ID, "port", c.Port)
+	slog.Info("audiosocket connected, media plane running", "call_id", c.ID, "component", "media", "event", "media.started", "port", c.Port)
 
 	go m.watchMediaDead(c, asm.Dead())
 	asm.Run(c.mediaCtx) // blocking is fine: already running in its own goroutine
@@ -980,7 +1053,7 @@ func (m *Manager) onStasisEnd(e *ari.StasisEnd) {
 	m.mu.Unlock()
 
 	if staged {
-		slog.Info("call ended before bridging completed", "call_id", pc.ID, "external_id", pc.ExternalID, "port", pc.Port)
+		slog.Info("call ended before bridging completed", "call_id", pc.ID, "event", "call.abandoned", "external_id", pc.ExternalID, "port", pc.Port)
 		m.abort(pc)
 	}
 }
@@ -1029,9 +1102,9 @@ func (m *Manager) teardown(c *call) {
 
 		switch {
 		case cm != nil && !cm.RemoteLocked():
-			slog.Warn("rtp remote never locked; no audio ever received", "call_id", c.ID, "external_id", c.ExternalID)
+			slog.Warn("rtp remote never locked; no audio ever received", "call_id", c.ID, "component", "media", "event", "media.no_audio", "external_id", c.ExternalID)
 		case cm == nil && asm == nil:
-			slog.Warn("media plane never started; no audio ever received", "call_id", c.ID, "external_id", c.ExternalID)
+			slog.Warn("media plane never started; no audio ever received", "call_id", c.ID, "component", "media", "event", "media.no_audio", "external_id", c.ExternalID)
 		}
 
 		// Independent of the checks above: a call can have transport-healthy audio
@@ -1041,7 +1114,7 @@ func (m *Manager) teardown(c *call) {
 		// above catches since Asterisk really was sending packets.
 		if avgRMS, ok := nearSilentRMS(cm, asm); ok {
 			slog.Warn("call carried near-silent audio throughout; audio pipeline may be misconfigured",
-				"call_id", c.ID, "external_id", c.ExternalID, "avg_rms", avgRMS)
+				"call_id", c.ID, "component", "media", "event", "media.silent", "external_id", c.ExternalID, "avg_rms", avgRMS)
 		}
 
 		closeMediaSocket(c)

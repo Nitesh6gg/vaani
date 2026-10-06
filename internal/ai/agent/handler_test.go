@@ -31,7 +31,7 @@ func captureSlog(t *testing.T) func() *lockedBuffer {
 	buf := &lockedBuffer{}
 	original := slog.Default()
 
-	slog.SetDefault(slog.New(slog.NewTextHandler(buf, nil)))
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	t.Cleanup(func() { slog.SetDefault(original) })
 
 	return func() *lockedBuffer { return buf }
@@ -445,7 +445,7 @@ func TestHandler_BargeInRecordsOnlyWhatWasHeard(t *testing.T) {
 		{Role: "assistant", Content: "First sentence."},
 		{Role: "user", Content: "wait"},
 	}, fLLM.seenAt(1), "only the sentence the caller started hearing may be recorded")
-	assert.Contains(t, getLog().String(), `[Agent] call_id=call1 gen=1 text="First sentence." cut=true`,
+	assert.Contains(t, getLog().String(), `event=turn.agent turn=1 node="" gen=1 cut=true text="First sentence."`,
 		"a cut reply is logged under its own turn's number")
 }
 
@@ -1633,9 +1633,9 @@ func TestHandler_LogsLatencyFromCallerSpeechEnd(t *testing.T) {
 
 	for _, line := range strings.Split(getLog().String(), "\n") {
 		switch {
-		case strings.Contains(line, "gen=1") && (strings.Contains(line, "stt final transcript") || strings.Contains(line, "tts first audio")):
+		case strings.Contains(line, "gen=1") && (strings.Contains(line, "event=turn.user") || strings.Contains(line, "tts first audio")):
 			first = append(first, line)
-		case strings.Contains(line, "gen=2") && (strings.Contains(line, "stt final transcript") || strings.Contains(line, "tts first audio")):
+		case strings.Contains(line, "gen=2") && (strings.Contains(line, "event=turn.user") || strings.Contains(line, "tts first audio")):
 			second = append(second, line)
 		}
 	}
@@ -1693,7 +1693,7 @@ func (d *fakeClockDetector) detectCount() int {
 // it last heard speech, the turn logs end_detect_ms (last sound -> Sarvam's
 // end-of-speech) and since_last_speech_ms (last sound -> first audio); a
 // last sound older than the previous end-of-speech is never used. The
-// conversation is logged as [User]/[Agent] lines.
+// conversation is logged as turn.user/turn.agent lines.
 func TestHandler_LogsCallerLastSoundAndConversation(t *testing.T) {
 	getLog := captureSlog(t)
 
@@ -1728,7 +1728,7 @@ func TestHandler_LogsCallerLastSoundAndConversation(t *testing.T) {
 
 	for _, line := range strings.Split(getLog().String(), "\n") {
 		for _, key := range []string{"gen=1", "gen=2"} {
-			for _, msg := range []string{"stt final transcript", "tts first audio"} {
+			for _, msg := range []string{"event=turn.user", "tts first audio"} {
 				if strings.Contains(line, key) && strings.Contains(line, msg) {
 					lines[key+" "+msg] = line
 				}
@@ -1736,15 +1736,17 @@ func TestHandler_LogsCallerLastSoundAndConversation(t *testing.T) {
 		}
 	}
 
-	assert.Contains(t, lines["gen=1 stt final transcript"], "end_detect_ms=")
+	assert.Contains(t, lines["gen=1 event=turn.user"], "end_detect_ms=")
 	assert.Contains(t, lines["gen=1 tts first audio"], "since_last_speech_ms=")
-	assert.Contains(t, lines["gen=2 stt final transcript"], "endpoint_ms=", "Sarvam's own figure is still there")
-	assert.NotContains(t, lines["gen=2 stt final transcript"], "end_detect_ms=")
+	assert.Contains(t, lines["gen=2 event=turn.user"], "endpoint_ms=", "Sarvam's own figure is still there")
+	assert.NotContains(t, lines["gen=2 event=turn.user"], "end_detect_ms=")
 	assert.NotContains(t, lines["gen=2 tts first audio"], "since_last_speech_ms=")
 
 	log := getLog().String()
-	assert.Contains(t, log, `[User] call_id=call1 text=first`)
-	assert.Contains(t, log, `[Agent] call_id=call1 gen=1 text=Okay. cut=false`)
+	assert.Contains(t, log, `event=turn.user turn=1 node="" gen=1 text=first`)
+	assert.Contains(t, log, `event=turn.agent turn=1 node="" gen=1 cut=false text=Okay.`)
+	assert.Regexp(t, `event=turn\.agent turn=1 .* llm_ttft_ms=\d+ tts_ttfa_ms=\d+ reply_latency_ms=\d+`, log,
+		"the reply's timings are on its turn.agent line")
 	assert.NotContains(t, log, "agent reply recorded")
 }
 
@@ -1800,7 +1802,7 @@ func TestHandler_PausedJunkDoesNotConfirmButAShortAnswerDoes(t *testing.T) {
 }
 
 // TestHandler_ReplyHeardWhenTheCallEndsIsLogged: the caller hanging up
-// mid-reply still leaves an [Agent] line with what they heard.
+// mid-reply still leaves a turn.agent line with what they heard.
 func TestHandler_ReplyHeardWhenTheCallEndsIsLogged(t *testing.T) {
 	getLog := captureSlog(t)
 
@@ -1822,7 +1824,7 @@ func TestHandler_ReplyHeardWhenTheCallEndsIsLogged(t *testing.T) {
 	hangUp()
 
 	require.Eventually(t, func() bool {
-		return strings.Contains(getLog().String(), `[Agent] call_id=call1 gen=1 text="Goodbye now." cut=true`)
+		return strings.Contains(getLog().String(), `event=turn.agent turn=1 node="" gen=1 cut=true text="Goodbye now."`)
 	}, time.Second, time.Millisecond)
 }
 

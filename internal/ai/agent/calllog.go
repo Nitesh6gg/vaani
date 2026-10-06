@@ -52,6 +52,11 @@ type CallLog struct {
 	userSpoke bool
 	extracted map[string]any // nil until an extraction has returned
 	keys      []string       // extracted's keys, in the order they first came
+
+	// For the call.summary log line (CallLog is also a Sink).
+	replies, bargeIns, pauses, falseInterruptions int
+	errors                                        map[string]int
+	replyLatencies                                []int64
 }
 
 // CallSummary is everything a CallLog recorded.
@@ -64,6 +69,82 @@ type CallSummary struct {
 	// winning (nil: none returned); ExtractedKeys its keys in arrival order.
 	Extracted     map[string]any
 	ExtractedKeys []string
+
+	// UserTurns counts the caller's accepted transcripts and AgentReplies
+	// the agent's turns; BargeIns confirmed interruptions, Pauses possible
+	// ones, FalseInterruptions pauses that resumed; Errors failures by stage
+	// (Sink.Error). ReplyLatenciesMS: per reply, caller's last sound (or the
+	// STT's end of speech) to the reply's first audio.
+	UserTurns, AgentReplies, BargeIns, Pauses, FalseInterruptions int
+	Errors                                                        map[string]int
+	ReplyLatenciesMS                                              []int64
+}
+
+// Sink: a CallLog counts what the handler reports, for the call's summary.
+func (l *CallLog) BargeIn()            { l.count(func() { l.bargeIns++ }) }
+func (l *CallLog) InterruptionPaused() { l.count(func() { l.pauses++ }) }
+func (l *CallLog) FalseInterruption()  { l.count(func() { l.falseInterruptions++ }) }
+func (l *CallLog) TurnStarted()        { l.count(func() { l.replies++ }) }
+func (l *CallLog) Error(stage string) {
+	l.count(func() {
+		if l.errors == nil {
+			l.errors = map[string]int{}
+		}
+
+		l.errors[stage]++
+	})
+}
+
+// ReplyLatency records one reply's wait as the caller experienced it.
+func (l *CallLog) ReplyLatency(d time.Duration) {
+	l.count(func() { l.replyLatencies = append(l.replyLatencies, d.Milliseconds()) })
+}
+
+func (l *CallLog) count(f func()) {
+	if l == nil {
+		return
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	f()
+}
+
+// Sinks fans each Sink event out to all of sinks (e.g. metrics and the
+// call's CallLog).
+func Sinks(sinks ...Sink) Sink { return multiSink(sinks) }
+
+type multiSink []Sink
+
+func (m multiSink) BargeIn() {
+	for _, s := range m {
+		s.BargeIn()
+	}
+}
+
+func (m multiSink) InterruptionPaused() {
+	for _, s := range m {
+		s.InterruptionPaused()
+	}
+}
+
+func (m multiSink) FalseInterruption() {
+	for _, s := range m {
+		s.FalseInterruption()
+	}
+}
+
+func (m multiSink) TurnStarted() {
+	for _, s := range m {
+		s.TurnStarted()
+	}
+}
+
+func (m multiSink) Error(stage string) {
+	for _, s := range m {
+		s.Error(stage)
+	}
 }
 
 // Timestamp formats as Python's isoformat() on a UTC datetime, which is
@@ -215,6 +296,17 @@ func (l *CallLog) Summary() CallSummary {
 		EndReason:     l.reason,
 		UserSpoke:     l.userSpoke,
 		ExtractedKeys: append([]string(nil), l.keys...),
+
+		UserTurns: l.turn, AgentReplies: l.replies, BargeIns: l.bargeIns, Pauses: l.pauses,
+		FalseInterruptions: l.falseInterruptions,
+		ReplyLatenciesMS:   append([]int64(nil), l.replyLatencies...),
+	}
+
+	if l.errors != nil {
+		s.Errors = make(map[string]int, len(l.errors))
+		for k, v := range l.errors {
+			s.Errors[k] = v
+		}
 	}
 
 	if l.extracted != nil {

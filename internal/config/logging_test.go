@@ -25,7 +25,7 @@ func testHandler(t *testing.T, env string) (*bytes.Buffer, slog.Handler) {
 	RegisterCallTrace("c1", NewTraceID())
 	t.Cleanup(func() { UnregisterCallTrace("c1") })
 
-	return buf, newHandler(buf, env, "json", slog.LevelInfo)
+	return buf, newHandler(buf, env, "json", slog.LevelInfo, true)
 }
 
 // TestJSONLineShape is the golden-record test: one emitted line must
@@ -97,6 +97,77 @@ func TestExplicitComponentWins(t *testing.T) {
 	require.NoError(t, json.Unmarshal(buf.Bytes(), &rec))
 
 	assert.Equal(t, "db", rec["component"])
+}
+
+// TestCallContextOutlivesTeardownWhileHeld: the Dograh run is completed after
+// the call's teardown; its lines must still carry trace_id and run_id.
+func TestCallContextOutlivesTeardownWhileHeld(t *testing.T) {
+	buf, h := testHandler(t, "production")
+	logger := slog.New(h)
+
+	HoldCallTrace("c1")       // the run writer
+	SetCallRunID("c1", 503)   // the run was created
+	UnregisterCallTrace("c1") // teardown
+	logger.Info("run.completed", "call_id", "c1")
+
+	var rec map[string]any
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &rec))
+	assert.NotEmpty(t, rec["trace_id"])
+	assert.Equal(t, float64(503), rec["run_id"])
+
+	UnregisterCallTrace("c1") // the run writer is done
+	buf.Reset()
+	logger.Info("late", "call_id", "c1")
+	assert.NotContains(t, buf.String(), "trace_id")
+}
+
+// TestExplicitRunIDNotDuplicated: a line that names run_id itself must not
+// get a second one.
+func TestExplicitRunIDNotDuplicated(t *testing.T) {
+	buf, h := testHandler(t, "production")
+	SetCallRunID("c1", 7)
+
+	slog.New(h).Info("x", "call_id", "c1", "run_id", 7)
+
+	assert.Equal(t, 1, strings.Count(buf.String(), `"run_id"`))
+}
+
+func TestPIIMasking(t *testing.T) {
+	cases := []struct {
+		pii  bool
+		want []string
+	}{
+		{false, []string{`"caller_number":"XXXXXXXXX35"`, `"text":"[redacted 14 chars]"`, `"gen":3`}},
+		{true, []string{`"caller_number":"08448805135"`, `"text":"मेरा नाम नितेश"`}},
+	}
+
+	for _, tc := range cases {
+		buf := &bytes.Buffer{}
+		slog.New(newHandler(buf, "production", "json", slog.LevelInfo, tc.pii)).
+			Info("turn.user", "caller_number", "08448805135", "text", "मेरा नाम नितेश", "gen", 3)
+
+		for _, w := range tc.want {
+			assert.Contains(t, buf.String(), w, "pii=%v", tc.pii)
+		}
+	}
+}
+
+func TestParseLogPII(t *testing.T) {
+	cases := []struct {
+		v, env  string
+		pii, ok bool
+	}{
+		{"", "development", true, true},
+		{"", "production", false, true},
+		{"1", "production", true, true},
+		{"0", "development", false, true},
+		{"maybe", "production", false, false},
+	}
+	for _, tc := range cases {
+		pii, ok := parseLogPII(tc.v, tc.env)
+		assert.Equal(t, tc.pii, pii, "%q/%s", tc.v, tc.env)
+		assert.Equal(t, tc.ok, ok, "%q/%s", tc.v, tc.env)
+	}
 }
 
 func TestUnregisterRemovesTrace(t *testing.T) {
@@ -193,7 +264,7 @@ func TestNewHandler_TextFormat(t *testing.T) {
 	RegisterCallTrace("c1", NewTraceID())
 	t.Cleanup(func() { UnregisterCallTrace("c1") })
 
-	logger := slog.New(newHandler(buf, "production", "text", slog.LevelInfo))
+	logger := slog.New(newHandler(buf, "production", "text", slog.LevelInfo, true))
 	logger.Info("hello", "call_id", "c1")
 
 	out := buf.String()
@@ -207,7 +278,7 @@ func TestNewHandler_TextFormat(t *testing.T) {
 // TestNewHandler_LevelFiltering: LOG_LEVEL gates emission.
 func TestNewHandler_LevelFiltering(t *testing.T) {
 	buf := &bytes.Buffer{}
-	logger := slog.New(newHandler(buf, "production", "json", slog.LevelWarn))
+	logger := slog.New(newHandler(buf, "production", "json", slog.LevelWarn, true))
 
 	logger.Info("hidden at warn")
 	logger.Debug("also hidden")

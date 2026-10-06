@@ -98,13 +98,20 @@ heard. A reply that plays out is recorded whole; one cut short (barge-in, dead
 TTS connection) is recorded only up to the sentence that was playing. Tool
 calls and their results are recorded ahead of the spoken reply.
 
-Conversation in the logs: each accepted caller transcript is logged as
-`[User] call_id=... text="..."`, and each agent reply -- exactly the part the
-caller heard, greeting, transition speech and tool messages included -- as
-`[Agent] call_id=... gen=N text="..." cut=false|true` once it has finished
-playing or been cut, so the two read in conversation order. If the call ends
-during a reply (usually the caller hanging up), what they heard of it is
-logged with `cut=true` as the call closes.
+Conversation in the logs: each accepted caller transcript is one
+`event=turn.user` line (`turn`, `node`, `text`, and the STT timings
+`end_detect_ms`/`endpoint_ms`/`since_flush_ms`), and each agent reply --
+exactly the part the caller heard, greeting, transition speech and tool
+messages included -- one `event=turn.agent` line (`turn`, `node`, `text`,
+`cut`, and `llm_ttft_ms`, `tts_ttfa_ms`, `reply_latency_ms`) once it has
+finished playing or been cut, so the two read in conversation order. If the
+call ends during a reply (usually the caller hanging up), what they heard of
+it is logged with `cut=true` as the call closes. Each call ends with one
+`event=call.summary` line: duration, turns, interruptions, reply latency
+p50/p95, errors by stage, disposition and nodes. Every line about a call
+carries `call_id`, `trace_id` and (once Dograh's run exists) `run_id`.
+`LOG_PII=0` (the default outside development) masks phone numbers and
+replaces text with its length.
 
 ### Configured in Dograh
 
@@ -280,9 +287,9 @@ call: failures are logged (`dograh run: ...`) and the call carries on.
   shows (`realtime_feedback_events`, shaped as Dograh's logs buffer stores
   them -- timestamp, turn, node):
   - `rtf-node-transition` at the start node and on every edge taken;
-  - `rtf-user-transcription` for each caller turn (the `[User]` line; each
+  - `rtf-user-transcription` for each caller turn (the `turn.user` line; each
     one starts a new turn);
-  - `rtf-bot-text` for each reply as heard (the `[Agent]` line -- greeting,
+  - `rtf-bot-text` for each reply as heard (the `turn.agent` line -- greeting,
     transition speech and tool messages included, as one entry);
   - `rtf-function-call-start` / `-end` for every function the LLM calls,
     tools and edges alike (Dograh registers both as functions).

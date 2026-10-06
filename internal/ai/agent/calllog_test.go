@@ -2,6 +2,7 @@ package agent
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -57,4 +58,35 @@ func TestCallLogMatchesDograhEvents(t *testing.T) {
 
 	var nilLog *CallLog
 	nilLog.UserSaid("x") // a call without a log records nothing, safely
+	nilLog.BargeIn()
+	nilLog.Error("llm")
+}
+
+// TestCallLogCountsForTheSummary: as a Sink (fanned out next to metrics), a
+// CallLog counts what call.summary reports.
+func TestCallLogCountsForTheSummary(t *testing.T) {
+	var l CallLog
+
+	sink := Sinks(NoopSink{}, &l)
+
+	sink.TurnStarted()
+	sink.TurnStarted()
+	sink.InterruptionPaused()
+	sink.InterruptionPaused()
+	sink.FalseInterruption()
+	sink.BargeIn()
+	sink.Error("llm")
+	sink.Error("llm")
+	sink.Error("tts_open")
+	l.UserSaid("हाँ")
+	l.ReplyLatency(850 * time.Millisecond)
+
+	s := l.Summary()
+	assert.Equal(t, 1, s.UserTurns)
+	assert.Equal(t, 2, s.AgentReplies)
+	assert.Equal(t, 2, s.Pauses)
+	assert.Equal(t, 1, s.FalseInterruptions)
+	assert.Equal(t, 1, s.BargeIns)
+	assert.Equal(t, map[string]int{"llm": 2, "tts_open": 1}, s.Errors)
+	assert.Equal(t, []int64{850}, s.ReplyLatenciesMS)
 }

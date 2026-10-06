@@ -8,9 +8,11 @@ import (
 	"log/slog"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/nitesh/vaani/internal/version"
 )
@@ -24,22 +26,39 @@ const ServiceName = "vaani-engine"
 
 // Log level guidelines (who logs what, at which level):
 //
-//   - DEBUG: high-frequency detail -- streaming ticks, per-packet events,
-//     LLM stream chunk processing, VAD hop processing. Off in production
-//     unless troubleshooting.
-//   - INFO: key state transitions -- call answered, workflow node
-//     transitions, turn completed, final transcripts, hangup, and the
-//     caller's speech started/ended boundaries (kept at INFO deliberately:
-//     they are an operator-facing feature, not an internal tick).
-//   - WARN: degraded experience -- barge-in interruptions, transcript
-//     filtering during playback, fallback configurations, size-cap hits.
-//   - ERROR: non-fatal system failures -- STT socket drops and retries,
-//     database write fallbacks, LLM/tool execution errors.
+//   - DEBUG: per-step and high-frequency detail -- each TTS chunk, LLM first
+//     token / stream end, TTS first audio / delivery, STT flushes and the
+//     STT's own speech start/end signals, local VAD speech start/end. Their
+//     timings are summed up on turn.agent. Off in production unless
+//     troubleshooting.
+//   - INFO: the call's story -- call answered/bridged/ended, workflow loaded,
+//     turn.user / turn.agent, node transitions, tool calls, interruptions
+//     (normal conversation, not a fault), transcripts ignored, the Dograh
+//     run, and one call.summary per call.
+//   - WARN: degraded experience -- fallbacks, a dead TTS connection, media
+//     with no audio, size-cap hits, a provider retry.
+//   - ERROR: failures -- a call that can't run, a record that can't be
+//     written, an LLM/tool error.
+//
+// Every line about a call carries call_id; the handler adds its trace_id and
+// (once the Dograh run exists) run_id. Set component and event explicitly
+// where the call site's package isn't what the line is about.
 
-// callTraces maps call_id -> W3C trace_id (32 hex chars) so the log handler
-// can stamp every line that carries a call_id with its call's trace.
-// Registered at call setup, removed at teardown -- bounded by live calls.
-var callTraces sync.Map
+// calls maps call_id -> its log context, so the handler can stamp every line
+// carrying a call_id with the call's trace_id and run_id. Reference-counted:
+// registered at call setup, held by whatever still logs about the call after
+// its teardown (writing the Dograh run), and dropped when the last holder
+// lets go -- bounded by live calls.
+var (
+	callsMu sync.Mutex
+	calls   = map[string]*callLogContext{}
+)
+
+type callLogContext struct {
+	traceID string
+	runID   int64
+	refs    int
+}
 
 // NewTraceID generates a W3C-format trace id: 16 random bytes as 32 hex
 // characters.
@@ -57,24 +76,63 @@ func NewTraceID() string {
 
 // RegisterCallTrace associates a call with its trace id: from then on, every
 // log line carrying call_id=<callID> is stamped with trace_id automatically.
+// It holds one reference (see UnregisterCallTrace).
 func RegisterCallTrace(callID, traceID string) {
-	callTraces.Store(callID, traceID)
+	callsMu.Lock()
+	defer callsMu.Unlock()
+
+	calls[callID] = &callLogContext{traceID: traceID, refs: 1}
 }
 
-// UnregisterCallTrace drops the association at teardown, keeping the registry
-// bounded by live calls.
+// HoldCallTrace takes one more reference on a registered call, for work that
+// keeps logging about it after its teardown. Release with UnregisterCallTrace.
+func HoldCallTrace(callID string) {
+	callsMu.Lock()
+	defer callsMu.Unlock()
+
+	if c := calls[callID]; c != nil {
+		c.refs++
+	}
+}
+
+// UnregisterCallTrace releases one reference; the call's context is dropped
+// when the last one is released.
 func UnregisterCallTrace(callID string) {
-	callTraces.Delete(callID)
+	callsMu.Lock()
+	defer callsMu.Unlock()
+
+	if c := calls[callID]; c != nil {
+		if c.refs--; c.refs <= 0 {
+			delete(calls, callID)
+		}
+	}
+}
+
+// SetCallRunID records the call's Dograh run id: from then on its lines carry
+// run_id too.
+func SetCallRunID(callID string, runID int64) {
+	callsMu.Lock()
+	defer callsMu.Unlock()
+
+	if c := calls[callID]; c != nil {
+		c.runID = runID
+	}
+}
+
+func lookupCall(callID string) (traceID string, runID int64) {
+	callsMu.Lock()
+	defer callsMu.Unlock()
+
+	if c := calls[callID]; c != nil {
+		return c.traceID, c.runID
+	}
+
+	return "", 0
 }
 
 func lookupTrace(callID string) string {
-	if v, ok := callTraces.Load(callID); ok {
-		if s, ok := v.(string); ok {
-			return s
-		}
-	}
-
-	return ""
+	t, _ := lookupCall(callID)
+	return t
 }
 
 // ConfigureLogging installs the process's default slog logger: single-line
@@ -113,7 +171,54 @@ func ConfigureLogging() {
 		slog.Warn("LOG_LEVEL invalid; using info", "value", os.Getenv("LOG_LEVEL"), "valid", "debug|info|warn|error")
 	}
 
-	slog.SetDefault(slog.New(newHandler(os.Stderr, env, format, level)))
+	pii, piiOK := parseLogPII(os.Getenv("LOG_PII"), env)
+	if !piiOK {
+		slog.Warn("LOG_PII invalid; using the environment's default", "value", os.Getenv("LOG_PII"), "valid", "0|1",
+			"log_pii", pii)
+	}
+
+	slog.SetDefault(slog.New(newHandler(os.Stderr, env, format, level, pii)))
+}
+
+// parseLogPII reads LOG_PII: whether logs may carry personal data in full
+// (phone numbers, what the caller and agent said, tool arguments). Default:
+// yes in development, no anywhere else -- production logs are masked unless
+// someone deliberately turns it on.
+func parseLogPII(v, env string) (pii, ok bool) {
+	switch strings.TrimSpace(v) {
+	case "":
+		return env == "development", true
+	case "1", "true":
+		return true, true
+	case "0", "false":
+		return false, true
+	default:
+		return env == "development", false
+	}
+}
+
+// piiKeys are the attributes that can carry personal data: phone numbers
+// (masked to their last two digits) and free text (replaced by its length).
+var piiKeys = map[string]bool{
+	"caller_number": true, "called_number": true, "destination": true,
+	"text": true, "rejected_text": true, "args": true, "result": true,
+	"reply": true, "variables": true,
+}
+
+// redact is a PII attribute's value with LOG_PII=0.
+func redact(key string, v slog.Value) slog.Value {
+	s := v.String()
+
+	switch key {
+	case "caller_number", "called_number", "destination":
+		if len(s) <= 2 {
+			return slog.StringValue(strings.Repeat("X", len(s)))
+		}
+
+		return slog.StringValue(strings.Repeat("X", len(s)-2) + s[len(s)-2:])
+	default:
+		return slog.StringValue("[redacted " + strconv.Itoa(utf8.RuneCountInString(s)) + " chars]")
+	}
 }
 
 // parseLogFormat validates LOG_FORMAT; ok is false when the value should be
@@ -145,11 +250,23 @@ func parseLogLevel(v string) (slog.Level, bool) {
 	}
 }
 
-// newHandler builds the enriched handler for the requested format and level.
-func newHandler(w io.Writer, env, format string, level slog.Level) slog.Handler {
+// newHandler builds the enriched handler for the requested format and level;
+// with pii false, personal data is masked (see piiKeys).
+func newHandler(w io.Writer, env, format string, level slog.Level, pii bool) slog.Handler {
+	replace := replaceAttr
+	if !pii {
+		replace = func(groups []string, a slog.Attr) slog.Attr {
+			if len(groups) == 0 && piiKeys[a.Key] {
+				a.Value = redact(a.Key, a.Value)
+			}
+
+			return replaceAttr(groups, a)
+		}
+	}
+
 	opts := &slog.HandlerOptions{
 		Level:       level,
-		ReplaceAttr: replaceAttr,
+		ReplaceAttr: replace,
 	}
 
 	var base slog.Handler
@@ -222,12 +339,21 @@ func (e *enrichHandler) Handle(_ context.Context, r slog.Record) error {
 		slog.String("environment", e.env),
 	))
 
-	if traceID := e.traceFor(&r); traceID != "" {
-		out.AddAttrs(slog.String("trace_id", traceID))
+	callID, hasComponent, hasRunID := scanAttrs(&r)
+
+	if callID != "" {
+		traceID, runID := lookupCall(callID)
+		if traceID != "" {
+			out.AddAttrs(slog.String("trace_id", traceID))
+		}
+
+		if runID > 0 && !hasRunID {
+			out.AddAttrs(slog.Int64("run_id", runID))
+		}
 	}
 
-	if component := e.componentFor(&r); component != "" {
-		out.AddAttrs(slog.String("component", component))
+	if !hasComponent {
+		out.AddAttrs(slog.String("component", componentForPC(r.PC)))
 	}
 
 	for _, a := range e.presets {
@@ -243,59 +369,37 @@ func (e *enrichHandler) Handle(_ context.Context, r slog.Record) error {
 	return e.inner.Handle(context.Background(), out)
 }
 
-// traceFor looks up the record's call_id in the trace registry.
-func (e *enrichHandler) traceFor(r *slog.Record) string {
-	var callID string
-
+// scanAttrs reads, in one pass, the record's call_id and whether it already
+// names its component or run_id (explicit attrs win over derived ones).
+func scanAttrs(r *slog.Record) (callID string, hasComponent, hasRunID bool) {
 	r.Attrs(func(a slog.Attr) bool {
-		if a.Key == "call_id" && a.Value.Kind() == slog.KindString {
-			callID = a.Value.String()
-
-			return false
+		switch a.Key {
+		case "call_id":
+			if a.Value.Kind() == slog.KindString {
+				callID = a.Value.String()
+			}
+		case "component":
+			hasComponent = true
+		case "run_id":
+			hasRunID = true
 		}
 
 		return true
 	})
 
-	if callID == "" {
-		return ""
-	}
-
-	return lookupTrace(callID)
+	return callID, hasComponent, hasRunID
 }
 
-// hasExplicitComponent reports whether the record already carries a
-// component attr, which wins over the package-derived one.
-func (e *enrichHandler) hasExplicitComponent(r *slog.Record) bool {
-	exists := false
-
-	r.Attrs(func(a slog.Attr) bool {
-		if a.Key == "component" {
-			exists = true
-
-			return false
-		}
-
-		return true
-	})
-
-	return exists
-}
-
-// componentFor derives the component from the logging call site's package:
-// internal/ai/agent -> "agent", internal/ai/agent/tenvad -> "vad",
+// componentForPC derives the component from the logging call site's
+// package: internal/ai/agent -> "agent", internal/ai/agent/tenvad -> "vad",
 // internal/ari -> "ari", and so on. "service" covers cmd/ binaries and
 // anything outside the internal tree.
-func (e *enrichHandler) componentFor(r *slog.Record) string {
-	if e.hasExplicitComponent(r) {
-		return ""
-	}
-
-	if r.PC == 0 {
+func componentForPC(pc uintptr) string {
+	if pc == 0 {
 		return "service"
 	}
 
-	frame, _ := runtime.CallersFrames([]uintptr{r.PC}).Next()
+	frame, _ := runtime.CallersFrames([]uintptr{pc}).Next()
 
 	return componentFromFunction(frame.Function)
 }

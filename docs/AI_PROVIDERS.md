@@ -275,25 +275,30 @@ Metrics: `vaani_agent_interruption_pauses_total` counts pauses,
 
 With `VAD_MODE=ten` the detector
 also runs while the agent is listening (for the latency fields below), so
-`speech started`/`speech ended` lines appear between replies too; that
+its `vad.speech_started`/`vad.speech_ended` lines (DEBUG level) appear
+between replies too; that
 listening-time verdict never interrupts anything. Turning `BARGE_IN_ENABLED`
 to `0` stops all interruptions (no pause, no cut); with `VAD_MODE=energy` it
 also silences the logging.
 
 ## Turn latency in the logs
 
-Per turn, all in milliseconds:
+Per turn, all in milliseconds. At `LOG_LEVEL=info` the `turn.user` and
+`turn.agent` lines carry what matters; `debug` adds the per-step lines.
 
-| Log line | Field | From -> to |
-|---|---|---|
-| `stt final transcript` | `end_detect_ms` | the caller's last sound (TEN VAD) -> Sarvam's `END_SPEECH`: how long Sarvam took to decide they'd stopped |
-| `stt final transcript` | `endpoint_ms` | Sarvam's `END_SPEECH` -> its transcript |
-| `stt final transcript` | `since_flush_ms` | the early-finalize flush -> this transcript (only with `STT_FLUSH_AFTER_MS`) |
-| `llm first token` | `latency_ms` | transcript accepted -> first LLM token |
-| `tts first audio` | `latency_ms` | transcript accepted -> first TTS audio received |
-| `tts first audio` | `since_speech_end_ms` | Sarvam's `END_SPEECH` -> first TTS audio received |
-| `tts first audio` | `since_last_speech_ms` | the caller's last sound (TEN VAD) -> first TTS audio received: the closest figure to the caller's wait |
-| `turn complete` | `total_latency_ms` | transcript accepted -> the reply has fully played |
+| Log line (event) | Level | Field | From -> to |
+|---|---|---|---|
+| `turn.user` | info | `end_detect_ms` | the caller's last sound (TEN VAD) -> Sarvam's `END_SPEECH`: how long Sarvam took to decide they'd stopped |
+| `turn.user` | info | `endpoint_ms` | Sarvam's `END_SPEECH` -> its transcript |
+| `turn.user` | info | `since_flush_ms` | the early-finalize flush -> this transcript (only with `STT_FLUSH_AFTER_MS`) |
+| `turn.agent` | info | `llm_ttft_ms` | transcript accepted -> first LLM token |
+| `turn.agent` | info | `tts_ttfa_ms` | transcript accepted -> first TTS audio received |
+| `turn.agent` | info | `reply_latency_ms` | the caller's last sound (TEN VAD; else Sarvam's `END_SPEECH`) -> first TTS audio: the caller's wait. Its p50/p95 over the call are on `call.summary` |
+| `tts.first_audio` | debug | `since_speech_end_ms`, `since_last_speech_ms` | the two sources of `reply_latency_ms`, separately |
+| `agent.turn.completed` | debug | `total_latency_ms` | transcript accepted -> the reply has fully played |
+| `stt.speech_started` | debug | `vad_last_speech_ago_ms` | Sarvam's `START_SPEECH` arriving, against the local VAD's last speech |
+| `stt.speech_ended` | debug | `utterance_ms`, `end_detect_ms` | Sarvam's utterance length; the caller's last sound -> its `END_SPEECH` |
+| `stt.flush_skipped` | debug | `vad_last_speech_before_onset_ms` | no early flush for this utterance because the local VAD didn't hear its onset (its last speech was this long before Sarvam's `START_SPEECH`) -- the usual cause of a slow reply with no `stt.flush` line |
 
 **Sarvam-based fields** (`endpoint_ms`, `since_speech_end_ms`) appear only
 on turns started by the caller speaking, and only when Sarvam sent
