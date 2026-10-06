@@ -25,7 +25,7 @@ func testHandler(t *testing.T, env string) (*bytes.Buffer, slog.Handler) {
 	RegisterCallTrace("c1", NewTraceID())
 	t.Cleanup(func() { UnregisterCallTrace("c1") })
 
-	return buf, newJSONHandler(buf, env)
+	return buf, newHandler(buf, env, "json", slog.LevelInfo)
 }
 
 // TestJSONLineShape is the golden-record test: one emitted line must
@@ -150,4 +150,71 @@ func TestConfigureLoggingTimestampKeptMillisecondPrecision(t *testing.T) {
 	got := time.Date(2026, 10, 6, 11, 24, 14, 651_900_000, ist).UTC().Format(LogTimeFormat)
 
 	assert.Equal(t, "2026-10-06T05:54:14.651Z", got)
+}
+
+// TestParseLogLevel: the four accepted values, case-insensitive, with the
+// empty string meaning info and anything else falling back.
+func TestParseLogLevel(t *testing.T) {
+	cases := []struct {
+		in   string
+		want slog.Level
+		ok   bool
+	}{
+		{"", slog.LevelInfo, true},
+		{"info", slog.LevelInfo, true},
+		{"DEBUG", slog.LevelDebug, true},
+		{"warn", slog.LevelWarn, true},
+		{"warning", slog.LevelWarn, true},
+		{"error", slog.LevelError, true},
+		{"verbose", slog.LevelInfo, false},
+	}
+	for _, tc := range cases {
+		got, ok := parseLogLevel(tc.in)
+		assert.Equal(t, tc.want, got, "input %q", tc.in)
+		assert.Equal(t, tc.ok, ok, "input %q", tc.in)
+	}
+}
+
+func TestParseLogFormat(t *testing.T) {
+	got, ok := parseLogFormat("TEXT")
+	assert.Equal(t, "text", got)
+	assert.True(t, ok)
+
+	got, ok = parseLogFormat("jsonl")
+	assert.Equal(t, "json", got)
+	assert.False(t, ok, "an unrecognized format must fall back with a warning")
+}
+
+// TestNewHandler_TextFormat: LOG_FORMAT=text produces the key=value shape
+// with the same enriched fields as JSON.
+func TestNewHandler_TextFormat(t *testing.T) {
+	buf := &bytes.Buffer{}
+
+	RegisterCallTrace("c1", NewTraceID())
+	t.Cleanup(func() { UnregisterCallTrace("c1") })
+
+	logger := slog.New(newHandler(buf, "production", "text", slog.LevelInfo))
+	logger.Info("hello", "call_id", "c1")
+
+	out := buf.String()
+	assert.Contains(t, out, `service.name=vaani-engine`)
+	assert.Contains(t, out, `trace_id=`)
+	assert.Contains(t, out, `component=config`)
+	assert.Contains(t, out, `level=info`)
+	assert.Regexp(t, regexp.MustCompile(`time=\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z`), out)
+}
+
+// TestNewHandler_LevelFiltering: LOG_LEVEL gates emission.
+func TestNewHandler_LevelFiltering(t *testing.T) {
+	buf := &bytes.Buffer{}
+	logger := slog.New(newHandler(buf, "production", "json", slog.LevelWarn))
+
+	logger.Info("hidden at warn")
+	logger.Debug("also hidden")
+
+	assert.Empty(t, buf.String(), "info/debug must be suppressed when LOG_LEVEL=warn")
+
+	logger.Error("shown")
+
+	assert.Contains(t, buf.String(), `"level":"error"`)
 }

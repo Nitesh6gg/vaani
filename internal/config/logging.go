@@ -78,46 +78,110 @@ func lookupTrace(callID string) string {
 }
 
 // ConfigureLogging installs the process's default slog logger: single-line
-// JSON on stderr, UTC ISO-8601 millisecond timestamps, lowercase level names,
-// a service group (name/version/deployment.environment) on every line, the
-// component derived from the logging call site's package, and trace_id
-// stamped on every line that carries a call_id. The deployment tier comes
-// from DEPLOYMENT_ENVIRONMENT (default "development"; set "production" in
-// deployment .env files).
+// JSON (default) or key=value text on stderr, UTC ISO-8601 millisecond
+// timestamps, lowercase level names, a service group
+// (name/version/deployment.environment) on every line, the component derived
+// from the logging call site's package, and trace_id stamped on every line
+// that carries a call_id.
+//
+// Read from the environment or .env (loaded here first, so .env values work
+// even though this runs before config.Load): DEPLOYMENT_ENVIRONMENT
+// (default "development"; set "production" in deployment .env files),
+// LOG_FORMAT ("json" default, or "text" for development), and LOG_LEVEL
+// ("info" default; "debug", "warn", "error" also accepted). Invalid values
+// fall back to the defaults with a warning -- never fatal.
 func ConfigureLogging() {
+	// Apply .env before reading logging config: this runs before
+	// config.Load, and without this a .env-set LOG_FORMAT/LOG_LEVEL/
+	// DEPLOYMENT_ENVIRONMENT would be invisible. Real environment variables
+	// still win (loadDotenv never overwrites them).
+	loadDotenv()
+
 	env := os.Getenv("DEPLOYMENT_ENVIRONMENT")
 	if env == "" {
 		env = "development"
 	}
 
-	slog.SetDefault(slog.New(newJSONHandler(os.Stderr, env)))
-}
+	format, formatOK := parseLogFormat(os.Getenv("LOG_FORMAT"))
+	level, levelOK := parseLogLevel(os.Getenv("LOG_LEVEL"))
 
-// newJSONHandler builds the base JSON handler: UTC ISO-8601 millisecond
-// timestamps and lowercase level names, per the logging spec.
-func newJSONHandler(w io.Writer, env string) slog.Handler {
-	opts := &slog.HandlerOptions{
-		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
-			if len(groups) != 0 {
-				return a
-			}
-
-			switch a.Key {
-			case slog.TimeKey:
-				if t, ok := a.Value.Any().(time.Time); ok {
-					a.Value = slog.StringValue(t.UTC().Format(LogTimeFormat))
-				}
-			case slog.LevelKey:
-				if l, ok := a.Value.Any().(slog.Level); ok {
-					a.Value = slog.StringValue(strings.ToLower(l.String()))
-				}
-			}
-
-			return a
-		},
+	if !formatOK {
+		slog.Warn("LOG_FORMAT invalid; using json", "value", os.Getenv("LOG_FORMAT"), "valid", "json|text")
 	}
 
-	return &enrichHandler{inner: slog.NewJSONHandler(w, opts), env: env}
+	if !levelOK {
+		slog.Warn("LOG_LEVEL invalid; using info", "value", os.Getenv("LOG_LEVEL"), "valid", "debug|info|warn|error")
+	}
+
+	slog.SetDefault(slog.New(newHandler(os.Stderr, env, format, level)))
+}
+
+// parseLogFormat validates LOG_FORMAT; ok is false when the value should be
+// replaced by the default.
+func parseLogFormat(v string) (format string, ok bool) {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "", "json":
+		return "json", true
+	case "text":
+		return "text", true
+	default:
+		return "json", false
+	}
+}
+
+// parseLogLevel validates LOG_LEVEL against slog's levels.
+func parseLogLevel(v string) (slog.Level, bool) {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "", "info":
+		return slog.LevelInfo, true
+	case "debug":
+		return slog.LevelDebug, true
+	case "warn", "warning":
+		return slog.LevelWarn, true
+	case "error":
+		return slog.LevelError, true
+	default:
+		return slog.LevelInfo, false
+	}
+}
+
+// newHandler builds the enriched handler for the requested format and level.
+func newHandler(w io.Writer, env, format string, level slog.Level) slog.Handler {
+	opts := &slog.HandlerOptions{
+		Level:       level,
+		ReplaceAttr: replaceAttr,
+	}
+
+	var base slog.Handler
+
+	if format == "text" {
+		base = slog.NewTextHandler(w, opts)
+	} else {
+		base = slog.NewJSONHandler(w, opts)
+	}
+
+	return &enrichHandler{inner: base, env: env}
+}
+
+// replaceAttr rewrites the top-level time (UTC ISO-8601 with milliseconds)
+// and level (lowercase) attributes, per the logging spec.
+func replaceAttr(groups []string, a slog.Attr) slog.Attr {
+	if len(groups) != 0 {
+		return a
+	}
+
+	switch a.Key {
+	case slog.TimeKey:
+		if t, ok := a.Value.Any().(time.Time); ok {
+			a.Value = slog.StringValue(t.UTC().Format(LogTimeFormat))
+		}
+	case slog.LevelKey:
+		if l, ok := a.Value.Any().(slog.Level); ok {
+			a.Value = slog.StringValue(strings.ToLower(l.String()))
+		}
+	}
+
+	return a
 }
 
 // enrichHandler wraps the JSON handler, prepending what every line carries
