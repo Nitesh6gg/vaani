@@ -109,7 +109,20 @@ func (m *Manager) connectTransfer(c *call, destID string) error {
 		return fmt.Errorf("could not connect the transfer: %w", err)
 	}
 
+	// Re-checked here, under the lock teardown reads transferChannel with: the
+	// caller can hang up during AddChannel's round trip above. session.Teardown
+	// marks the call torn down before its cleanup takes m.mu, so either this
+	// sees the teardown and hangs the destination up itself, or the teardown's
+	// cleanup sees transferChannel and does. Without it the destination stayed
+	// up, billable, and its m.active entry was never removed.
 	m.mu.Lock()
+	if c.State() == session.StateTornDown {
+		m.mu.Unlock()
+		hangupChannel(m.cl, c.ID, destID)
+
+		return errors.New("call ended while the transfer was connecting")
+	}
+
 	c.transferChannel = destID
 	m.active[destID] = c
 	// The agent's leg is about to be hung up on purpose; its StasisEnd must

@@ -90,6 +90,9 @@ Real-time voice agent: Asterisk ARI (telephony) + Go media plane + Sarvam STT/TT
 ## Conventions
 - Errors: wrap with `fmt.Errorf("...: %w", err)`, never panic in request path.
 - Logging: structured (`log/slog`), include `call_id` in every log line.
+  Every `cmd/` binary calls `config.ConfigureLogging()` first: slog's
+  key=value text format on stderr, timestamps in UTC with milliseconds
+  (`time="2026-10-06 05:54:14.651"`).
 - Tests: table-driven, `testify/assert`. Integration tests skip if `ASTERISK_HOST` unset.
 
 ## Docs Index

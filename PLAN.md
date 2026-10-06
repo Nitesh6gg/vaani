@@ -168,7 +168,22 @@ Status, item by item — "live" means seen working on a real call:
   formatting, JSON-reply parsing all checked against Dograh's own code);
   **not yet tried live**.
 
-**Step 3b is done.** Not done yet:
+**Step 3b is done.**
+
+- **Robustness pass** (2026-10-06, after an external code review, each
+  finding verified against the code first): fixes for calls that could get
+  stuck (a dropped barge-in signal leaving a reply paused, a dead TTS
+  connection reused for the rest of the call, an LLM stream with no
+  deadline), leaks (the STT connection never closed at call end; a transfer
+  race leaving the answered destination up), scaling (AudioSocket call
+  setup serialized behind the manager's lock), and Dograh run integrity
+  (completion written before uploads, each step its own budget, shutdown
+  writes the completion); log timestamps now UTC with milliseconds. See
+  "Failure handling" in `docs/ARCHITECTURE.md` — unit-tested; **not yet
+  tried live**, and `go test -race ./...` must be run on Linux (this
+  Windows toolchain can't).
+
+Not done yet:
 - **Step 4:** knowledge base (Dograh's documents, pgvector).
 - Dograh features Vaani skips for now: muting the caller during queued
   messages (tool messages, transition speech) regardless of the node,

@@ -54,3 +54,17 @@ func TestMixRecorder(t *testing.T) {
 
 	assert.Nil(t, NewMixRecorder(fixedHandler(nil)).WAV(), "nothing recorded: no file")
 }
+
+func TestMixRecorderReportsTruncation(t *testing.T) {
+	r := NewMixRecorder(fixedHandler(nil))
+	r.max = 2 * FrameSize
+
+	r.ProcessFrame(context.Background(), "c", frameOf(1))
+	r.ProcessFrame(context.Background(), "c", frameOf(1))
+	assert.False(t, r.Truncated(), "exactly at the cap is complete")
+
+	out := r.ProcessFrame(context.Background(), "c", frameOf(1))
+	assert.Empty(t, out, "the call's audio is unaffected")
+	assert.True(t, r.Truncated())
+	assert.Len(t, r.WAV(), wavHeaderSize+2*FrameSize)
+}

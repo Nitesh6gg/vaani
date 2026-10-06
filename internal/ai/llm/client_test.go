@@ -48,6 +48,70 @@ func TestClient_Stream_DeliversTokensInOrder(t *testing.T) {
 	assert.Equal(t, []string{"Hel", "lo", "!"}, got)
 }
 
+func TestClient_Stream_EdgeCases(t *testing.T) {
+	cases := []struct {
+		name    string
+		lines   []string
+		want    []string
+		wantErr string
+	}{
+		{"data: without a space (valid SSE)",
+			[]string{`data:{"choices":[{"delta":{"content":"a"}}]}`, `data:[DONE]`}, []string{"a"}, ""},
+		{"error object inside a 200 stream",
+			[]string{`data: {"error":{"message":"model_overloaded","code":503}}`}, nil, "provider error in stream"},
+		{"EOF with nothing delivered",
+			[]string{`: keepalive`}, nil, "without any reply"},
+		{"EOF without [DONE] after a reply is still a reply",
+			[]string{`data: {"choices":[{"delta":{"content":"ok"}}]}`}, []string{"ok"}, ""},
+		{"empty reply ending in [DONE] is a (legitimately empty) reply",
+			[]string{`data: [DONE]`}, nil, ""},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := sseServer(t, tc.lines)
+			defer srv.Close()
+
+			var got []string
+			_, err := NewClient(srv.URL, "k", "m").Stream(context.Background(), nil, nil, func(tok string) { got = append(got, tok) })
+
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+				return
+			}
+
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// TestClient_Stream_IdleTimeout: a provider that sends headers and then
+// nothing must not hang the turn.
+func TestClient_Stream_IdleTimeout(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"a"}}]}`)
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	c := NewClient(srv.URL, "k", "m")
+	c.idleTimeout = 100 * time.Millisecond
+
+	start := time.Now()
+	_, err := c.Stream(context.Background(), nil, nil, func(string) {})
+
+	require.ErrorIs(t, err, errStreamIdle)
+	assert.Less(t, time.Since(start), 2*time.Second)
+}
+
 func TestClient_Stream_SkipsMalformedLinesWithoutFailing(t *testing.T) {
 	srv := sseServer(t, []string{
 		`: this is a comment/keepalive`,

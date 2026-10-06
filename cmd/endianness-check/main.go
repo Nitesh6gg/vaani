@@ -56,6 +56,8 @@ const (
 )
 
 func main() {
+	config.ConfigureLogging()
+
 	if err := run(); err != nil {
 		slog.Error("endianness-check failed", "error", err)
 		os.Exit(1)

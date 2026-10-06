@@ -303,6 +303,11 @@ func (h *Handler) FinishExtraction(ctx context.Context) {
 	}
 
 	if node := h.node.Load(); node.Extraction != nil {
+		if ctx.Err() != nil {
+			slog.Warn("end-of-call variable extraction skipped: shutting down", "call_id", h.callID, "node", node.Name)
+			return
+		}
+
 		ctx, cancel := context.WithTimeout(ctx, extractionTimeout)
 		defer cancel()
 

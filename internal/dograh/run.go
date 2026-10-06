@@ -26,8 +26,28 @@ type RunCall struct {
 	CalledNumber string
 }
 
-// StartRun creates the call's run and returns its id.
+// StartRun creates the call's run and returns its id, trying a second time
+// after a failure (each attempt bounded by runDBTimeout): one dropped
+// connection must not cost the call its place in Dograh's history.
 func (s *Store) StartRun(ctx context.Context, wf *Workflow, c RunCall) (int64, error) {
+	id, err := s.startRun(ctx, wf, c)
+	if err == nil || ctx.Err() != nil {
+		return id, err
+	}
+
+	select {
+	case <-time.After(500 * time.Millisecond):
+	case <-ctx.Done():
+		return 0, err
+	}
+
+	return s.startRun(ctx, wf, c)
+}
+
+func (s *Store) startRun(ctx context.Context, wf *Workflow, c RunCall) (int64, error) {
+	ctx, cancel := context.WithTimeout(ctx, runDBTimeout)
+	defer cancel()
+
 	initial, _ := json.Marshal(map[string]any{
 		"caller_number": c.CallerNumber, "called_number": c.CalledNumber,
 		"direction": "inbound", "provider": "ari",
@@ -58,14 +78,33 @@ type RunEnd struct {
 	Recording []byte // WAV; nil when there's none
 }
 
+// Each FinishRun step gets its own time budget, so a slow one can't use up
+// the next one's (a slow MinIO used to leave runs stuck at 'running').
+const (
+	runDBTimeout     = 10 * time.Second
+	runUploadTimeout = 20 * time.Second
+)
+
 // FinishRun completes run runID: what the call gathered, its length, its
 // conversation (the run page's events), and -- with storage -- its recording
-// and transcript, uploaded where Dograh keeps them. A failed upload doesn't
-// stop the rest; every failure is in the returned error.
+// and transcript, uploaded where Dograh keeps them.
+//
+// The run is marked completed first and the files attached after, as
+// Dograh's own completion job does: a slow or failing upload, or the process
+// being stopped meanwhile, then costs only the files, never leaves the run at
+// 'running'. Each step runs on its own budget, detached from ctx's
+// cancellation (ctx only carries values); every failure is in the returned
+// error.
 func (s *Store) FinishRun(ctx context.Context, wf *Workflow, runID int64, end RunEnd, storage *Storage) error {
+	ctx = context.WithoutCancel(ctx)
 	sum := end.Summary
 
-	g, mapped := gatheredContext(sum, func(v string) string { return s.mapDisposition(ctx, wf.OrgID, v) })
+	step := func(d time.Duration) (context.Context, context.CancelFunc) { return context.WithTimeout(ctx, d) }
+
+	mctx, cancel := step(runDBTimeout)
+	g, mapped := gatheredContext(sum, func(v string) string { return s.mapDisposition(mctx, wf.OrgID, v) })
+	cancel()
+
 	gathered, _ := json.Marshal(g)
 
 	// pipeline_metrics_aggregator: whole seconds; Dograh's cost job copies it
@@ -82,60 +121,80 @@ func (s *Store) FinishRun(ctx context.Context, wf *Workflow, runID int64, end Ru
 		logs, _ = json.Marshal(map[string]any{"realtime_feedback_events": sum.Events})
 	}
 
-	var (
-		errs                        []error
-		recordingURL, transcriptURL *string
-	)
+	var errs []error
 
-	if storage != nil {
-		id := strconv.FormatInt(runID, 10)
-
-		if len(end.Recording) > 0 {
-			key := "recordings/" + id + ".wav"
-			if err := storage.Put(ctx, key, "audio/wav", end.Recording); err != nil {
-				errs = append(errs, err)
-			} else {
-				recordingURL = &key
-			}
-		}
-
-		if text := transcriptText(sum.Events); text != "" {
-			key := "transcripts/" + id + ".txt"
-			if err := storage.Put(ctx, key, "text/plain; charset=utf-8", []byte(text)); err != nil {
-				errs = append(errs, err)
-			} else {
-				transcriptURL = &key
-			}
-		}
-	}
-
-	_, err := s.pool.Exec(ctx, `
+	dctx, cancel := step(runDBTimeout)
+	_, err := s.pool.Exec(dctx, `
 		UPDATE workflow_runs SET
 			usage_info = $2::text::json,
 			cost_info = (cost_info::jsonb || $3::text::jsonb)::json,
 			gathered_context = (gathered_context::jsonb || $4::text::jsonb)::json,
 			logs = $5::text::json,
 			is_completed = true,
-			state = 'completed',
-			recording_url = COALESCE($6::text, recording_url),
-			transcript_url = COALESCE($7::text, transcript_url),
-			storage_backend = CASE WHEN $6::text IS NULL AND $7::text IS NULL
-				THEN storage_backend ELSE 'minio' END
+			state = 'completed'
 		WHERE id = $1`,
-		runID, string(usage), string(cost), string(gathered), string(logs), recordingURL, transcriptURL)
+		runID, string(usage), string(cost), string(gathered), string(logs))
+	cancel()
+
 	if err != nil {
 		errs = append(errs, fmt.Errorf("dograh: complete run %d: %w", runID, err))
 	}
 
 	// Lets Dograh's call list filter by this disposition code.
 	if mapped != "" {
-		if _, err := s.pool.Exec(ctx, `
+		dctx, cancel := step(runDBTimeout)
+		if _, err := s.pool.Exec(dctx, `
 			UPDATE workflows SET call_disposition_codes = jsonb_build_object('disposition_codes',
 				COALESCE(call_disposition_codes::jsonb->'disposition_codes', '[]'::jsonb) || to_jsonb($2::text))::json
 			WHERE id = $1
 				AND NOT COALESCE(call_disposition_codes::jsonb->'disposition_codes', '[]'::jsonb) ? $2::text`,
 			wf.ID, mapped); err != nil {
 			errs = append(errs, fmt.Errorf("dograh: add disposition code: %w", err))
+		}
+		cancel()
+	}
+
+	if storage == nil {
+		return errors.Join(errs...)
+	}
+
+	var recordingURL, transcriptURL *string
+
+	put := func(key, contentType string, body []byte) *string {
+		uctx, cancel := step(runUploadTimeout)
+		defer cancel()
+
+		if err := storage.Put(uctx, key, contentType, body); err != nil {
+			errs = append(errs, err)
+			return nil
+		}
+
+		return &key
+	}
+
+	id := strconv.FormatInt(runID, 10)
+
+	if len(end.Recording) > 0 {
+		recordingURL = put("recordings/"+id+".wav", "audio/wav", end.Recording)
+	}
+
+	if text := transcriptText(sum.Events); text != "" {
+		transcriptURL = put("transcripts/"+id+".txt", "text/plain; charset=utf-8", []byte(text))
+	}
+
+	if recordingURL != nil || transcriptURL != nil {
+		dctx, cancel := step(runDBTimeout)
+		_, err := s.pool.Exec(dctx, `
+			UPDATE workflow_runs SET
+				recording_url = COALESCE($2::text, recording_url),
+				transcript_url = COALESCE($3::text, transcript_url),
+				storage_backend = 'minio'
+			WHERE id = $1`,
+			runID, recordingURL, transcriptURL)
+		cancel()
+
+		if err != nil {
+			errs = append(errs, fmt.Errorf("dograh: attach files to run %d: %w", runID, err))
 		}
 	}
 

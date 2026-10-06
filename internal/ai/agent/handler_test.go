@@ -585,6 +585,29 @@ func TestHandler_BargeInPausesThenCuts(t *testing.T) {
 // TestHandler_FalseInterruptionResumesTheReply: a pause no transcript
 // confirms (noise, echo) ends after falseInterruptionTimeout of quiet, and
 // the reply plays on from where it stopped -- nothing cut, nothing lost.
+// TestHandler_ResumeNeverReplaysThePreviousTurn: a reply paused before its
+// first frame played still has the previous turn's sentence in sentFrames;
+// resuming must not replay that.
+func TestHandler_ResumeNeverReplaysThePreviousTurn(t *testing.T) {
+	h := NewHandler(context.Background(), "call1", testConfig(newFakeSTT(), newFakeTTS(), &fakeLLM{}, 0, 0))
+	old := constFrame(loudAmplitude)
+
+	h.sentGen, h.sentReq, h.sentFrames = 1, 1, [][]byte{old} // turn 1's last sentence
+	h.state.Store(int32(StateSpeaking))
+	h.replayGen.Store(2) // turn 2 was paused and resumed
+	h.replayPending.Store(true)
+
+	out := h.ProcessFrame(context.Background(), "call1", constFrame(quietAmplitude))
+	assert.Empty(t, out, "turn 1's audio must not play in turn 2")
+
+	// Same generation: the interrupted sentence is replayed, as designed.
+	h.replayGen.Store(1)
+	h.replayPending.Store(true)
+	out = h.ProcessFrame(context.Background(), "call1", constFrame(quietAmplitude))
+	require.Len(t, out, 1)
+	assert.Equal(t, old, out[0])
+}
+
 func TestHandler_FalseInterruptionResumesTheReply(t *testing.T) {
 	fSTT := newFakeSTT()
 	fTTS := newFakeTTS()
@@ -1102,6 +1125,49 @@ func TestHandler_UnknownToolReturnsErrorToLLM(t *testing.T) {
 	assert.Equal(t, "tool", result.Role)
 	assert.Contains(t, result.Content, `"status":"error"`)
 	assert.Contains(t, result.Content, "nope")
+}
+
+// TestHandler_DeadTTSIsReplacedNextTurn: the provider closing the TTS
+// connection mid-turn must not leave the call on a dead client -- observed
+// as dead air for the rest of the call. The turn ends, and the next one
+// opens a fresh connection.
+func TestHandler_DeadTTSIsReplacedNextTurn(t *testing.T) {
+	fSTT := newFakeSTT()
+	first, second := newFakeTTS(), newFakeTTS()
+
+	var opened atomic.Int32
+
+	cfg := testConfig(fSTT, first, &fakeLLM{tokens: []string{"Hello."}}, 0, 0)
+	cfg.NewTTS = func() (tts.Client, error) {
+		if opened.Add(1) == 1 {
+			return first, nil
+		}
+
+		return second, nil
+	}
+	h := NewHandler(context.Background(), "call1", cfg)
+
+	fSTT.sendFinal("hi")
+	require.Eventually(t, func() bool { return first.spokenCount() == 1 }, time.Second, time.Millisecond)
+	require.Equal(t, StateThinking, h.State(), "no audio yet")
+
+	_ = first.Close() // the provider drops the connection before any audio
+	require.Eventually(t, func() bool { return h.State() == StateListening }, time.Second, time.Millisecond,
+		"the turn must end instead of waiting forever for audio")
+
+	fSTT.sendFinal("hello?")
+	require.Eventually(t, func() bool { return second.spokenCount() == 1 }, time.Second, time.Millisecond,
+		"the next turn must open a fresh TTS connection")
+	assert.Equal(t, int32(2), opened.Load())
+}
+
+func TestSignalNeverBlocksAndCoalesces(t *testing.T) {
+	ch := make(chan struct{}, 1)
+
+	signal(ch)
+	signal(ch) // already pending: must not block, must not be lost
+
+	assert.Len(t, ch, 1)
 }
 
 // TestHandler_DrainTimeoutPausedWhileToolRuns: once "let me check" finishes

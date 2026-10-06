@@ -26,6 +26,8 @@ import (
 )
 
 func main() {
+	config.ConfigureLogging()
+
 	if err := run(); err != nil {
 		slog.Error("loadgen failed", "error", err)
 		os.Exit(1)

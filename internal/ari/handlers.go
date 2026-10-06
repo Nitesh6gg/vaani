@@ -168,8 +168,10 @@ type Manager struct {
 	store   *dograh.Store
 	storage *dograh.Storage
 	// runs counts calls whose Dograh run is still being written, so
-	// shutdown can let them finish.
-	runs sync.WaitGroup
+	// shutdown can let them finish. procCtx is the process's context (Run's),
+	// cancelled when Vaani is stopping -- not any one call's.
+	runs    sync.WaitGroup
+	procCtx context.Context
 
 	// holdAudio/beepAudio are the transfer sounds (see assets), 16kHz PCM.
 	holdAudio []byte
@@ -189,6 +191,7 @@ func NewManager(cl ari.Client, cfg config.Config, ports *media.PortAllocator, st
 		ports:     ports,
 		store:     store,
 		storage:   storage,
+		procCtx:   context.Background(),
 		pending:   make(map[string]*call),
 		active:    make(map[string]*call),
 		transfers: make(map[string]*pendingTransfer),
@@ -211,6 +214,10 @@ func NewManager(cl ari.Client, cfg config.Config, ports *media.PortAllocator, st
 // Run subscribes to the Stasis events this app cares about and dispatches them
 // until ctx is cancelled.
 func (m *Manager) Run(ctx context.Context) {
+	// Set before any call exists (calls only start from this loop's events),
+	// so every recordRun goroutine sees it.
+	m.procCtx = ctx
+
 	sub := m.cl.Bus().Subscribe(nil, "StasisStart", "StasisEnd", "ChannelDtmfReceived", "ChannelDestroyed")
 	defer sub.Cancel()
 
@@ -503,12 +510,15 @@ func (m *Manager) completeBridge(c *call) {
 		"call_id", c.ID, "external_id", c.ExternalID, "port", c.Port,
 		"caller_number", c.Info.CallerNumber, "called_number", c.Info.CalledNumber, "direction", c.Info.Direction)
 
+	// Both off the Stasis event loop: building an agent call's handler reads
+	// Dograh's database and dials the STT (seconds, worst case), and every
+	// other call's events wait on this loop meanwhile.
 	if m.cfg.MediaEncapsulation == "audiosocket" {
 		go m.startAudioSocketMedia(c)
 		return
 	}
 
-	m.startRTPMedia(c)
+	go m.startRTPMedia(c)
 }
 
 // mediaHandler builds the Handler for a new call from config: SilentHandler if
@@ -693,13 +703,10 @@ func (m *Manager) recordRun(c *call, wf *dograh.Workflow, callLog *agent.CallLog
 	started := time.Now()
 
 	// Not the call's context: the record is completed after the call ends.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	runID, err := m.store.StartRun(ctx, wf, dograh.RunCall{
+	// StartRun bounds (and retries) itself.
+	runID, err := m.store.StartRun(m.procCtx, wf, dograh.RunCall{
 		CallID: c.ID, CallerNumber: c.Info.CallerNumber, CalledNumber: c.Info.CalledNumber,
 	})
-
-	cancel()
-
 	if err != nil {
 		slog.Warn("dograh run: not created; this call won't appear in Dograh", "call_id", c.ID, "error", err)
 		return
@@ -713,15 +720,23 @@ func (m *Manager) recordRun(c *call, wf *dograh.Workflow, callLog *agent.CallLog
 
 	// Dograh extracts the last node's variables as the call ends, after any
 	// still running from earlier nodes (each bounded by its own timeout).
-	h.FinishExtraction(context.Background())
-
-	ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	// On the process's context: when Vaani is stopping (a deploy), the
+	// extraction is skipped so the run's completion fits in the shutdown
+	// window -- a call left at 'running' in Dograh is worse than one without
+	// its last node's variables.
+	h.FinishExtraction(m.procCtx)
 
 	summary := callLog.Summary()
 	recording := rec.WAV()
 
-	err = m.store.FinishRun(ctx, wf, runID, dograh.RunEnd{
+	if rec.Truncated() {
+		metrics.RecordingTruncated.Inc()
+		slog.Warn("call recording hit its size cap; the end of the call is missing from it",
+			"call_id", c.ID, "run_id", runID, "recording_bytes", len(recording))
+	}
+
+	// FinishRun bounds each of its steps itself.
+	err = m.store.FinishRun(context.Background(), wf, runID, dograh.RunEnd{
 		Summary: summary, Duration: duration, Recording: recording,
 	}, m.storage)
 	if err != nil {
@@ -775,13 +790,26 @@ func (m *Manager) newBargeInDetector(callID string) agent.BargeInDetector {
 }
 
 // startRTPMedia constructs and runs the RTP media plane for an already-bridged
-// call. Called synchronously from completeBridge -- unlike AudioSocket, there's
-// no blocking accept step, so this doesn't need its own goroutine.
+// call, on its own goroutine (see completeBridge). Inbound RTP arriving
+// meanwhile waits in the already-bound socket's buffer.
 func (m *Manager) startRTPMedia(c *call) {
 	fromWire, err := media.ParseEndianness(m.cfg.AudioL16Endianness)
 	if err != nil {
 		// Already validated at config.Load() time; unreachable in practice.
 		slog.Error("invalid AUDIO_L16_ENDIANNESS", "call_id", c.ID, "error", err)
+	}
+
+	// Built before taking m.mu: it can take seconds (see mediaHandler), and
+	// every other call's events need m.mu.
+	handler := m.mediaHandler(c)
+
+	// Under m.mu, like c.asm: teardown snapshots c.cm under it. A call torn
+	// down meanwhile (the caller hung up) gets no media plane; its handler
+	// already stopped with the call's context.
+	m.mu.Lock()
+	if c.State() == session.StateTornDown {
+		m.mu.Unlock()
+		return
 	}
 
 	c.cm = media.NewCallMedia(c.ID, c.udpConn, metrics.Sink{}, media.Config{
@@ -793,16 +821,18 @@ func (m *Manager) startRTPMedia(c *call) {
 		// the caller hears byte-swapped noise while the WAV sounds fine.
 		ToWire:           fromWire,
 		RecordDir:        m.cfg.RecordDir,
-		Handler:          m.mediaHandler(c),
+		Handler:          handler,
 		DebugAudio:       m.cfg.DebugAudio,
 		MediaDeadTimeout: m.cfg.MediaDeadTimeout,
 	})
+	cm := c.cm
+	m.mu.Unlock()
 
 	c.SetState(session.StateMediaActive)
 	slog.Info("rtp media plane running", "call_id", c.ID, "port", c.Port)
 
-	go m.watchMediaDead(c, c.cm.Dead())
-	go c.cm.Run(c.mediaCtx)
+	go m.watchMediaDead(c, cm.Dead())
+	cm.Run(c.mediaCtx) // already on its own goroutine
 }
 
 // watchMediaDead hangs a call up as soon as its media plane declares itself
@@ -849,24 +879,38 @@ func (m *Manager) startAudioSocketMedia(c *call) {
 
 	_ = ln.Close() // one connection is all a call needs; free the OS listener now
 
+	// Built before taking m.mu: it can take seconds (see mediaHandler), and
+	// holding m.mu meanwhile stalled every other call's events -- calls were
+	// set up one at a time.
+	handler := m.mediaHandler(c)
+
 	// Assigned under m.mu: this runs on its own goroutine while the Stasis event
 	// loop can concurrently run teardown, which reads c.asm. Without the lock
-	// that's a data race per the Go memory model, not just a lost update.
+	// that's a data race per the Go memory model, not just a lost update. A
+	// call torn down meanwhile gets no media plane.
 	m.mu.Lock()
+	if c.State() == session.StateTornDown {
+		m.mu.Unlock()
+		_ = conn.Close()
+
+		return
+	}
+
 	c.asm = media.NewAudioSocketCallMedia(c.ID, conn, metrics.AudioSocketSink{}, media.AudioSocketConfig{
 		RecordDir:        m.cfg.RecordDir,
-		Handler:          m.mediaHandler(c),
+		Handler:          handler,
 		ToWire:           media.LittleEndian, // AudioSocket payload is LE by protocol; see AudioSocketConfig.ToWire
 		DebugAudio:       m.cfg.DebugAudio,
 		MediaDeadTimeout: m.cfg.MediaDeadTimeout,
 	})
+	asm := c.asm
 	m.mu.Unlock()
 
 	c.SetState(session.StateMediaActive)
 	slog.Info("audiosocket connected, media plane running", "call_id", c.ID, "port", c.Port)
 
-	go m.watchMediaDead(c, c.asm.Dead())
-	c.asm.Run(c.mediaCtx) // blocking is fine: already running in its own goroutine
+	go m.watchMediaDead(c, asm.Dead())
+	asm.Run(c.mediaCtx) // blocking is fine: already running in its own goroutine
 }
 
 // abort releases a call's port when bridging fails before the media plane starts.

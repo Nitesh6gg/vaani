@@ -304,15 +304,24 @@ call: failures are logged (`dograh run: ...`) and the call carries on.
   - `call_duration_seconds` in `usage_info` and `cost_info` (where the call
     list reads the duration), whole seconds from when the agent started.
   - `logs.realtime_feedback_events`, `is_completed`, state `completed`.
-  - **Recording and transcript**, uploaded to Dograh's MinIO (`MINIO_*`,
-    `internal/dograh/storage.go`, S3 Signature V4 as the MinIO client signs)
-    at Dograh's paths, `recordings/<run id>.wav` and
-    `transcripts/<run id>.txt`, with `storage_backend` `minio`. The
+  - **Then** the recording and transcript, uploaded to Dograh's MinIO
+    (`MINIO_*`, `internal/dograh/storage.go`, S3 Signature V4 as the MinIO
+    client signs) at Dograh's paths, `recordings/<run id>.wav` and
+    `transcripts/<run id>.txt`, and attached to the run (`recording_url`,
+    `transcript_url`, `storage_backend` `minio`) in a second update. The
     recording is one mono 16kHz track, caller and agent mixed
     (`media.MixRecorder`, around the agent's handler -- as Dograh's is
-    mono); the transcript is Dograh's text format, `[timestamp] User: ...` /
+    mono), capped at 100MB (~54 minutes; past it the rest is missing,
+    logged and counted in `vaani_recording_truncated_total`); the
+    transcript is Dograh's text format, `[timestamp] User: ...` /
     `[timestamp] Agent: ...`, one line per event above.
   - Log: `dograh run completed run_id=... disposition=... variables=N`.
+- **Time budgets:** creating the run is tried twice, 10s each. Completing it
+  comes first and gets its own 10s; each upload 20s, the file update 10s --
+  so a slow MinIO costs only the files, never leaves a run at `running`
+  (Dograh likewise uploads in a later job). When Vaani is stopping (SIGTERM,
+  a deploy), the end-of-call variable extraction is skipped so the
+  completion is written inside the shutdown window.
 - **Not done** (Dograh's completion job, which Vaani can't run): cost
   calculation, QA, integrations/webhooks. LLM/TTS/STT usage in `usage_info`
   is left empty.
@@ -350,6 +359,40 @@ narrow window after the call has already finished (the handler's goroutine
 can be mid-turn for a few statements past the call ending) is refused
 rather than run unobserved, logged as `variable extraction skipped: the
 call already finished`.
+
+### Failure handling (nothing may strand a call)
+
+- **Signals from the 20ms frame goroutine** (a possible interruption, the
+  reply finished playing, the dead-TTS drain timeout) each have their own
+  1-slot channel, never the shared event channel: that goroutine must not
+  block, and a dropped event there used to leave a reply paused -- dead air
+  -- for the rest of the call. A full slot means that same signal is already
+  pending, so nothing is lost.
+- **TTS connection lost** (the provider closed it): the handler forgets the
+  dead client -- it used to be reused by every later turn, all failing --
+  and ends the current turn after playing whatever audio already arrived;
+  the next turn opens a fresh connection (`tts connection lost ...`).
+- **LLM:** the shared HTTP client bounds each connection phase (dial 5s,
+  TLS 5s, response headers 30s) but never the whole request, which would
+  kill long streamed replies and uploads; a stream that sends nothing for
+  30s ends the turn with an error (`llm: stream idle timeout`). An
+  `{"error":...}` object inside a 200 stream, or a stream that ends without
+  `[DONE]` having delivered nothing, is an error, not an empty reply; SSE
+  `data:` lines are read with or without the space.
+- **STT:** the connection is closed when the call ends (it used to stay
+  open until Sarvam dropped it, holding a stream slot of the API key's
+  concurrency limit); a failed redial backs off 200ms -> 5s instead of
+  redialing on every 20ms frame; one handshake is bounded at 10s.
+- **Call setup** (reading the workflow from Dograh, dialing the STT) runs
+  on the call's own goroutine and outside the manager's lock, in both
+  transports: in AudioSocket mode it used to hold the lock, so calls were
+  set up one at a time and every other call's events waited.
+- **Transfer handover:** the call being torn down is re-checked under the
+  manager's lock at the moment the destination is registered, so a caller
+  hanging up mid-handover can't leave the answered destination up (billable)
+  and registered forever.
+- **`end_call` then an interruption:** the end-call still happens even if
+  the interruption cancelled the turn the tool ran in.
 
 ## Operability endpoints
 

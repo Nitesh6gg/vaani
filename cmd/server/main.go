@@ -27,6 +27,8 @@ import (
 const shutdownDrainDeadline = 10 * time.Second
 
 func main() {
+	config.ConfigureLogging()
+
 	if err := run(); err != nil {
 		slog.Error("fatal", "error", err)
 		os.Exit(1)

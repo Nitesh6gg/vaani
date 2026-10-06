@@ -206,15 +206,14 @@ type spokenChunk struct {
 	text string
 }
 type ttsDoneEvent struct{ gen uint64 }
-type bargeInEvent struct{}
+type ttsClosedEvent struct{ client tts.Client } // its connection is gone (provider closed it, or Vaani did)
+type endCallToolEvent struct{}                  // end_call ran in a turn an interruption then cancelled
 type greetingEvent struct{}
 type openingEvent struct{}
 type callerSpeechEvent struct{ started bool } // STT VAD: caller started/stopped speaking
 type resumeCheckEvent struct{ seq uint64 }    // is a paused reply's interruption false?
 type idleEvent struct{ seq uint64 }
 type maxDurationEvent struct{}
-type ttsPlaybackDoneEvent struct{}
-type ttsDrainTimeoutEvent struct{}
 
 // Handler implements media.Handler: Sarvam STT -> LLM -> Sarvam TTS with local
 // barge-in detection. See docs/AUDIO_PIPELINE.md's Handler Contract and
@@ -277,8 +276,12 @@ type Handler struct {
 	sttFlushAt   atomic.Int64
 
 	// replayPending is set by run() when it resumes a paused reply, telling
-	// ProcessFrame to restart the interrupted sentence (see sentFrames).
+	// ProcessFrame to restart the interrupted sentence (see sentFrames);
+	// replayGen is that reply's generation, stored first. ProcessFrame
+	// replays only frames of that generation: sentFrames still holds the
+	// previous turn's sentence until the new turn's first frame plays.
 	replayPending atomic.Bool
+	replayGen     atomic.Uint64
 	// closing is set once the call is ending -- an end node reached, the
 	// end_call tool run, or Handler.ending -- after which the caller can no
 	// longer interrupt, as in Dograh (end_call_with_reason mutes the user).
@@ -296,6 +299,14 @@ type Handler struct {
 	node atomic.Pointer[Node]
 
 	events chan any
+	// Signals from ProcessFrame's goroutine, which must never block and so
+	// can't use events (whose sender would drop on a full channel -- a
+	// dropped barge-in left the reply paused forever). One 1-slot channel per
+	// signal: a full one means that same signal is already pending, so a
+	// non-blocking send never loses anything. See signal().
+	bargeInSig      chan struct{}
+	playbackDoneSig chan struct{}
+	drainTimeoutSig chan struct{}
 	// done is closed when run() has returned: nothing more is logged.
 	done chan struct{}
 	// extracting holds a channel per background variable extraction, closed
@@ -439,12 +450,15 @@ func NewHandler(ctx context.Context, callID string, cfg Config) *Handler {
 	}
 
 	h := &Handler{
-		callID:   callID,
-		cfg:      cfg,
-		baseCtx:  ctx,
-		events:   make(chan any, 8),
-		done:     make(chan struct{}),
-		outbound: make(chan outFrame, outboundBufferFrames),
+		callID:          callID,
+		cfg:             cfg,
+		baseCtx:         ctx,
+		events:          make(chan any, 8),
+		bargeInSig:      make(chan struct{}, 1),
+		playbackDoneSig: make(chan struct{}, 1),
+		drainTimeoutSig: make(chan struct{}, 1),
+		done:            make(chan struct{}),
+		outbound:        make(chan outFrame, outboundBufferFrames),
 	}
 	h.state.Store(int32(StateListening))
 
@@ -565,12 +579,7 @@ func (h *Handler) processSpeakingFrame(pcm []byte) [][]byte {
 		h.silenceUntil.Store(now.Add(h.cfg.PostCutSilence).UnixNano())
 		slog.Info("agent barge-in detected; pausing the reply", "call_id", h.callID)
 		h.emptyTicks = 0
-
-		select {
-		case h.events <- bargeInEvent{}:
-		default:
-			slog.Error("agent: events channel full dropping bargeInEvent", "call_id", h.callID)
-		}
+		signal(h.bargeInSig)
 
 		return nil
 	}
@@ -579,7 +588,7 @@ func (h *Handler) processSpeakingFrame(pcm []byte) [][]byte {
 	// from its start before taking new frames from the queue.
 	if h.replayPending.CompareAndSwap(true, false) {
 		h.replayIdx = 0
-		h.replaying = len(h.sentFrames) > 0
+		h.replaying = len(h.sentFrames) > 0 && h.sentGen == h.replayGen.Load()
 	}
 
 	if h.replaying {
@@ -616,12 +625,7 @@ func (h *Handler) processSpeakingFrame(pcm []byte) [][]byte {
 	// before run() gets around to processing the event.
 	if h.ttsDeliveryDone.CompareAndSwap(true, false) {
 		h.emptyTicks = 0
-
-		select {
-		case h.events <- ttsPlaybackDoneEvent{}:
-		default:
-			slog.Error("agent: events channel full dropping ttsPlaybackDoneEvent", "call_id", h.callID)
-		}
+		signal(h.playbackDoneSig)
 
 		return nil
 	}
@@ -645,15 +649,20 @@ func (h *Handler) processSpeakingFrame(pcm []byte) [][]byte {
 			"call_id", h.callID)
 
 		if h.state.CompareAndSwap(int32(StateSpeaking), int32(StateListening)) {
-			select {
-			case h.events <- ttsDrainTimeoutEvent{}:
-			default:
-				slog.Error("agent: events channel full dropping ttsDrainTimeoutEvent", "call_id", h.callID)
-			}
+			signal(h.drainTimeoutSig)
 		}
 	}
 
 	return nil
+}
+
+// signal raises a 1-slot signal without blocking; if it's already raised the
+// pending one stands for both.
+func signal(ch chan struct{}) {
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
 }
 
 // sttFlushOnsetSlack: the VAD's last speech must be no older than this
@@ -758,6 +767,12 @@ func (h *Handler) run() {
 			return
 		case ev := <-h.events:
 			h.handleEvent(ev)
+		case <-h.bargeInSig:
+			h.handleBargeIn()
+		case <-h.playbackDoneSig:
+			h.finishTurn(h.curGen)
+		case <-h.drainTimeoutSig:
+			h.handleDrainTimeout()
 		}
 	}
 }
@@ -772,8 +787,10 @@ func (h *Handler) handleEvent(ev any) {
 		h.handleTTSAudio(e.pcm, e.gen, e.req, e.text)
 	case ttsDoneEvent:
 		h.handleTTSDone(e.gen)
-	case bargeInEvent:
-		h.handleBargeIn()
+	case ttsClosedEvent:
+		h.handleTTSClosed(e.client)
+	case endCallToolEvent:
+		h.endCall("end_call")
 	case greetingEvent:
 		h.handleGreeting()
 	case openingEvent:
@@ -790,20 +807,20 @@ func (h *Handler) handleEvent(ev any) {
 			"max_duration_s", int(h.cfg.MaxDuration.Seconds()))
 		h.cfg.Log.Ending(EndReasonMaxDuration)
 		h.endCall("max_call_duration")
-	case ttsPlaybackDoneEvent:
-		h.finishTurn(h.curGen)
-	case ttsDrainTimeoutEvent:
-		// State was already flipped by processSpeakingFrame; this only clears
-		// run()-owned turn state so a dead turn's <640B ttsBuf tail can't leak
-		// into the front of the next turn's audio, and records whatever part
-		// of the reply actually played before the TTS went silent.
-		h.ttsBuf = nil
-		h.agentQuietSince = time.Now()
-		h.recordReply(true)
+	}
+}
 
-		if h.ending {
-			h.hangup()
-		}
+// handleDrainTimeout: processSpeakingFrame already flipped the state; this
+// only clears run()-owned turn state so a dead turn's <640B ttsBuf tail can't
+// leak into the front of the next turn's audio, and records whatever part of
+// the reply actually played before the TTS went silent.
+func (h *Handler) handleDrainTimeout() {
+	h.ttsBuf = nil
+	h.agentQuietSince = time.Now()
+	h.recordReply(true)
+
+	if h.ending {
+		h.hangup()
 	}
 }
 
@@ -1252,6 +1269,14 @@ func (h *Handler) runLLMTurn(ctx context.Context, history []llm.Message, ttsClie
 
 		if ctx.Err() != nil {
 			slog.Info("llm turn cancelled during tool call", "call_id", h.callID, "gen", gen)
+
+			// end_call already ran (the call is recorded as ending and the
+			// caller muted for interruptions): the call must still end, not
+			// carry on half-closed because an interruption cut this turn.
+			if endCall && h.baseCtx.Err() == nil {
+				h.post(endCallToolEvent{})
+			}
+
 			return
 		}
 
@@ -1643,6 +1668,44 @@ func (h *Handler) readTTS(ttsClient tts.Client) {
 			}
 		}
 	}
+
+	// Both channels closed: the connection is gone. Kept as h.tts it would be
+	// reused by every later turn, each Speak failing -- dead air for the rest
+	// of the call. run() drops it (unless it already replaced it).
+	h.post(ttsClosedEvent{client: ttsClient})
+}
+
+// handleTTSClosed: t's connection is gone. If it's still the call's TTS (not
+// one a barge-in already cancelled and replaced), forget it so the next turn
+// opens a fresh one, and end the current turn instead of waiting for audio
+// that can't come: what already arrived still plays out first.
+func (h *Handler) handleTTSClosed(t tts.Client) {
+	if h.tts != t {
+		return
+	}
+
+	h.tts = nil
+
+	switch State(h.state.Load()) {
+	case StateThinking:
+		slog.Warn("tts connection lost before the reply's audio; ending the turn", "call_id", h.callID, "gen", h.curGen)
+		h.cfg.Sink.Error("tts_closed")
+		h.cancelTurn()
+		h.finishTurn(h.curGen)
+	case StateSpeaking:
+		slog.Warn("tts connection lost mid-reply; playing what arrived, then ending the turn", "call_id", h.callID, "gen", h.curGen)
+		h.cfg.Sink.Error("tts_closed")
+		h.cancelTurn()
+		h.ttsDeliveryDone.Store(true) // no more audio is coming for this generation
+	}
+}
+
+// cancelTurn stops the current LLM turn, if one is running.
+func (h *Handler) cancelTurn() {
+	if h.turnCancel != nil {
+		h.turnCancel()
+		h.turnCancel = nil
+	}
 }
 
 // ttsFrameBuf is run()-owned (only ever appended to inside handleTTSAudio,
@@ -1754,7 +1817,7 @@ func (h *Handler) handleTTSDone(gen uint64) {
 // end-to-end latency (transcript accepted to every frame of the reply
 // actually queued for playout), and clears per-turn state. Called either
 // directly from handleTTSDone (Thinking: nothing was ever queued) or via
-// ttsPlaybackDoneEvent, once processSpeakingFrame observes outbound has
+// playbackDoneSig, once processSpeakingFrame observes outbound has
 // fully drained after delivery finished.
 func (h *Handler) finishTurn(gen uint64) {
 	// Only move back to Listening if still in this turn's Speaking/Thinking
@@ -1888,6 +1951,10 @@ const (
 // handleBargeIn: ProcessFrame has paused the reply on a possible
 // interruption; start checking whether it was real.
 func (h *Handler) handleBargeIn() {
+	if !h.paused.Load() {
+		return // a transcript already confirmed it (or the reply resumed) before this signal was read
+	}
+
 	h.pausedAt = time.Now()
 	h.scheduleResumeCheck(falseInterruptionTimeout)
 }
@@ -1938,7 +2005,8 @@ func (h *Handler) handleResumeCheck(seq uint64) {
 func (h *Handler) resumeReply(reason string) {
 	h.resumeSeq++ // any pending check is now stale
 	// replayPending before paused: ProcessFrame must see the replay request
-	// on its very first unpaused tick.
+	// on its very first unpaused tick; replayGen before replayPending.
+	h.replayGen.Store(h.curGen)
 	h.replayPending.Store(true)
 	h.paused.Store(false)
 
@@ -1971,10 +2039,7 @@ func (h *Handler) confirmInterruption() {
 // cutReply is the barge-in cut: LLM and TTS cancelled, queued audio
 // dropped, and only what the caller heard recorded.
 func (h *Handler) cutReply() {
-	if h.turnCancel != nil {
-		h.turnCancel()
-		h.turnCancel = nil
-	}
+	h.cancelTurn()
 
 	// Keep only what the caller heard before cutting in -- recorded before
 	// the generation advances, so it's logged under its own turn's number.

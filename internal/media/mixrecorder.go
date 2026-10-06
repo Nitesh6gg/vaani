@@ -25,13 +25,15 @@ const mixPrealloc = int(time.Minute/FrameInterval) * FrameSize
 type MixRecorder struct {
 	Handler
 
-	mu  sync.Mutex
-	pcm []byte
+	mu        sync.Mutex
+	pcm       []byte
+	max       int  // maxMixRecording; smaller in tests
+	truncated bool // the cap was hit: the rest of the call isn't recorded
 }
 
 // NewMixRecorder wraps h.
 func NewMixRecorder(h Handler) *MixRecorder {
-	return &MixRecorder{Handler: h, pcm: make([]byte, 0, mixPrealloc)}
+	return &MixRecorder{Handler: h, pcm: make([]byte, 0, mixPrealloc), max: maxMixRecording}
 }
 
 // ProcessFrame implements Handler: h's output is returned unchanged; the
@@ -42,7 +44,8 @@ func (r *MixRecorder) ProcessFrame(ctx context.Context, callID string, pcm []byt
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if len(r.pcm)+len(pcm) > maxMixRecording {
+	if len(r.pcm)+len(pcm) > r.max {
+		r.truncated = true
 		return out
 	}
 
@@ -67,6 +70,15 @@ func mixInto(dst, src []byte) {
 		s = max(math.MinInt16, min(math.MaxInt16, s))
 		binary.LittleEndian.PutUint16(dst[i:], uint16(int16(s)))
 	}
+}
+
+// Truncated reports whether the size cap cut the recording short (the
+// caller logs it: this runs on the 20ms tick, where nothing may log).
+func (r *MixRecorder) Truncated() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.truncated
 }
 
 // WAV returns the recording so far as a 16kHz mono PCM16 WAV file, or nil

@@ -23,6 +23,11 @@ var (
 		Help: "Total paused replies that resumed because no transcript confirmed the interruption (noise, echo).",
 	})
 
+	RecordingTruncated = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "vaani_recording_truncated_total",
+		Help: "Calls whose recording hit its size cap (100MB, ~54 minutes) and is missing the rest of the call.",
+	})
+
 	AgentTurnsTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "vaani_agent_turns_total",
 		Help: "Total agent turns started: one per accepted caller transcript, plus the LLM opening a call and caller-silence prompts.",

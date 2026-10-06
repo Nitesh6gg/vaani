@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -272,4 +273,74 @@ func TestSarvamClient_FeedAfterCloseReconnectsInBackground(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return c.Feed([]byte{1, 2, 3, 4}) == nil
 	}, time.Second, 5*time.Millisecond, "Feed never succeeded again after reconnecting")
+}
+
+// TestSarvamClient_CallEndClosesConnection: the call's context ending must
+// close the Sarvam stream -- nothing else does, and a leaked one held a
+// Sarvam stream slot until Sarvam dropped it.
+func TestSarvamClient_CallEndClosesConnection(t *testing.T) {
+	serverSawClose := make(chan struct{})
+
+	srv := sttServer(t, func(conn *websocket.Conn, r *http.Request) {
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				close(serverSawClose)
+				return
+			}
+		}
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	c, err := NewSarvamClient(ctx, "call1", Config{WSURL: wsURL(srv.URL), APIKey: "k", Model: "saaras:v3"})
+	require.NoError(t, err)
+
+	cancel()
+
+	select {
+	case <-serverSawClose:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the connection stayed open after the call ended")
+	}
+
+	assert.Error(t, c.Feed([]byte{1, 2}), "a closed client doesn't send")
+}
+
+// TestSarvamClient_FailedRedialsBackOff: with Sarvam unreachable, Feed (every
+// 20ms) must not trigger a dial each time.
+func TestSarvamClient_FailedRedialsBackOff(t *testing.T) {
+	var dials atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if dials.Add(1) == 1 {
+			conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+			require.NoError(t, err)
+			_ = conn.Close() // accept the first connection, then drop it
+			return
+		}
+
+		http.Error(w, "unavailable", http.StatusServiceUnavailable) // every redial fails
+	}))
+	defer srv.Close()
+
+	c, err := NewSarvamClient(context.Background(), "call1", Config{WSURL: wsURL(srv.URL), APIKey: "k", Model: "saaras:v3"})
+	require.NoError(t, err)
+	defer func() { _ = c.Close() }()
+
+	for range 50 { // one second of frames
+		_ = c.Feed([]byte{1, 2})
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// 1 initial + a handful of backed-off redials (200ms, 400ms, 800ms...),
+	// not ~50.
+	assert.LessOrEqual(t, dials.Load(), int32(6))
+	assert.GreaterOrEqual(t, dials.Load(), int32(2), "it must still retry")
+}
+
+func TestReconnectBackoff(t *testing.T) {
+	cases := map[int]time.Duration{1: 200 * time.Millisecond, 2: 400 * time.Millisecond, 3: 800 * time.Millisecond, 10: 5 * time.Second}
+	for n, want := range cases {
+		assert.Equal(t, want, reconnectBackoff(n), n)
+	}
 }

@@ -176,6 +176,26 @@ func TestHandler_StartExtractionAfterFinishIsRefused(t *testing.T) {
 	assert.Empty(t, fLLM.seen, "the LLM must never be asked")
 }
 
+// TestHandler_FinishExtractionSkippedAtShutdown: when Vaani is stopping, the
+// end-of-call extraction must not hold up the run's completion.
+func TestHandler_FinishExtractionSkippedAtShutdown(t *testing.T) {
+	fLLM := &extractingLLM{conv: &fakeLLM{}, reply: func(string) string { return `{"a": 1}` }}
+	cfg := testConfig(newFakeSTT(), newFakeTTS(), fLLM, 0, 0)
+	cfg.Start = &Node{Name: "S", Extraction: &Extraction{Vars: []ExtractionVar{{Name: "a", Type: "number"}}}}
+	cfg.Log = &CallLog{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	h := NewHandler(ctx, "call1", cfg)
+	cancel()
+	<-h.Done()
+
+	stopping, stop := context.WithCancel(context.Background())
+	stop()
+	h.FinishExtraction(stopping)
+
+	assert.Empty(t, fLLM.seen, "no LLM call while shutting down")
+}
+
 func TestHandler_NoExtractionWithoutSettings(t *testing.T) {
 	fSTT := newFakeSTT()
 	fLLM := &fakeLLM{}

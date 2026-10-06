@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -52,19 +53,46 @@ const sarvamSampleRate = 16000
 // never retries in a loop (a standing retry loop exhausted Sarvam's rate
 // limit in that project's own history) -- a failed send drops that frame,
 // invalidates the connection, and kicks off one background redial for the
-// next Feed to use.
+// next Feed to use. After a failed redial the next one waits (backoff from
+// reconnectBackoffMin, doubling to reconnectBackoffMax): without it every
+// 20ms frame triggered a fresh dial.
+//
+// The connection is closed when ctx ends (the call is over): nothing else
+// closes it, and an open one held a Sarvam stream (and a goroutine) until
+// Sarvam dropped it -- with a per-key concurrent-stream limit, that capped
+// how many calls could run.
 type sarvamClient struct {
 	cfg    Config
 	callID string
 	ctx    context.Context
 
-	connMu sync.RWMutex
-	conn   *websocket.Conn
+	connMu     sync.RWMutex
+	conn       *websocket.Conn
+	closed     bool      // ctx ended or Close: no more connections
+	nextDialAt time.Time // no redial before this (backoff after failures)
+	failures   int       // consecutive failed redials
 
 	writeMu      sync.Mutex
 	reconnecting atomic.Bool
 
 	results chan Result
+}
+
+const (
+	reconnectBackoffMin = 200 * time.Millisecond
+	reconnectBackoffMax = 5 * time.Second
+	// dialTimeout bounds one connection handshake (gorilla's default is 45s).
+	dialTimeout = 10 * time.Second
+)
+
+// reconnectBackoff is the wait after the n-th consecutive failed redial.
+func reconnectBackoff(n int) time.Duration {
+	d := reconnectBackoffMin
+	for i := 1; i < n && d < reconnectBackoffMax; i++ {
+		d *= 2
+	}
+
+	return min(d, reconnectBackoffMax)
 }
 
 // NewSarvamClient connects to Sarvam's saaras realtime STT WebSocket and
@@ -93,6 +121,11 @@ func NewSarvamClient(ctx context.Context, callID string, cfg Config) (Client, er
 	c.setConn(conn)
 	go c.receiveLoop(ctx, conn)
 
+	go func() {
+		<-ctx.Done()
+		_ = c.Close()
+	}()
+
 	return c, nil
 }
 
@@ -112,7 +145,9 @@ func (c *sarvamClient) dial(ctx context.Context) (*websocket.Conn, error) {
 	header := http.Header{}
 	header.Set("Api-Subscription-Key", c.cfg.APIKey)
 
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, endpoint, header)
+	dialer := websocket.Dialer{Proxy: http.ProxyFromEnvironment, HandshakeTimeout: dialTimeout}
+
+	conn, _, err := dialer.DialContext(ctx, endpoint, header)
 	if err != nil {
 		return nil, err
 	}
@@ -146,7 +181,11 @@ func (c *sarvamClient) invalidate(conn *websocket.Conn) {
 }
 
 func (c *sarvamClient) triggerReconnect() {
-	if !c.reconnecting.CompareAndSwap(false, true) {
+	c.connMu.RLock()
+	wait := c.closed || time.Now().Before(c.nextDialAt)
+	c.connMu.RUnlock()
+
+	if wait || !c.reconnecting.CompareAndSwap(false, true) {
 		return
 	}
 
@@ -158,12 +197,31 @@ func (c *sarvamClient) triggerReconnect() {
 		}
 
 		conn, err := c.dial(c.ctx)
+
+		c.connMu.Lock()
 		if err != nil {
-			slog.Warn("stt reconnect failed", "call_id", c.callID, "error", err)
+			c.failures++
+			backoff := reconnectBackoff(c.failures)
+			c.nextDialAt = time.Now().Add(backoff)
+			c.connMu.Unlock()
+
+			slog.Warn("stt reconnect failed", "call_id", c.callID, "error", err,
+				"attempt", c.failures, "next_in_ms", backoff.Milliseconds())
+
 			return
 		}
 
-		c.setConn(conn)
+		if c.closed {
+			// The call ended while this dial was in flight.
+			c.connMu.Unlock()
+			_ = conn.Close()
+
+			return
+		}
+
+		c.conn, c.failures, c.nextDialAt = conn, 0, time.Time{}
+		c.connMu.Unlock()
+
 		slog.Info("stt reconnected", "call_id", c.callID)
 
 		go c.receiveLoop(c.ctx, conn)
@@ -220,10 +278,14 @@ func (c *sarvamClient) Flush() error {
 
 func (c *sarvamClient) Results() <-chan Result { return c.results }
 
-// Close closes the underlying connection. The receive loop's own exit closes
-// Results.
+// Close closes the connection for good: no redial follows. Idempotent;
+// called automatically when the client's context ends.
 func (c *sarvamClient) Close() error {
-	conn := c.getConn()
+	c.connMu.Lock()
+	conn := c.conn
+	c.conn, c.closed = nil, true
+	c.connMu.Unlock()
+
 	if conn == nil {
 		return nil
 	}
