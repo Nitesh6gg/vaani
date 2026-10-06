@@ -218,6 +218,37 @@ func (f *fakeTTS) wasCancelled() bool {
 	return f.cancelled
 }
 
+// spokenList, seenAt and toolsAt read the fakes' records under their locks:
+// the handler's goroutines may still be appending (a later LLM round, an
+// idle prompt), and a bare read of the slice races with that.
+func (f *fakeTTS) spokenList() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return append([]string(nil), f.spoken...)
+}
+
+func (f *fakeLLM) seenAt(i int) []llm.Message {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.seen[i]
+}
+
+func (f *fakeLLM) toolsAt(i int) []llm.Tool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.tools[i]
+}
+
+func (f *fakeTTS) endedGens() []uint64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return append([]uint64(nil), f.ended...)
+}
+
 func (f *fakeTTS) spokenCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -312,7 +343,7 @@ func TestHandler_GreetingIsSpokenWithoutWaitingForCaller(t *testing.T) {
 	})
 
 	require.Eventually(t, func() bool { return fTTS.spokenCount() > 0 }, time.Second, time.Millisecond)
-	assert.Equal(t, []string{"Hi, this side Shubh."}, fTTS.spoken)
+	assert.Equal(t, []string{"Hi, this side Shubh."}, fTTS.spokenList())
 
 	const gen = 1
 
@@ -413,7 +444,7 @@ func TestHandler_BargeInRecordsOnlyWhatWasHeard(t *testing.T) {
 		{Role: "user", Content: "hi"},
 		{Role: "assistant", Content: "First sentence."},
 		{Role: "user", Content: "wait"},
-	}, fLLM.seen[1], "only the sentence the caller started hearing may be recorded")
+	}, fLLM.seenAt(1), "only the sentence the caller started hearing may be recorded")
 	assert.Contains(t, getLog().String(), `[Agent] call_id=call1 gen=1 text="First sentence." cut=true`,
 		"a cut reply is logged under its own turn's number")
 }
@@ -865,7 +896,7 @@ func TestHandler_SeparatelySpokenPiecesEndWithASpace(t *testing.T) {
 
 	fSTT.sendFinal("हाँ")
 	require.Eventually(t, func() bool { return fTTS.spokenCount() == 2 }, time.Second, time.Millisecond)
-	assert.Equal(t, []string{"चलिए आगे बढ़ते हैं। ", "धन्यवाद।"}, fTTS.spoken)
+	assert.Equal(t, []string{"चलिए आगे बढ़ते हैं। ", "धन्यवाद।"}, fTTS.spokenList())
 }
 
 func TestHandler_BargeInRespectsGuardWindow(t *testing.T) {
@@ -1080,13 +1111,13 @@ func TestHandler_ToolRoundTrip(t *testing.T) {
 	require.Eventually(t, func() bool { return fTTS.spokenCount() == 2 }, time.Second, time.Millisecond)
 
 	assert.Equal(t, int32(1), ran.Load())
-	assert.Equal(t, []string{"Let me check.", " It is done."}, fTTS.spoken,
+	assert.Equal(t, []string{"Let me check.", " It is done."}, fTTS.spokenList(),
 		"the pre-tool sentence must be sent to TTS before the tool result comes back")
 
 	require.Equal(t, 2, fLLM.streamCalls())
-	assert.Equal(t, "lookup", fLLM.tools[0][0].Function.Name, "tools must be offered to the LLM")
+	assert.Equal(t, "lookup", fLLM.toolsAt(0)[0].Function.Name, "tools must be offered to the LLM")
 
-	second := fLLM.seen[1]
+	second := fLLM.seenAt(1)
 	require.Len(t, second, 3)
 	assert.Equal(t, llm.Message{Role: "assistant", Content: "Let me check.", ToolCalls: []llm.ToolCall{call}}, second[1])
 	assert.Equal(t, llm.Message{Role: "tool", ToolCallID: "c1", Content: `{"ok":true}`}, second[2])
@@ -1170,7 +1201,7 @@ func TestHandler_UnknownToolReturnsErrorToLLM(t *testing.T) {
 	fSTT.sendFinal("hi")
 	require.Eventually(t, func() bool { return fTTS.spokenCount() == 1 }, time.Second, time.Millisecond)
 
-	result := fLLM.seen[1][2]
+	result := fLLM.seenAt(1)[2]
 	assert.Equal(t, "tool", result.Role)
 	assert.Contains(t, result.Content, `"status":"error"`)
 	assert.Contains(t, result.Content, "nope")
@@ -1240,7 +1271,11 @@ func TestHandler_DrainTimeoutPausedWhileToolRuns(t *testing.T) {
 
 	cfg := testConfig(fSTT, fTTS, fLLM, time.Hour, 0)
 	cfg.Start = &Node{Tools: []Tool{slow}}
-	h := NewHandler(context.Background(), "call1", cfg)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	h := NewHandler(ctx, "call1", cfg)
 
 	fSTT.sendFinal("hi")
 	require.Eventually(t, func() bool { return fTTS.spokenCount() == 1 }, time.Second, time.Millisecond)
@@ -1256,9 +1291,11 @@ func TestHandler_DrainTimeoutPausedWhileToolRuns(t *testing.T) {
 
 	// Let the tool and the rest of the turn finish before returning, so their
 	// log lines can't land in a later test that captures slog output.
+	// EndGeneration is the turn goroutine's last act; then stop run() too.
+	// (Not h.turnToolMsgs: that's run()'s alone -- reading it here raced.)
 	close(release)
-	require.Eventually(t, func() bool { return fLLM.streamCalls() == 2 }, time.Second, time.Millisecond)
-	require.Eventually(t, func() bool { return !h.toolRunning.Load() && len(h.turnToolMsgs) > 0 }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return len(fTTS.endedGens()) > 0 }, time.Second, time.Millisecond)
+	finalHistory(t, h, cancel)
 }
 
 // firstSample identifies which canned sound a frame came from in the
@@ -1379,10 +1416,10 @@ func TestHandler_TransferFailureGoesBackToLLM(t *testing.T) {
 
 	assert.Nil(t, h.hold.Load(), "hold audio must stop when the transfer fails")
 
-	result := fLLM.seen[1][2]
+	result := fLLM.seenAt(1)[2]
 	assert.Equal(t, "tool", result.Role)
 	assert.JSONEq(t, `{"status":"failed","reason":"transfer destination did not answer (User busy, cause 17)"}`, result.Content)
-	assert.Equal(t, "Nobody is free right now.", fTTS.spoken[1])
+	assert.Equal(t, "Nobody is free right now.", fTTS.spokenList()[1])
 }
 
 // TestHandler_WorkflowWalk follows a Dograh-shaped workflow end to end: the
@@ -1426,16 +1463,16 @@ func TestHandler_WorkflowWalk(t *testing.T) {
 	// Opening: the LLM speaks first, from the start node's prompt.
 	require.Eventually(t, func() bool { return fTTS.spokenCount() == 1 }, time.Second, time.Millisecond)
 	assert.Equal(t, []llm.Message{{Role: "system", Content: "start prompt"}, {Role: "user", Content: "start prompt"}},
-		fLLM.seen[0], "opening: system prompt, repeated as the only user message")
-	assert.Equal(t, "move_to_main", fLLM.tools[0][0].Function.Name, "the start node's edges are offered")
+		fLLM.seenAt(0), "opening: system prompt, repeated as the only user message")
+	assert.Equal(t, "move_to_main", fLLM.toolsAt(0)[0].Function.Name, "the start node's edges are offered")
 	playTurn(t, h, fTTS, 1, "Hi there.")
 
 	// Edge call: switch to Main within the same turn.
 	fSTT.sendFinal("yes")
 	require.Eventually(t, func() bool { return fTTS.spokenCount() == 2 }, time.Second, time.Millisecond)
-	assert.Equal(t, "main prompt", fLLM.seen[2][0].Content, "the round after the edge uses the new node's prompt")
-	assert.Equal(t, llm.Message{Role: "tool", ToolCallID: "t1", Content: `{"status":"done"}`}, fLLM.seen[2][len(fLLM.seen[2])-1])
-	assert.Equal(t, "end_call", fLLM.tools[2][0].Function.Name, "and its edges")
+	assert.Equal(t, "main prompt", fLLM.seenAt(2)[0].Content, "the round after the edge uses the new node's prompt")
+	assert.Equal(t, llm.Message{Role: "tool", ToolCallID: "t1", Content: `{"status":"done"}`}, fLLM.seenAt(2)[len(fLLM.seenAt(2))-1])
+	assert.Equal(t, "end_call", fLLM.toolsAt(2)[0].Function.Name, "and its edges")
 	assert.Equal(t, "Main", h.node.Load().Name)
 	playTurn(t, h, fTTS, 2, "Here is the topic.")
 	assert.Zero(t, hangups.Load())
@@ -1443,7 +1480,7 @@ func TestHandler_WorkflowWalk(t *testing.T) {
 	// End node: its closing line plays, then the call hangs up.
 	fSTT.sendFinal("bye")
 	require.Eventually(t, func() bool { return fTTS.spokenCount() == 3 }, time.Second, time.Millisecond)
-	assert.Equal(t, "end prompt", fLLM.seen[4][0].Content)
+	assert.Equal(t, "end prompt", fLLM.seenAt(4)[0].Content)
 	assert.Zero(t, hangups.Load(), "must not hang up before the closing line has played")
 	playTurn(t, h, fTTS, 3, "Thanks, goodbye.")
 
@@ -1497,11 +1534,11 @@ func TestHandler_SilentCallerIsAskedThenCallEnds(t *testing.T) {
 	playTurn(t, h, fTTS, 1, "Hello.")
 
 	require.Eventually(t, func() bool { return fTTS.spokenCount() == 2 }, time.Second, time.Millisecond)
-	assert.Equal(t, llm.Message{Role: "user", Content: idleFirstPrompt}, lastMessage(fLLM.seen[0]))
+	assert.Equal(t, llm.Message{Role: "user", Content: idleFirstPrompt}, lastMessage(fLLM.seenAt(0)))
 	playTurn(t, h, fTTS, 2, "Are you there?")
 
 	require.Eventually(t, func() bool { return fTTS.spokenCount() == 3 }, time.Second, time.Millisecond)
-	assert.Equal(t, llm.Message{Role: "user", Content: idleFinalPrompt}, lastMessage(fLLM.seen[1]))
+	assert.Equal(t, llm.Message{Role: "user", Content: idleFinalPrompt}, lastMessage(fLLM.seenAt(1)))
 	assert.Zero(t, hangups.Load(), "the goodbye must play first")
 	playTurn(t, h, fTTS, 3, "Have a good day.")
 
@@ -1532,7 +1569,7 @@ func TestHandler_CallerSpeechPausesIdleClock(t *testing.T) {
 
 	fSTT.results <- stt.Result{Signal: stt.SpeechEnded} // no transcript follows
 	require.Eventually(t, func() bool { return fLLM.streamCalls() == 1 }, time.Second, time.Millisecond)
-	assert.Equal(t, idleFirstPrompt, lastMessage(fLLM.seen[0]).Content)
+	assert.Equal(t, idleFirstPrompt, lastMessage(fLLM.seenAt(0)).Content)
 }
 
 func TestHandler_MaxDurationHangsUpAtOnceWhenListening(t *testing.T) {
@@ -1759,7 +1796,7 @@ func TestHandler_PausedJunkDoesNotConfirmButAShortAnswerDoes(t *testing.T) {
 	fSTT.sendFinal("जी")
 	require.Eventually(t, fTTS.wasCancelled, time.Second, time.Millisecond, "a real short answer confirms")
 	require.Eventually(t, func() bool { return fLLM.streamCalls() == 2 }, time.Second, time.Millisecond)
-	assert.Equal(t, llm.Message{Role: "user", Content: "जी"}, lastMessage(fLLM.seen[1]))
+	assert.Equal(t, llm.Message{Role: "user", Content: "जी"}, lastMessage(fLLM.seenAt(1)))
 }
 
 // TestHandler_ReplyHeardWhenTheCallEndsIsLogged: the caller hanging up

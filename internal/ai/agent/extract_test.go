@@ -105,6 +105,14 @@ func (f *extractingLLM) Stream(ctx context.Context, msgs []llm.Message, tools []
 	return f.conv.Stream(ctx, msgs, tools, onToken)
 }
 
+// extractions returns the extraction requests' user messages, under the lock.
+func (f *extractingLLM) extractions() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return append([]string(nil), f.seen...)
+}
+
 // TestHandler_ExtractsOnLeavingANodeAndAtTheEnd: Dograh's two moments --
 // leaving a node with extraction on, and the end of the call for the node
 // it ended at -- both land in the call log, later values winning.
@@ -150,8 +158,8 @@ func TestHandler_ExtractsOnLeavingANodeAndAtTheEnd(t *testing.T) {
 		"the end-of-call extraction runs last and wins")
 	assert.Equal(t, []string{"party", "tag_party", "mood"}, s.ExtractedKeys)
 
-	require.Len(t, fLLM.seen, 2)
-	assert.Contains(t, fLLM.seen[0], "user: मैं AAP को वोट दूंगा", "the start node's extraction sees the caller's answer")
+	require.Len(t, fLLM.extractions(), 2)
+	assert.Contains(t, fLLM.extractions()[0], "user: मैं AAP को वोट दूंगा", "the start node's extraction sees the caller's answer")
 }
 
 // TestHandler_StartExtractionAfterFinishIsRefused: a straggling extraction
@@ -173,7 +181,7 @@ func TestHandler_StartExtractionAfterFinishIsRefused(t *testing.T) {
 	h.startExtraction(node, nil)
 
 	assert.Nil(t, cfg.Log.Summary().Extracted, "a post-finish extraction never runs")
-	assert.Empty(t, fLLM.seen, "the LLM must never be asked")
+	assert.Empty(t, fLLM.extractions(), "the LLM must never be asked")
 }
 
 // TestHandler_FinishExtractionSkippedAtShutdown: when Vaani is stopping, the
@@ -193,7 +201,7 @@ func TestHandler_FinishExtractionSkippedAtShutdown(t *testing.T) {
 	stop()
 	h.FinishExtraction(stopping)
 
-	assert.Empty(t, fLLM.seen, "no LLM call while shutting down")
+	assert.Empty(t, fLLM.extractions(), "no LLM call while shutting down")
 }
 
 func TestHandler_NoExtractionWithoutSettings(t *testing.T) {
