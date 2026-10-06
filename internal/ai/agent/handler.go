@@ -582,7 +582,7 @@ func (h *Handler) processSpeakingFrame(pcm []byte) [][]byte {
 		h.cfg.BargeIn.Reset()
 		h.speechRunStart = time.Time{}
 		h.silenceUntil.Store(now.Add(h.cfg.PostCutSilence).UnixNano())
-		slog.Info("agent barge-in detected; pausing the reply", "call_id", h.callID)
+		slog.Info("agent barge-in detected; pausing the reply", "call_id", h.callID, "event", "agent.barge_in.detected")
 		h.emptyTicks = 0
 		signal(h.bargeInSig)
 
@@ -951,7 +951,7 @@ func (h *Handler) hangup() {
 		reason = "end_call"
 	}
 
-	slog.Info("agent ending call", "call_id", h.callID, "gen", h.curGen, "reason", reason,
+	slog.Info("agent ending call", "call_id", h.callID, "gen", h.curGen, "reason", reason, "event", "call.ended_by_agent",
 		"node", h.node.Load().Name)
 
 	if h.cfg.Hangup != nil {
@@ -1073,7 +1073,8 @@ func (h *Handler) handleFinalTranscript(text string) {
 	// ended after it finished arrives in Listening instead, whole.
 	switch s := State(h.state.Load()); s {
 	case StateThinking, StateSpeaking:
-		slog.Info("transcript ignored: the agent is "+s.String(), "call_id", h.callID, "text", text)
+		slog.Info("transcript ignored: the agent is "+s.String(), "call_id", h.callID, "text", text,
+			"event", "stt.transcript.ignored")
 		return
 	}
 
@@ -1099,7 +1100,7 @@ func (h *Handler) handleFinalTranscript(text string) {
 		args = append(args, "since_flush_ms", time.Since(flushedAt).Milliseconds())
 	}
 
-	slog.Info("stt final transcript", args...)
+	slog.Info("stt final transcript", append(args, slog.String("event", "stt.transcript.final"))...)
 
 	h.idleCount = 0
 	h.startTurn()
@@ -1339,7 +1340,7 @@ func (h *Handler) takeEdge(ctx context.Context, ttsClient tts.Client, from *Node
 		h.sendToTTS(ctx, ttsClient, e.Speech+" ", gen)
 	}
 
-	slog.Info("node transition", "call_id", h.callID, "gen", gen,
+	slog.Info("node transition", "call_id", h.callID, "gen", gen, "event", "workflow.node_transition",
 		"from", from.Name, "to", e.To.Name, "via", e.Def.Name,
 		"allow_interrupt", e.To.AllowInterrupt, "interrupt", InterruptMode(!h.cfg.BargeInObserveOnly, e.To))
 	h.node.Store(e.To)
@@ -1835,7 +1836,7 @@ func (h *Handler) finishTurn(gen uint64) {
 		h.state.Store(int32(StateListening))
 	}
 
-	slog.Info("turn complete", "call_id", h.callID, "gen", gen,
+	slog.Info("turn complete", "call_id", h.callID, "gen", gen, "event", "agent.turn.completed",
 		"total_latency_ms", time.Since(h.turnStartedAt).Milliseconds())
 
 	h.agentQuietSince = time.Now()
@@ -2039,7 +2040,7 @@ func (h *Handler) confirmInterruption() {
 	h.paused.Store(false)
 	h.cfg.Sink.BargeIn()
 	slog.Info("agent barge-in confirmed; reply cut", "call_id", h.callID, "gen", h.curGen,
-		"paused_ms", time.Since(h.pausedAt).Milliseconds())
+		"paused_ms", time.Since(h.pausedAt).Milliseconds(), "event", "agent.barge_in.confirmed")
 	h.cutReply()
 }
 

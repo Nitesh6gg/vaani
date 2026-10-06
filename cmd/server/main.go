@@ -73,7 +73,7 @@ func run() error {
 
 	clPtr.Store(&cl)
 
-	slog.Info("connected to ARI")
+	slog.Info("connected to ARI", "event", "ari.connected")
 
 	// Dograh's database holds the workflow the agent runs. Failing to reach it
 	// is fatal at startup rather than failing every call.
@@ -89,7 +89,7 @@ func run() error {
 		}
 		defer store.Close()
 
-		slog.Info("connected to dograh database", "workflow_id", cfg.DograhWorkflowID)
+		slog.Info("connected to dograh database", "workflow_id", cfg.DograhWorkflowID, "event", "db.connected")
 	}
 
 	// Dograh's MinIO, for call recordings and transcripts; nil = no uploads.
@@ -102,7 +102,8 @@ func run() error {
 	ports := media.NewPortAllocator(cfg.MediaPortBase, cfg.MediaPortCount)
 	mgr := vaaniari.NewManager(cl, cfg, ports, store, storage)
 
-	slog.Info("vaani running", "metrics_addr", cfg.MetricsAddr, "media_ip", cfg.MediaIP, "app_mode", cfg.AppMode)
+	slog.Info("vaani running", "metrics_addr", cfg.MetricsAddr, "media_ip", cfg.MediaIP, "app_mode", cfg.AppMode,
+		"event", "service.started")
 
 	runDone := make(chan struct{})
 

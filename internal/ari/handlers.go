@@ -251,7 +251,7 @@ func (m *Manager) Run(ctx context.Context) {
 				// timeout) -- without it, every teardown looks identical.
 				slog.Info("channel destroyed",
 					"call_id", e.Channel.ID,
-					"cause", e.Cause, "cause_txt", e.CauseTxt)
+					"cause", e.Cause, "cause_txt", e.CauseTxt, "event", "call.destroyed")
 				m.onTransferLegDestroyed(e)
 			}
 		}
@@ -398,6 +398,11 @@ func (m *Manager) startCall(ctx context.Context, e *ari.StasisStart) {
 	}
 	c := &call{Call: session.New(id, externalID, port, info, ctx), udpConn: udpConn, listener: listener}
 
+	// Every log line carrying call_id=id is now stamped with this call's
+	// W3C trace_id by the logging handler (see internal/config/logging.go);
+	// unregistered at teardown so the registry stays bounded by live calls.
+	config.RegisterCallTrace(id, config.NewTraceID())
+
 	m.mu.Lock()
 	m.pending[externalID] = c
 	m.pending[id] = c // so a hangup during setup can still find and clean up this call
@@ -457,7 +462,8 @@ func (m *Manager) startCall(ctx context.Context, e *ari.StasisStart) {
 
 	slog.Info("call answered, media socket listening, externalMedia staged",
 		"call_id", id, "external_id", externalID, "port", port, "encapsulation", encap,
-		"caller_number", info.CallerNumber, "called_number", info.CalledNumber, "direction", info.Direction)
+		"caller_number", info.CallerNumber, "called_number", info.CalledNumber, "direction", info.Direction,
+		"event", "call.answered")
 }
 
 // completeBridge runs once the externalMedia channel itself enters Stasis: it
@@ -570,7 +576,7 @@ func (m *Manager) loadWorkflow(c *call) (*dograh.Workflow, error) {
 		opening = "greeting"
 	}
 
-	slog.Info("agent workflow loaded", "call_id", c.ID, "workflow_id", m.cfg.DograhWorkflowID,
+	slog.Info("agent workflow loaded", "call_id", c.ID, "workflow_id", m.cfg.DograhWorkflowID, "event", "workflow.loaded",
 		"start_node", wf.Start.Name, "opening", opening, "start_tools", toolNames(wf.Start),
 		"start_allow_interrupt", wf.Start.AllowInterrupt,
 		"start_interrupt", agent.InterruptMode(m.cfg.BargeInEnabled, wf.Start),
@@ -578,7 +584,7 @@ func (m *Manager) loadWorkflow(c *call) (*dograh.Workflow, error) {
 
 	// Never the keys.
 	s := wf.Services
-	slog.Info("agent models", "call_id", c.ID,
+	slog.Info("agent models", "call_id", c.ID, "event", "agent.configured",
 		"llm", s.LLM.Provider+"/"+s.LLM.Model, "llm_url", s.LLM.BaseURL,
 		"stt", "sarvam/"+s.STT.Model, "stt_language", s.STT.Language,
 		"tts", "sarvam/"+s.TTS.Model, "tts_voice", s.TTS.Voice, "tts_language", s.TTS.Language)
@@ -712,7 +718,7 @@ func (m *Manager) recordRun(c *call, wf *dograh.Workflow, callLog *agent.CallLog
 		return
 	}
 
-	slog.Info("dograh run created", "call_id", c.ID, "run_id", runID, "workflow_id", wf.ID)
+	slog.Info("dograh run created", "call_id", c.ID, "run_id", runID, "workflow_id", wf.ID, "event", "run.created")
 
 	<-h.Done()
 
@@ -751,7 +757,7 @@ func (m *Manager) recordRun(c *call, wf *dograh.Workflow, callLog *agent.CallLog
 
 	slog.Info("dograh run completed", "call_id", c.ID, "run_id", runID, "disposition", reason,
 		"events", len(summary.Events), "variables", len(summary.Extracted),
-		"recording_bytes", len(recording), "minio", m.storage != nil)
+		"recording_bytes", len(recording), "minio", m.storage != nil, "event", "run.completed")
 }
 
 // newBargeInDetector builds the caller-interrupt detector for one call.
@@ -928,6 +934,7 @@ func (m *Manager) abort(c *call) {
 
 		m.ports.Free(c.Port)
 		metrics.MediaPortsInUse.Set(float64(m.ports.InUse()))
+		config.UnregisterCallTrace(c.ID)
 
 		hangupChannel(m.cl, c.ID, c.ID)
 		hangupChannel(m.cl, c.ID, c.ExternalID)
@@ -956,7 +963,8 @@ func (m *Manager) onStasisEnd(e *ari.StasisEnd) {
 			leg = "caller"
 		}
 
-		slog.Info("call ended by leg", "call_id", c.ID, "leg", leg, "channel_id", id, "external_id", c.ExternalID)
+		slog.Info("call ended by leg", "call_id", c.ID, "leg", leg, "channel_id", id, "external_id", c.ExternalID,
+			"event", "call.hangup")
 		m.teardown(c)
 
 		return
@@ -1052,7 +1060,10 @@ func (m *Manager) teardown(c *call) {
 
 		slog.Info("call torn down",
 			"call_id", c.ID, "external_id", c.ExternalID, "port", c.Port,
-			"caller_number", c.Info.CallerNumber, "called_number", c.Info.CalledNumber, "direction", c.Info.Direction)
+			"caller_number", c.Info.CallerNumber, "called_number", c.Info.CalledNumber, "direction", c.Info.Direction,
+			"event", "call.teardown")
+
+		config.UnregisterCallTrace(c.ID)
 	})
 }
 

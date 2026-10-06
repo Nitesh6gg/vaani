@@ -140,10 +140,10 @@ func (d *TenVadDetector) Detect(pcm []byte) bool {
 		case result && !d.speechActive:
 			d.speechActive = true
 			d.speechStartedAt = time.Now()
-			slog.Info("speech started", "call_id", d.callID)
+			slog.Info("speech started", "call_id", d.callID, "event", "vad.speech_started")
 		case !result && d.speechActive:
 			d.speechActive = false
-			slog.Info("speech ended", "call_id", d.callID,
+			slog.Info("speech ended", "call_id", d.callID, "event", "vad.speech_ended",
 				"duration_ms", time.Since(d.speechStartedAt).Milliseconds())
 		}
 	}

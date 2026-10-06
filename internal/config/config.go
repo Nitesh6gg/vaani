@@ -378,7 +378,7 @@ func Load() (Config, error) {
 	}
 
 	if _, ok := os.LookupEnv("MEDIA_IP"); !ok {
-		slog.Warn("MEDIA_IP not set; defaulting to 127.0.0.1 -- only works when Asterisk and Vaani share a host/network namespace")
+		slog.Warn("MEDIA_IP not set; defaulting to 127.0.0.1 -- only works when Asterisk and Vaani share a host/network namespace", "event", "config.media_ip_fallback")
 	}
 
 	return cfg, nil
