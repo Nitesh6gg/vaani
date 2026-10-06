@@ -206,8 +206,8 @@ type spokenChunk struct {
 	text string
 }
 type ttsDoneEvent struct{ gen uint64 }
-type ttsClosedEvent struct{ client tts.Client } // its connection is gone (provider closed it, or Vaani did)
-type endCallToolEvent struct{}                  // end_call ran in a turn an interruption then cancelled
+type ttsClosedEvent struct{ conn uint64 } // TTS connection number conn is gone (provider closed it, or Vaani did)
+type endCallToolEvent struct{}            // end_call ran in a turn an interruption then cancelled
 type greetingEvent struct{}
 type openingEvent struct{}
 type callerSpeechEvent struct{ started bool } // STT VAD: caller started/stopped speaking
@@ -320,7 +320,12 @@ type Handler struct {
 	extractDone bool
 
 	// run()-owned only.
-	tts        tts.Client
+	tts tts.Client
+	// ttsConn numbers each TTS connection opened (tts's is the latest), so a
+	// "connection closed" notice from an earlier one -- arriving late, after
+	// a barge-in already replaced it -- can't end the current turn. By
+	// number, not by client: two connections need not be distinct values.
+	ttsConn    uint64
 	turnCancel context.CancelFunc
 	history    []llm.Message
 	ttsBuf     []byte
@@ -788,7 +793,7 @@ func (h *Handler) handleEvent(ev any) {
 	case ttsDoneEvent:
 		h.handleTTSDone(e.gen)
 	case ttsClosedEvent:
-		h.handleTTSClosed(e.client)
+		h.handleTTSClosed(e.conn)
 	case endCallToolEvent:
 		h.endCall("end_call")
 	case greetingEvent:
@@ -972,8 +977,9 @@ func (h *Handler) openTTS(gen uint64) bool {
 	}
 
 	h.tts = t
+	h.ttsConn++
 
-	go h.readTTS(t)
+	go h.readTTS(t, h.ttsConn)
 
 	return true
 }
@@ -1617,7 +1623,7 @@ func (h *Handler) sendToTTS(ctx context.Context, ttsClient tts.Client, text stri
 // but hadn't yet overflowed the buffer) and turn 3 suddenly produced
 // hundreds, once the accumulated undrained backlog from all three turns
 // finally exceeded outboundBufferFrames.
-func (h *Handler) readTTS(ttsClient tts.Client) {
+func (h *Handler) readTTS(ttsClient tts.Client, conn uint64) {
 	audioCh := ttsClient.Audio()
 	doneCh := ttsClient.Done()
 
@@ -1672,15 +1678,16 @@ func (h *Handler) readTTS(ttsClient tts.Client) {
 	// Both channels closed: the connection is gone. Kept as h.tts it would be
 	// reused by every later turn, each Speak failing -- dead air for the rest
 	// of the call. run() drops it (unless it already replaced it).
-	h.post(ttsClosedEvent{client: ttsClient})
+	h.post(ttsClosedEvent{conn: conn})
 }
 
-// handleTTSClosed: t's connection is gone. If it's still the call's TTS (not
-// one a barge-in already cancelled and replaced), forget it so the next turn
-// opens a fresh one, and end the current turn instead of waiting for audio
-// that can't come: what already arrived still plays out first.
-func (h *Handler) handleTTSClosed(t tts.Client) {
-	if h.tts != t {
+// handleTTSClosed: TTS connection number conn is gone. If it's still the
+// call's TTS (not one a barge-in already cancelled and replaced), forget it
+// so the next turn opens a fresh one, and end the current turn instead of
+// waiting for audio that can't come: what already arrived still plays out
+// first.
+func (h *Handler) handleTTSClosed(conn uint64) {
+	if h.tts == nil || conn != h.ttsConn {
 		return
 	}
 

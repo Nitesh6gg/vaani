@@ -25,16 +25,56 @@ import (
 // restores it on test cleanup, and returns a function that hands back that
 // buffer. Same pattern as internal/media's captureSlog (unexported there, so
 // duplicated rather than shared across packages).
-func captureSlog(t *testing.T) func() *bytes.Buffer {
+func captureSlog(t *testing.T) func() *lockedBuffer {
 	t.Helper()
 
-	buf := &bytes.Buffer{}
+	buf := &lockedBuffer{}
 	original := slog.Default()
 
 	slog.SetDefault(slog.New(slog.NewTextHandler(buf, nil)))
 	t.Cleanup(func() { slog.SetDefault(original) })
 
-	return func() *bytes.Buffer { return buf }
+	return func() *lockedBuffer { return buf }
+}
+
+// lockedBuffer is a log sink a test can read while the handler's goroutines
+// are still writing to it (a plain bytes.Buffer is a data race there).
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.String()
+}
+
+// finalHistory stops h (cancel is its context's) and returns its history.
+// h.history belongs to run()'s goroutine; once Done is closed run() has
+// returned, so reading it is no longer a race. Call it once the turn has
+// visibly ended: run() finishes the event it's handling (finishTurn records
+// the reply right after flipping to Listening) before it sees the cancel.
+func finalHistory(t *testing.T, h *Handler, cancel context.CancelFunc) []llm.Message {
+	t.Helper()
+
+	cancel()
+
+	select {
+	case <-h.Done():
+	case <-time.After(time.Second):
+		t.Fatal("handler didn't stop")
+	}
+
+	return h.history
 }
 
 // fakeSTT records every fed frame and lets a test push transcript results.
@@ -259,7 +299,10 @@ func TestHandler_GreetingIsSpokenWithoutWaitingForCaller(t *testing.T) {
 	fSTT := newFakeSTT()
 	fTTS := newFakeTTS()
 
-	h := NewHandler(context.Background(), "call1", Config{
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	h := NewHandler(ctx, "call1", Config{
 		STT:     fSTT,
 		NewTTS:  func() (tts.Client, error) { return fTTS, nil },
 		LLM:     &fakeLLM{}, // must never be called for the greeting
@@ -279,8 +322,7 @@ func TestHandler_GreetingIsSpokenWithoutWaitingForCaller(t *testing.T) {
 	fTTS.done <- gen
 	drainUntilListening(t, h)
 
-	require.Eventually(t, func() bool { return len(h.history) == 1 }, time.Second, time.Millisecond)
-	assert.Equal(t, []llm.Message{{Role: "assistant", Content: "Hi, this side Shubh."}}, h.history,
+	assert.Equal(t, []llm.Message{{Role: "assistant", Content: "Hi, this side Shubh."}}, finalHistory(t, h, cancel),
 		"the greeting must be recorded so the LLM doesn't redundantly re-greet")
 }
 
@@ -305,7 +347,10 @@ func TestHandler_FullyPlayedReplyIsRecordedInHistory(t *testing.T) {
 	fTTS := newFakeTTS()
 	fLLM := &fakeLLM{tokens: []string{"Hello there.", " How are you?"}}
 
-	h := NewHandler(context.Background(), "call1", testConfig(fSTT, fTTS, fLLM, 0, 0))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	h := NewHandler(ctx, "call1", testConfig(fSTT, fTTS, fLLM, 0, 0))
 
 	fSTT.sendFinal("hi")
 	require.Eventually(t, func() bool { return fTTS.spokenCount() == 2 }, time.Second, time.Millisecond)
@@ -318,11 +363,10 @@ func TestHandler_FullyPlayedReplyIsRecordedInHistory(t *testing.T) {
 
 	drainUntilListening(t, h)
 
-	require.Eventually(t, func() bool { return len(h.history) == 2 }, time.Second, time.Millisecond)
 	assert.Equal(t, []llm.Message{
 		{Role: "user", Content: "hi"},
 		{Role: "assistant", Content: "Hello there. How are you?"},
-	}, h.history)
+	}, finalHistory(t, h, cancel))
 }
 
 // TestHandler_BargeInRecordsOnlyWhatWasHeard: when the caller cuts in, history
@@ -402,12 +446,16 @@ func drainUntilListening(t *testing.T, h *Handler) {
 
 func TestHandler_NoGreetingConfiguredStaysSilentUntilCallerSpeaks(t *testing.T) {
 	fSTT := newFakeSTT()
-	h := NewHandler(context.Background(), "call1", testConfig(fSTT, newFakeTTS(), &fakeLLM{}, 0, 0))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	h := NewHandler(ctx, "call1", testConfig(fSTT, newFakeTTS(), &fakeLLM{}, 0, 0))
 
 	time.Sleep(20 * time.Millisecond) // let NewHandler's goroutines settle
 
 	assert.Equal(t, StateListening, h.State())
-	assert.Empty(t, h.history)
+	assert.Empty(t, finalHistory(t, h, cancel))
 }
 
 func TestHandler_ListeningFeedsSTTAndReturnsNoAudio(t *testing.T) {
@@ -1022,7 +1070,11 @@ func TestHandler_ToolRoundTrip(t *testing.T) {
 
 	cfg := testConfig(fSTT, fTTS, fLLM, 0, 0)
 	cfg.Start = &Node{Tools: []Tool{echoTool("lookup", `{"ok":true}`, &ran)}}
-	h := NewHandler(context.Background(), "call1", cfg)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	h := NewHandler(ctx, "call1", cfg)
 
 	fSTT.sendFinal("check my pin")
 	require.Eventually(t, func() bool { return fTTS.spokenCount() == 2 }, time.Second, time.Millisecond)
@@ -1041,15 +1093,12 @@ func TestHandler_ToolRoundTrip(t *testing.T) {
 
 	playTurn(t, h, fTTS, 1, "Let me check.", " It is done.")
 
-	// finishTurn flips the state to Listening just before it records the
-	// reply (same goroutine), so wait for the history rather than the state.
-	require.Eventually(t, func() bool { return len(h.history) == 4 }, time.Second, time.Millisecond)
 	assert.Equal(t, []llm.Message{
 		{Role: "user", Content: "check my pin"},
 		{Role: "assistant", ToolCalls: []llm.ToolCall{call}},
 		{Role: "tool", ToolCallID: "c1", Content: `{"ok":true}`},
 		{Role: "assistant", Content: "Let me check. It is done."},
-	}, h.history)
+	}, finalHistory(t, h, cancel))
 }
 
 // TestHandler_EndCallHangsUpAfterGoodbyePlays: the LLM isn't asked again
