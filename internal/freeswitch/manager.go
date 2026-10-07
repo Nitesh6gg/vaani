@@ -34,6 +34,9 @@ const (
 	// shutdownDrain bounds how long Run waits for calls to end after its ctx
 	// is cancelled.
 	shutdownDrain = 10 * time.Second
+	// hangupEventGrace: how long a closed earshot socket waits for the
+	// hangup event before the call is ended as "socket closed".
+	hangupEventGrace = time.Second
 	// statusInterval: how often each call logs earshot's play buffer (the F1
 	// clock-drift question in docs/FREESWITCH.md).
 	// ponytail: one ESL command per call per interval; drop it (or make it
@@ -321,7 +324,15 @@ func (m *Manager) runCall(c *call, ws *websocket.Conn, h http.Header) {
 	go func() {
 		select {
 		case <-asm.ReadDone():
-			c.cancel(errWSClosed)
+			// On hangup earshot drops the socket (close code 1006) before
+			// FreeSWITCH's CHANNEL_HANGUP_COMPLETE reaches us (seen in the F1
+			// lab): give the event a moment, so a hangup is reported as one
+			// and the gone channel isn't killed again.
+			select {
+			case <-c.ctx.Done():
+			case <-time.After(hangupEventGrace):
+				c.cancel(errWSClosed)
+			}
 		case <-asm.Dead():
 			c.cancel(errMediaDead)
 		case <-c.ctx.Done():

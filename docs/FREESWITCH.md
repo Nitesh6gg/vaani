@@ -184,13 +184,17 @@ string, e.g. `sofia/gateway/<gw>/<number>` or `user/1002`):
 
 ## 5. Things to prove in the lab (Phase F1)
 
-| Question | Why it matters |
-|---|---|
-| Inbound message size with `codec=l16 rate=16000` on an 8 kHz channel | re-framing design |
-| Clock drift: Vaani's 20 ms ticker vs FreeSWITCH's write clock over a 10-min call (`earshot <uuid> status` → `play_buffered`) | if Vaani runs fast, Earshot's buffer slowly grows = growing delay; fix would be to pace writes off inbound frames |
-| `uuid_bridge` while the dialplan runs `silence_stream` | transfer |
-| What Earshot sends on `uuid_kill` (WS close code) | clean teardown, no "media dead" warnings |
-| Audio quality: 8 kHz G.711 caller → 16 kHz resample → Sarvam STT | STT accuracy vs Asterisk path |
+| Question | Why it matters | Result |
+|---|---|---|
+| Inbound message size with `codec=l16 rate=16000` on an 8 kHz channel | re-framing design | **640 B every time**: 7,315 of 7,315 messages on a 146 s call (channel `L16@8000hz`). The re-framer stays as a safety net. |
+| Clock drift: Vaani's 20 ms ticker vs FreeSWITCH's write clock (`earshot <uuid> status` → `play_buffered`) | if Vaani runs fast, Earshot's buffer slowly grows = growing delay | **None seen**: `play_buffered` 320 B (one 8 kHz frame) at 30/60/90/120 s; `rx_frames` +1,500 per 30 s = exactly 50/s. Re-check on a 10-min call. |
+| How the call ends on hangup | clean teardown | Earshot drops the socket **without a close frame (1006)**, *before* `CHANNEL_HANGUP_COMPLETE` arrives over ESL; Vaani waits up to 1 s for the event so it's logged as the hangup it is. |
+| `uuid_bridge` while the dialplan runs `silence_stream` | transfer | open (F3) |
+| Audio quality: 8 kHz G.711 caller → 16 kHz resample → Sarvam STT | STT accuracy vs Asterisk path | open (F2; needs a real phone) |
+
+Lab setup (2026-10-07, FreeSWITCH 1.11.3, earshot `c5847cc`): Vaani
+`TELEPHONY=freeswitch APP_MODE=loopback`; test call placed from the switch
+itself — `originate loopback/7000/default &playback(tone_stream://L=65;%(1000,0,440))`.
 
 ## 6. Code
 

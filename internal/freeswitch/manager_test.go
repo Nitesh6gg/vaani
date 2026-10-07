@@ -190,6 +190,23 @@ func TestSocketCloseHangsUpChannel(t *testing.T) {
 	assert.Equal(t, []string{"uuid_kill " + testUUID + " NORMAL_CLEARING"}, fs.apiCalls())
 }
 
+// What a real hangup looks like (F1 lab): earshot drops the socket first and
+// the hangup event follows. That's a hangup, not ours to kill.
+func TestSocketCloseThenHangupEventIsAHangup(t *testing.T) {
+	fs := newFakeSwitch(t)
+	m, url := start(t, fs, "")
+	ws := dialCall(t, url, callHeaders(""))
+
+	_, _, err := ws.ReadMessage()
+	require.NoError(t, err)
+	_ = ws.Close()
+	time.Sleep(100 * time.Millisecond)
+	fs.hangupEvent(testUUID)
+
+	waitNoCalls(t, m)
+	assert.Empty(t, fs.apiCalls())
+}
+
 func TestDuplicateConnectionRejected(t *testing.T) {
 	_, url := start(t, newFakeSwitch(t), "")
 	ws := dialCall(t, url, callHeaders(""))
