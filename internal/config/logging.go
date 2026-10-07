@@ -178,6 +178,8 @@ func ConfigureLogging() {
 	}
 
 	slog.SetDefault(slog.New(newHandler(os.Stderr, env, format, level, pii)))
+
+	applied = logSettings{env: env, format: format, level: strings.ToLower(level.String()), pii: pii}
 }
 
 // parseLogPII reads LOG_PII: whether logs may carry personal data in full
@@ -220,6 +222,15 @@ func redact(key string, v slog.Value) slog.Value {
 		return slog.StringValue("[redacted " + strconv.Itoa(utf8.RuneCountInString(s)) + " chars]")
 	}
 }
+
+// logSettings is what ConfigureLogging applied, for the startup banner.
+type logSettings struct {
+	env, format, level string
+	pii                bool
+}
+
+// applied is set once by ConfigureLogging, before anything else runs.
+var applied = logSettings{env: "development", format: "json", level: "info", pii: true}
 
 // parseLogFormat validates LOG_FORMAT; ok is false when the value should be
 // replaced by the default.

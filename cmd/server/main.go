@@ -45,6 +45,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	config.Startup(cfg)
 
 	media.WarnIfUnset()
 
@@ -68,7 +69,7 @@ func run() error {
 		}
 	}()
 
-	slog.Info("connecting to ARI", "url", cfg.AriURL, "app", cfg.AriApp)
+	slog.Info("connecting to ARI", "url", config.SafeURL(cfg.AriURL), "app", cfg.AriApp)
 
 	cl, err := vaaniari.Connect(ctx, cfg)
 	if err != nil {

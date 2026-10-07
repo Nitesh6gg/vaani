@@ -107,7 +107,7 @@ func waitForConnect(ctx context.Context, resCh <-chan connectResult, ariURL stri
 		case r := <-resCh:
 			return r, false
 		case <-ticker.C:
-			slog.Info("still waiting for Asterisk ARI", "url", ariURL)
+			slog.Info("still waiting for Asterisk ARI", "url", config.SafeURL(ariURL))
 		case <-ctx.Done():
 			return connectResult{}, true
 		}
