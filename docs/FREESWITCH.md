@@ -222,6 +222,13 @@ Still to do:
   detector) into a shared package so both call managers use them; send
   `{"type":"clear"}` on a confirmed barge-in.
 - F3: transfer (section 4).
+- **Open gap (found in the F1 lab):** if Vaani is down when a call arrives,
+  earshot logs "ws closed: Unable to connect" and gives up
+  (`EARSHOT_NO_RECONNECT`), but the dialplan's `silence_stream://-1` keeps
+  the caller in silence **forever**. Fix in F2: Vaani subscribes to
+  `CUSTOM earshot::error earshot::disconnected` and `uuid_kill`s any channel
+  that isn't one of its live calls, plus a FreeSWITCH-side cap
+  (`sched_hangup`) so a call still ends when Vaani is down altogether.
 ## 7. Milestones
 
 - **F1 — lab proof:** FreeSWITCH 1.11 + Earshot installed; Vaani
