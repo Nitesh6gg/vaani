@@ -128,16 +128,9 @@ func (c *AudioSocketCallMedia) Run(ctx context.Context) {
 	readDone := make(chan struct{})
 
 	var pacedLoops sync.WaitGroup
-	pacedLoops.Add(2)
 
-	go func() {
-		defer pacedLoops.Done()
-		c.releaseLoop(ctx)
-	}()
-	go func() {
-		defer pacedLoops.Done()
-		c.writeLoop(ctx)
-	}()
+	pacedLoops.Go(func() { c.releaseLoop(ctx) })
+	pacedLoops.Go(func() { c.writeLoop(ctx) })
 	go c.watchdog.Run(ctx)
 	go c.readLoop(ctx, readDone)
 

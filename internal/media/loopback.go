@@ -156,16 +156,9 @@ func (c *CallMedia) Run(ctx context.Context) {
 	readDone := make(chan struct{})
 
 	var pacedLoops sync.WaitGroup
-	pacedLoops.Add(2)
 
-	go func() {
-		defer pacedLoops.Done()
-		c.releaseLoop(ctx)
-	}()
-	go func() {
-		defer pacedLoops.Done()
-		c.writeLoop(ctx)
-	}()
+	pacedLoops.Go(func() { c.releaseLoop(ctx) })
+	pacedLoops.Go(func() { c.writeLoop(ctx) })
 	go c.watchdog.Run(ctx)
 	go c.readLoop(ctx, readDone)
 
@@ -189,7 +182,7 @@ func (c *CallMedia) Run(ctx context.Context) {
 // RTP destination for this call. Callers should WARN at teardown if this is still
 // false -- it means no audio was ever received from Asterisk for the whole call.
 func (c *CallMedia) RemoteLocked() bool {
-	return c.ep.Remote() != nil
+	return c.ep.Remote().IsValid()
 }
 
 // Dead returns a channel that's closed once inbound media has been silent for
@@ -262,7 +255,7 @@ func (c *CallMedia) readLoop(ctx context.Context, done chan<- struct{}) {
 		}
 
 		if c.ep.LockRemote(addr) {
-			slog.Info("rtp remote locked", "call_id", c.callID, "addr", addr)
+			slog.Info("rtp remote locked", "call_id", c.callID, "addr", LogAddr(addr))
 		}
 
 		c.sender.SetPayloadType(pkt.PayloadType)

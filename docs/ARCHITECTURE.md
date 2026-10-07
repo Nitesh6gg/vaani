@@ -135,6 +135,9 @@ opens, `Manager.loadWorkflow` (3s timeout) loads workflow `DOGRAH_WORKFLOW_ID`:
   `{{var | default}}` / `{{var | fallback:default}}` fallbacks work; a
   missing variable becomes empty text. (Dograh renders on entering each
   node, so `{{current_time}}` there can be minutes later on a long call.)
+  The time-zone database is built into the binary (`time/tzdata`, about
+  450 KB), so `<Zone>` variables work even on a host or slim image without
+  `/usr/share/zoneinfo` -- without it they silently rendered empty there.
 - **Tools:** the rows of `tools` referenced by the nodes' `tool_uuids`,
   limited to active ones in the workflow's organization (Dograh's own lookup),
   each with the `external_credentials` row its `credential_uuid` names (same

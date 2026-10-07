@@ -328,7 +328,7 @@ func probe(port int) ([]byte, probeStats, error) {
 			// RTP audio" the old gate was waiting for without the lock it's itself
 			// blocking. See docs/AUDIO_PIPELINE.md.
 			if ep.LockRemote(addr) {
-				slog.Info("probe remote locked", "addr", addr)
+				slog.Info("probe remote locked", "addr", media.LogAddr(addr))
 			}
 
 			if media.IsRTCP(buf[:n]) {

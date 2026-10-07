@@ -2,6 +2,7 @@ package media
 
 import (
 	"net"
+	"net/netip"
 	"testing"
 	"time"
 
@@ -115,12 +116,12 @@ func TestEndpoint_LockRemoteThenSend(t *testing.T) {
 
 	ep := NewEndpoint(server)
 
-	clientAddr := client.LocalAddr().(*net.UDPAddr)
+	clientAddr := client.LocalAddr().(*net.UDPAddr).AddrPort()
 
 	assert.True(t, ep.LockRemote(clientAddr), "first LockRemote call must report locked=true")
-	assert.False(t, ep.LockRemote(&net.UDPAddr{IP: net.IPv4(9, 9, 9, 9), Port: 1}),
+	assert.False(t, ep.LockRemote(netip.MustParseAddrPort("9.9.9.9:1")),
 		"a second LockRemote call must be a no-op and report false")
-	assert.Equal(t, clientAddr.String(), ep.Remote().String(), "remote must stay the first address, not the second")
+	assert.Equal(t, clientAddr, ep.Remote(), "remote must stay the first address, not the second")
 
 	sent, err := ep.WriteTo([]byte("payload"))
 	require.NoError(t, err)
@@ -132,4 +133,80 @@ func TestEndpoint_LockRemoteThenSend(t *testing.T) {
 	n, _, err := client.ReadFromUDP(buf)
 	require.NoError(t, err, "the packet must actually arrive at the locked remote")
 	assert.Equal(t, "payload", string(buf[:n]))
+}
+
+// TestEndpoint_ReadIsAllocationFree: receiving a packet (and replying to its
+// sender) must not allocate -- 50 packets a second per call on the hot path,
+// invariant #3. The old ReadFromUDP allocated a *net.UDPAddr for each one.
+func TestEndpoint_ReadIsAllocationFree(t *testing.T) {
+	server, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	defer func() { _ = server.Close() }()
+
+	client, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+
+	ep := NewEndpoint(server)
+	to := server.LocalAddr().(*net.UDPAddr).AddrPort()
+	pkt := make([]byte, 652) // RTP header + one 640-byte slin16 frame
+	buf := make([]byte, 1500)
+	reply := make([]byte, 1500) // a short buffer fails ("message too long") and that error allocates
+
+	// Warm up: lock the remote and let the runtime set up its poller state.
+	_, err = client.WriteToUDPAddrPort(pkt, to)
+	require.NoError(t, err)
+	_, from, err := ep.ReadFrom(buf)
+	require.NoError(t, err)
+	ep.LockRemote(from)
+
+	allocs := testing.AllocsPerRun(100, func() {
+		_, _ = client.WriteToUDPAddrPort(pkt, to)
+		_, _, _ = ep.ReadFrom(buf)
+		_, _ = ep.WriteTo(pkt)
+		_, _, _ = client.ReadFromUDPAddrPort(reply)
+	})
+
+	assert.Zero(t, allocs, "RTP receive and reply must not allocate")
+}
+
+// TestEndpoint_WildcardBindRepliesToIPv4Sender binds like production
+// (internal/ari: all interfaces, so possibly a dual-stack socket that reports
+// IPv4 peers IPv4-mapped) and checks the locked address still reaches the
+// sender.
+func TestEndpoint_WildcardBindRepliesToIPv4Sender(t *testing.T) {
+	server, err := net.ListenUDP("udp", &net.UDPAddr{})
+	require.NoError(t, err)
+	defer func() { _ = server.Close() }()
+
+	client, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+
+	ep := NewEndpoint(server)
+	port := server.LocalAddr().(*net.UDPAddr).Port
+
+	_, err = client.WriteToUDPAddrPort([]byte("rtp"), netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), uint16(port)))
+	require.NoError(t, err)
+
+	_ = server.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 64)
+	_, from, err := ep.ReadFrom(buf)
+	require.NoError(t, err)
+	require.True(t, ep.LockRemote(from))
+	assert.Equal(t, "127.0.0.1", from.Addr().Unmap().String(), "the sender, whatever form it was reported in")
+
+	sent, err := ep.WriteTo([]byte("reply"))
+	require.NoError(t, err)
+	require.True(t, sent)
+
+	_ = client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, _, err := client.ReadFromUDPAddrPort(buf)
+	require.NoError(t, err, "the reply must reach the sender")
+	assert.Equal(t, "reply", string(buf[:n]))
+}
+
+func TestLogAddrUnmapsIPv4(t *testing.T) {
+	assert.Equal(t, "192.168.26.249:20000", LogAddr(netip.MustParseAddrPort("[::ffff:192.168.26.249]:20000")))
+	assert.Equal(t, "[2001:db8::1]:5004", LogAddr(netip.MustParseAddrPort("[2001:db8::1]:5004")))
 }

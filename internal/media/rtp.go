@@ -3,8 +3,9 @@ package media
 import (
 	"errors"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -95,7 +96,7 @@ type Sender struct {
 func NewSender() *Sender {
 	s := &Sender{
 		ssrc: rand.Uint32(),
-		seq:  uint16(rand.Intn(1 << 16)),
+		seq:  uint16(rand.IntN(1 << 16)),
 		//nolint:gosec // initial RTP timestamp offset has no security relevance
 		ts: rand.Uint32(),
 	}
@@ -137,11 +138,16 @@ func (s *Sender) Build(payload []byte) *rtp.Packet {
 // Endpoint owns one UDP socket for a single call. The outbound destination is
 // locked to the source address of the first valid inbound packet; outbound writes
 // before that are dropped rather than sent nowhere.
+//
+// Addresses are netip.AddrPort values, not *net.UDPAddr: ReadFromUDP allocates
+// a new *net.UDPAddr for every packet received (50 per second per call),
+// while the AddrPort variants are allocation-free (Go 1.18 release notes) --
+// the 20ms hot path stays allocation-free, per invariant #3.
 type Endpoint struct {
 	conn *net.UDPConn
 
 	mu     sync.RWMutex
-	remote *net.UDPAddr
+	remote netip.AddrPort // zero (not IsValid) until locked
 }
 
 // NewEndpoint wraps conn, sizing its socket buffers for RTP traffic.
@@ -152,20 +158,20 @@ func NewEndpoint(conn *net.UDPConn) *Endpoint {
 	return &Endpoint{conn: conn}
 }
 
-// ReadFrom reads one packet into buf.
-func (e *Endpoint) ReadFrom(buf []byte) (int, *net.UDPAddr, error) {
-	return e.conn.ReadFromUDP(buf)
+// ReadFrom reads one packet into buf, without allocating.
+func (e *Endpoint) ReadFrom(buf []byte) (int, netip.AddrPort, error) {
+	return e.conn.ReadFromUDPAddrPort(buf)
 }
 
 // LockRemote sets the outbound destination the first time it's called; later calls
 // are no-ops, per the "lock to first inbound packet" invariant. It reports whether
 // this call was the one that performed the lock, so callers can log the transition
 // exactly once.
-func (e *Endpoint) LockRemote(addr *net.UDPAddr) (locked bool) {
+func (e *Endpoint) LockRemote(addr netip.AddrPort) (locked bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if e.remote == nil {
+	if !e.remote.IsValid() {
 		e.remote = addr
 		return true
 	}
@@ -173,12 +179,20 @@ func (e *Endpoint) LockRemote(addr *net.UDPAddr) (locked bool) {
 	return false
 }
 
-// Remote returns the locked outbound destination, or nil if none is known yet.
-func (e *Endpoint) Remote() *net.UDPAddr {
+// Remote returns the locked outbound destination; it's not IsValid until one
+// is locked.
+func (e *Endpoint) Remote() netip.AddrPort {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
 	return e.remote
+}
+
+// LogAddr is addr for a log line: an IPv4 peer read through a dual-stack
+// socket arrives IPv4-mapped (::ffff:a.b.c.d) and is shown as plain a.b.c.d.
+// Only for display -- replies go back to the address exactly as received.
+func LogAddr(addr netip.AddrPort) string {
+	return netip.AddrPortFrom(addr.Addr().Unmap(), addr.Port()).String()
 }
 
 // WriteTo sends b to the locked remote address. sent is true only when a packet
@@ -189,11 +203,11 @@ func (e *Endpoint) Remote() *net.UDPAddr {
 // failures.
 func (e *Endpoint) WriteTo(b []byte) (sent bool, err error) {
 	remote := e.Remote()
-	if remote == nil {
+	if !remote.IsValid() {
 		return false, nil
 	}
 
-	if _, err = e.conn.WriteToUDP(b, remote); err != nil {
+	if _, err = e.conn.WriteToUDPAddrPort(b, remote); err != nil {
 		if errors.Is(err, syscall.ECONNREFUSED) {
 			return false, nil
 		}

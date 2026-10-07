@@ -93,6 +93,38 @@ the full list of series. `http://localhost:9091/healthz` returns 200 JSON while
 the ARI WebSocket is connected, 503 otherwise. Neither endpoint requires
 authentication -- see "Operability endpoints" in `docs/ARCHITECTURE.md`.
 
+## Memory limit (`GOMEMLIMIT`)
+
+Set Go's soft memory limit to about **90% of the memory Vaani may use**
+(its container limit, or its share of the host), so the garbage collector
+works harder as memory gets tight instead of the process being OOM-killed
+mid-call:
+
+```bash
+# systemd unit
+Environment=GOMEMLIMIT=3600MiB      # e.g. 4 GiB available to Vaani
+# docker / compose
+-e GOMEMLIMIT=3600MiB               # with --memory=4g
+```
+
+It's a runtime environment variable -- no code or config change. It's a
+*soft* limit: it makes the GC run more often near it, but if the live data
+really exceeds it the process still runs out, so size the box for the load.
+
+What grows per agent call (from the code):
+
+- The call recording for Dograh (`media.MixRecorder`): 32,000 bytes per
+  second of call (16 kHz mono, 16-bit), about 1.9 MB a minute, held in
+  memory until the call ends; capped at 100 MB (about 54 minutes,
+  `vaani_recording_truncated_total` counts calls that hit it).
+- The agent's outbound audio queue: up to 30 s of frames, about 0.96 MB
+  when full.
+- Plus the STT and TTS WebSocket connections and the conversation history.
+
+So a 5-minute call holds roughly 10 MB of recording at its end; 500 such
+calls ending together need about 5 GB for recordings alone. Measure under
+your real load (`docs/LOADTEST.md`) before choosing the box.
+
 ## Port ranges
 
 - Asterisk's own SIP-leg RTP: `10000-19999` (`deploy/asterisk/rtp.conf`)

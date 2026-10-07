@@ -85,20 +85,16 @@ func run() error {
 		case <-ticker.C:
 		}
 
-		wg.Add(1)
-
-		go func(idx int) {
-			defer wg.Done()
-
+		wg.Go(func() {
 			if err := originateAndHold(ctx, cl, cfg.AriApp, *endpoint, *hold); err != nil {
 				failed.Add(1)
-				slog.Warn("call failed", "index", idx, "error", err)
+				slog.Warn("call failed", "index", i, "error", err)
 
 				return
 			}
 
 			originated.Add(1)
-		}(i)
+		})
 	}
 
 	wg.Wait()

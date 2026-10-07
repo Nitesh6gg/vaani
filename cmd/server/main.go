@@ -10,6 +10,11 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	// The IANA time-zone database, embedded (~450 KB): Dograh's
+	// {{current_time_<Zone>}} template variables need time.LoadLocation, which
+	// otherwise fails -- and the variable silently renders empty -- on a host
+	// or slim container image without /usr/share/zoneinfo.
+	_ "time/tzdata"
 
 	"github.com/CyCoreSystems/ari/v5"
 

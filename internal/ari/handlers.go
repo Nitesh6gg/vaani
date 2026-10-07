@@ -712,12 +712,11 @@ func (m *Manager) newAgentHandler(c *call) media.Handler {
 
 	rec := media.NewMixRecorder(h)
 
-	m.runs.Add(1)
 	// recordRun logs about this call after its teardown: keep its trace_id
 	// (and run_id) on those lines until it's done.
 	config.HoldCallTrace(callID)
 
-	go m.recordRun(c, wf, callLog, rec, h)
+	m.runs.Go(func() { m.recordRun(c, wf, callLog, rec, h) })
 
 	return rec
 }
@@ -728,8 +727,8 @@ func (m *Manager) newAgentHandler(c *call) media.Handler {
 // the variables extracted, how it ended, and the recording and transcript
 // uploaded to Dograh's MinIO. Failures are logged; the call itself is never
 // affected.
+// Run on m.runs (shutdown waits for it).
 func (m *Manager) recordRun(c *call, wf *dograh.Workflow, callLog *agent.CallLog, rec *media.MixRecorder, h *agent.Handler) {
-	defer m.runs.Done()
 	defer config.UnregisterCallTrace(c.ID) // HoldCallTrace in newAgentHandler
 
 	started := time.Now()
