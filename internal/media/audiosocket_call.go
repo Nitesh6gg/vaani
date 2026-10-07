@@ -368,8 +368,16 @@ func (c *AudioSocketCallMedia) writeLoop(ctx context.Context) {
 		if err != nil {
 			c.sink.SendError()
 			dead = true
-			slog.Error("media write error; stopping writes and closing connection (framed stream can no longer be trusted)",
-				"call_id", c.callID, "error", err)
+
+			select {
+			case <-c.readDone:
+				// The far end already closed (a hangup): the write just lost
+				// the race with teardown.
+				slog.Debug("media write after the connection closed", "call_id", c.callID, "error", err)
+			default:
+				slog.Error("media write error; stopping writes and closing connection (framed stream can no longer be trusted)",
+					"call_id", c.callID, "error", err)
+			}
 			_ = c.wire.Close()
 
 			return

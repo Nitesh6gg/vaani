@@ -32,7 +32,7 @@ FreeSWITCH).
                        │     barge-in      ← {"type":"clear"}
                        │
                        └── mod_event_socket :8021 ◄══ TCP (ONE per Vaani) ══ Vaani
-                             events → CHANNEL_ANSWER, CHANNEL_HANGUP_COMPLETE, ...
+                             events → CHANNEL_ANSWER, CHANNEL_HANGUP, ...
                              commands ← uuid_kill, originate, uuid_bridge, earshot ...
 ```
 
@@ -166,7 +166,7 @@ Dialplan (on FreeSWITCH):
 5. Barge-in confirmed → the 5 cuts as today **plus** `{"type":"clear"}` to
    drop the frame or two already queued in Earshot.
 6. Agent ends the call → ESL `api uuid_kill <uuid> NORMAL_CLEARING`.
-7. Caller hangs up → ESL `CHANNEL_HANGUP_COMPLETE` (with `Hangup-Cause`) and
+7. Caller hangs up → ESL `CHANNEL_HANGUP` (with `Hangup-Cause`) and
    the WebSocket closes → same teardown path as today (once-guaranteed),
    then `recordRun` writes Dograh's `workflow_runs` + MinIO upload.
 
@@ -180,7 +180,7 @@ string, e.g. `sofia/gateway/<gw>/<number>` or `user/1002`):
    caller ↔ destination. **[lab]** confirm `uuid_bridge` cleanly takes the
    caller out of `silence_stream`.
 4. No answer / failure → `BACKGROUND_JOB` `-ERR <cause>` or
-   `CHANNEL_HANGUP_COMPLETE` on `<new>` → agent says so, as today.
+   `CHANNEL_HANGUP` on `<new>` → agent says so, as today.
 
 ## 5. Things to prove in the lab (Phase F1)
 
@@ -188,7 +188,7 @@ string, e.g. `sofia/gateway/<gw>/<number>` or `user/1002`):
 |---|---|---|
 | Inbound message size with `codec=l16 rate=16000` on an 8 kHz channel | re-framing design | **640 B every time**: 7,315 of 7,315 messages on a 146 s call (channel `L16@8000hz`). The re-framer stays as a safety net. |
 | Clock drift: Vaani's 20 ms ticker vs FreeSWITCH's write clock (`earshot <uuid> status` → `play_buffered`) | if Vaani runs fast, Earshot's buffer slowly grows = growing delay | **None seen**: `play_buffered` 320 B (one 8 kHz frame) at 30/60/90/120 s; `rx_frames` +1,500 per 30 s = exactly 50/s. Re-check on a 10-min call. |
-| How the call ends on hangup | clean teardown | Earshot drops the socket **without a close frame (1006)**, *before* `CHANNEL_HANGUP_COMPLETE` arrives over ESL; Vaani waits up to 1 s for the event so it's logged as the hangup it is. |
+| How the call ends on hangup | clean teardown | Earshot drops the socket **without a close frame (1006)**. `CHANNEL_HANGUP_COMPLETE` came **5.4 s later** (it waits for the channel's cleanup), so Vaani listens for `CHANNEL_HANGUP` instead, which fires as the hangup starts (`switch_channel_perform_hangup`, cause already set), and a closed socket waits up to 1 s for it. |
 | `uuid_bridge` while the dialplan runs `silence_stream` | transfer | open (F3) |
 | Audio quality: 8 kHz G.711 caller → 16 kHz resample → Sarvam STT | STT accuracy vs Asterisk path | open (F2; needs a real phone) |
 
@@ -210,7 +210,7 @@ Done in F1:
   per outbound frame, close code recorded.
 - `internal/freeswitch/`: call manager — accepts `/call` (auth token,
   `X-Channel-UUID` validated before it's used anywhere), one call per channel
-  UUID, ESL connect with backoff and `CHANNEL_HANGUP_COMPLETE` → call ends;
+  UUID, ESL connect with backoff and `CHANNEL_HANGUP` → call ends;
   any other end (socket closed, media dead, max duration, shutdown) →
   `uuid_kill`. Lab logging: `call.ended` carries earshot message counts, odd
   sizes and close code; `earshot.status` logs `play_buffered` every 30 s.

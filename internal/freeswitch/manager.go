@@ -187,7 +187,11 @@ func (m *Manager) connectESL(ctx context.Context) (*esl.Client, error) {
 		return nil, err
 	}
 
-	if err := c.Subscribe(dctx, "CHANNEL_HANGUP_COMPLETE"); err != nil {
+	// CHANNEL_HANGUP, not _COMPLETE: it fires as the hangup starts
+	// (switch_channel_perform_hangup, Hangup-Cause already set), while
+	// _COMPLETE waits for the channel's cleanup -- measured 5.4 s after
+	// earshot dropped the socket in the F1 lab.
+	if err := c.Subscribe(dctx, "CHANNEL_HANGUP"); err != nil {
 		_ = c.Close()
 		return nil, err
 	}
@@ -196,7 +200,7 @@ func (m *Manager) connectESL(ctx context.Context) (*esl.Client, error) {
 }
 
 func (m *Manager) onEvent(ev *esl.Message) {
-	if ev.Name() != "CHANNEL_HANGUP_COMPLETE" {
+	if ev.Name() != "CHANNEL_HANGUP" {
 		return
 	}
 
@@ -324,10 +328,9 @@ func (m *Manager) runCall(c *call, ws *websocket.Conn, h http.Header) {
 	go func() {
 		select {
 		case <-asm.ReadDone():
-			// On hangup earshot drops the socket (close code 1006) before
-			// FreeSWITCH's CHANNEL_HANGUP_COMPLETE reaches us (seen in the F1
-			// lab): give the event a moment, so a hangup is reported as one
-			// and the gone channel isn't killed again.
+			// On hangup earshot drops the socket (close code 1006) about when
+			// CHANNEL_HANGUP reaches us: give the event a moment, so a hangup
+			// is reported as one and the gone channel isn't killed again.
 			select {
 			case <-c.ctx.Done():
 			case <-time.After(hangupEventGrace):

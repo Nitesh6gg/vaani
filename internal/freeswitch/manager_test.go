@@ -79,7 +79,7 @@ func (fs *fakeSwitch) send(s string) {
 }
 
 func (fs *fakeSwitch) hangupEvent(uuid string) {
-	body := fmt.Sprintf("Event-Name: CHANNEL_HANGUP_COMPLETE\nUnique-ID: %s\nHangup-Cause: NORMAL_CLEARING\n\n", uuid)
+	body := fmt.Sprintf("Event-Name: CHANNEL_HANGUP\nUnique-ID: %s\nHangup-Cause: NORMAL_CLEARING\n\n", uuid)
 	fs.send(fmt.Sprintf("Content-Length: %d\nContent-Type: text/event-plain\n\n%s", len(body), body))
 }
 
