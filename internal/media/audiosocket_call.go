@@ -60,9 +60,13 @@ type AudioSocketConfig struct {
 // definition, not a per-deployment question), and no "remote locked" concept
 // (accepting the TCP connection is itself the connection, unlike a UDP socket
 // that will take packets from anywhere until an address is learned).
+//
+// The same pipeline also runs FreeSWITCH calls (NewEarshotCallMedia): only
+// the wire -- how one 640-byte frame is read and written -- differs.
 type AudioSocketCallMedia struct {
 	callID   string
-	conn     net.Conn
+	wire     frameWire
+	readDone chan struct{}
 	sink     AudioSocketSink
 	handler  Handler
 	toWire   Endianness
@@ -74,12 +78,6 @@ type AudioSocketCallMedia struct {
 	writePacer   *Pacer
 	inbound      chan *[]byte
 	outbound     chan *[]byte
-
-	// writeBuf is writeLoop's reused header+payload scratch buffer for
-	// writeAudioSocketFrameInto -- sized once for the one frame size this hot
-	// path ever sends, so it never allocates (invariant #3). writeLoop-goroutine-
-	// owned only.
-	writeBuf [audioSocketHeaderSize + FrameSize]byte
 
 	prevRelease time.Time
 
@@ -96,6 +94,70 @@ type AudioSocketCallMedia struct {
 // NewAudioSocketCallMedia wraps conn -- already accepted from Asterisk's TCP
 // connection for this call -- into a running AudioSocket media pipeline.
 func NewAudioSocketCallMedia(callID string, conn net.Conn, sink AudioSocketSink, cfg AudioSocketConfig) *AudioSocketCallMedia {
+	return newFramedCallMedia(callID, &audioSocketWire{conn: conn, callID: callID, sink: sink}, sink, cfg)
+}
+
+// frameWire is one call's media connection, as whole 640-byte frames.
+// ReadFrame is called only from readLoop, WriteFrame only from writeLoop.
+type frameWire interface {
+	// ReadFrame returns the next inbound frame as a pooled FrameSize buffer,
+	// nil (with a nil error) for anything that isn't audio, or io.EOF when
+	// the far end hung up.
+	ReadFrame() (*[]byte, error)
+	// WriteFrame sends one frame. An error is fatal to the call's media.
+	WriteFrame(pcm []byte) error
+	Close() error
+}
+
+// audioSocketWire is Asterisk's res_audiosocket framing over TCP.
+type audioSocketWire struct {
+	conn   net.Conn
+	callID string
+	sink   AudioSocketSink
+	// writeBuf is the reused header+payload scratch buffer for
+	// writeAudioSocketFrameInto -- sized once for the one frame size this hot
+	// path ever sends, so it never allocates (invariant #3). writeLoop-goroutine-
+	// owned only.
+	writeBuf [audioSocketHeaderSize + FrameSize]byte
+}
+
+func (w *audioSocketWire) ReadFrame() (*[]byte, error) {
+	frame, err := ReadAudioSocketFrame(w.conn)
+	if err != nil {
+		return nil, err
+	}
+
+	switch frame.Kind {
+	case AudioSocketKindHangup:
+		return nil, io.EOF
+	case AudioSocketKindSlin16:
+		if len(frame.Payload) != FrameSize {
+			w.sink.Malformed()
+			logFrameSizeOnce(w.callID, int(frame.Kind), len(frame.Payload))
+			slog.Debug("audiosocket frame wrong size", "call_id", w.callID, "size", len(frame.Payload))
+
+			return nil, nil
+		}
+
+		return &frame.Payload, nil // already a pooled FrameSize buffer, per ReadAudioSocketFrame
+	default:
+		// UUID, DTMF, error frames: no-op for now (control-plane concerns, not
+		// the media pipeline). Logged for visibility.
+		slog.Debug("audiosocket control frame", "call_id", w.callID, "kind", frame.Kind)
+
+		return nil, nil
+	}
+}
+
+// WriteFrame writes header+payload as one Write call (see audiosocket.go's
+// package doc comment for why that matters).
+func (w *audioSocketWire) WriteFrame(pcm []byte) error {
+	return writeAudioSocketFrameInto(w.conn, w.writeBuf[:], AudioSocketKindSlin16, pcm)
+}
+
+func (w *audioSocketWire) Close() error { return w.conn.Close() }
+
+func newFramedCallMedia(callID string, wire frameWire, sink AudioSocketSink, cfg AudioSocketConfig) *AudioSocketCallMedia {
 	handler := cfg.Handler
 	if handler == nil {
 		handler = LoopbackHandler{}
@@ -108,7 +170,8 @@ func NewAudioSocketCallMedia(callID string, conn net.Conn, sink AudioSocketSink,
 
 	return &AudioSocketCallMedia{
 		callID:       callID,
-		conn:         conn,
+		wire:         wire,
+		readDone:     make(chan struct{}),
 		sink:         sink,
 		handler:      handler,
 		toWire:       cfg.ToWire,
@@ -125,20 +188,18 @@ func NewAudioSocketCallMedia(callID string, conn net.Conn, sink AudioSocketSink,
 // Run starts the pipeline's goroutines and blocks until ctx is cancelled or the
 // TCP connection errors out.
 func (c *AudioSocketCallMedia) Run(ctx context.Context) {
-	readDone := make(chan struct{})
-
 	var pacedLoops sync.WaitGroup
 
 	pacedLoops.Go(func() { c.releaseLoop(ctx) })
 	pacedLoops.Go(func() { c.writeLoop(ctx) })
 	go c.watchdog.Run(ctx)
-	go c.readLoop(ctx, readDone)
+	go c.readLoop(ctx, c.readDone)
 
 	<-ctx.Done()
 	c.releasePacer.Stop()
 	c.writePacer.Stop()
-	_ = c.conn.Close()
-	<-readDone
+	_ = c.wire.Close()
+	<-c.readDone
 	// Pacer stop ends the release/write loops, but a tick already in flight
 	// must finish before the recorder (and anything reading per-call state)
 	// is touched -- Pacer.Stop does not wait for fn to return.
@@ -148,6 +209,13 @@ func (c *AudioSocketCallMedia) Run(ctx context.Context) {
 	if c.tap != nil {
 		UnregisterAudioTap(c.callID)
 	}
+}
+
+// ReadDone is closed once the connection stops delivering frames: the far end
+// hung up or closed it, a read failed, or Run's ctx ended. Run itself keeps
+// going until its ctx is cancelled.
+func (c *AudioSocketCallMedia) ReadDone() <-chan struct{} {
+	return c.readDone
 }
 
 // Dead returns a channel that's closed once inbound media has been silent for
@@ -177,43 +245,28 @@ func (c *AudioSocketCallMedia) readLoop(ctx context.Context, done chan<- struct{
 	defer close(done)
 
 	for {
-		frame, err := ReadAudioSocketFrame(c.conn)
+		buf, err := c.wire.ReadFrame()
 		if err != nil {
 			if ctx.Err() != nil || errors.Is(err, io.EOF) {
 				return
 			}
 
-			slog.Warn("audiosocket read error", "call_id", c.callID, "error", err)
+			slog.Warn("media read error", "call_id", c.callID, "error", err)
 
 			return
 		}
 
-		switch frame.Kind {
-		case AudioSocketKindHangup:
-			return
-		case AudioSocketKindSlin16:
-			if len(frame.Payload) != FrameSize {
-				c.sink.Malformed()
-				logFrameSizeOnce(c.callID, int(frame.Kind), len(frame.Payload))
-				slog.Debug("audiosocket frame wrong size", "call_id", c.callID, "size", len(frame.Payload))
+		if buf == nil {
+			continue
+		}
 
-				continue
-			}
+		c.sink.PacketIn(len(*buf))
+		c.watchdog.Touch()
 
-			c.sink.PacketIn(len(frame.Payload))
-			c.watchdog.Touch()
-
-			buf := &frame.Payload // already a pooled FrameSize buffer, per ReadAudioSocketFrame
-
-			select {
-			case c.inbound <- buf:
-			default:
-				PutFrame(buf) // release isn't keeping up; drop rather than block the reader
-			}
+		select {
+		case c.inbound <- buf:
 		default:
-			// UUID, DTMF, error frames: no-op for now (control-plane concerns, not
-			// the media pipeline). Logged for visibility.
-			slog.Debug("audiosocket control frame", "call_id", c.callID, "kind", frame.Kind)
+			PutFrame(buf) // release isn't keeping up; drop rather than block the reader
 		}
 	}
 }
@@ -308,16 +361,16 @@ func (c *AudioSocketCallMedia) writeLoop(ctx context.Context) {
 		// caller ignored AudioSocketConfig.ToWire's contract.
 		FromLE(*frame, c.toWire)
 
-		err := writeAudioSocketFrameInto(c.conn, c.writeBuf[:], AudioSocketKindSlin16, *frame)
+		err := c.wire.WriteFrame(*frame)
 
 		PutFrame(frame)
 
 		if err != nil {
 			c.sink.SendError()
 			dead = true
-			slog.Error("audiosocket write error; stopping writes and closing connection (framed stream can no longer be trusted)",
+			slog.Error("media write error; stopping writes and closing connection (framed stream can no longer be trusted)",
 				"call_id", c.callID, "error", err)
-			_ = c.conn.Close()
+			_ = c.wire.Close()
 
 			return
 		}

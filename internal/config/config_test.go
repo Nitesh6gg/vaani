@@ -250,3 +250,38 @@ func TestLoad_MinioEndpointNormalized(t *testing.T) {
 
 	assert.Equal(t, "h:9000", cfg.MinioEndpoint)
 }
+
+func TestLoad_Telephony(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		env     map[string]string
+		wantErr string
+	}{
+		{"default is asterisk", nil, ""},
+		{"unknown", map[string]string{"TELEPHONY": "kamailio"}, "TELEPHONY must be"},
+		{"freeswitch needs ESL password", map[string]string{"TELEPHONY": "freeswitch"}, "ESL_PASSWORD"},
+		{"freeswitch is loopback-only for now", map[string]string{"TELEPHONY": "freeswitch", "ESL_PASSWORD": "x",
+			"APP_MODE": "agent", "DOGRAH_DB_URL": "postgresql://u:p@h/d", "DOGRAH_WORKFLOW_ID": "1"}, "APP_MODE=loopback"},
+		{"token with a space", map[string]string{"TELEPHONY": "freeswitch", "ESL_PASSWORD": "x",
+			"EARSHOT_AUTH_TOKEN": "Bearer abc"}, "must not contain spaces"},
+		{"freeswitch ok", map[string]string{"TELEPHONY": "freeswitch", "ESL_PASSWORD": "x", "EARSHOT_AUTH_TOKEN": "abc"}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			restoreWD := chdir(t, t.TempDir())
+			defer restoreWD()
+			clearEnv(t, "TELEPHONY", "ESL_PASSWORD", "EARSHOT_AUTH_TOKEN", "APP_MODE")
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+
+			cfg, err := Load()
+			if tc.wantErr != "" {
+				assert.ErrorContains(t, err, tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, "127.0.0.1:8021", cfg.EslAddr)
+			assert.Equal(t, ":9095", cfg.EarshotListenAddr)
+		})
+	}
+}

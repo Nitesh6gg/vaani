@@ -41,3 +41,16 @@ func TestSafeURL(t *testing.T) {
 		assert.Equal(t, tc.want, SafeURL(tc.in), tc.in)
 	}
 }
+
+func TestStartupBannerFreeSWITCHHasNoSecrets(t *testing.T) {
+	cfg := Config{AppMode: "loopback", Telephony: "freeswitch", EslAddr: "127.0.0.1:8021",
+		EslPassword: "eslsecret", EarshotListenAddr: ":9095", EarshotAuthToken: "earshottoken"}
+	var buf bytes.Buffer
+	writeBanner(&buf, startupFields(cfg))
+	out := buf.String()
+
+	assert.NotContains(t, out, "eslsecret")
+	assert.NotContains(t, out, "earshottoken")
+	assert.Contains(t, out, "ws://:9095/call auth=on")
+	assert.NotContains(t, out, "ari ", "no ARI line on FreeSWITCH")
+}

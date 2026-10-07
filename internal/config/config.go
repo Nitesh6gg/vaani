@@ -156,6 +156,20 @@ type Config struct {
 	// the confidence Dograh's VAD runs with (pipecat's VADParams default);
 	// TEN VAD's own example uses 0.5. Only meaningful when VadMode is "ten".
 	TenVadThreshold float64
+
+	// Telephony picks the switch: "asterisk" (default; ARI) or "freeswitch"
+	// (ESL for control, mod_earshot WebSocket for media; docs/FREESWITCH.md).
+	Telephony string
+	// EslAddr/EslPassword reach FreeSWITCH's mod_event_socket (inbound mode).
+	EslAddr     string
+	EslPassword string
+	// EarshotListenAddr is where Vaani accepts mod_earshot's per-call
+	// WebSocket (the dialplan's "earshot start ws://<this>/call ...").
+	EarshotListenAddr string
+	// EarshotAuthToken, if set, must arrive as the WebSocket's Authorization
+	// header (dialplan: "earshot start ... auth=<token>"); without it anyone
+	// who can reach EarshotListenAddr can start a call.
+	EarshotAuthToken string
 }
 
 // Load reads configuration from the environment, applying local-dev defaults that
@@ -189,6 +203,11 @@ func Load() (Config, error) {
 		MinioSecure:         strings.EqualFold(getEnv("MINIO_SECURE", "false"), "true"),
 		BargeInEnabled:      getEnv("BARGE_IN_ENABLED", "1") == "1",
 		VadMode:             getEnv("VAD_MODE", "energy"),
+		Telephony:           getEnv("TELEPHONY", "asterisk"),
+		EslAddr:             getEnv("ESL_ADDR", "127.0.0.1:8021"),
+		EslPassword:         getEnv("ESL_PASSWORD", ""),
+		EarshotListenAddr:   getEnv("EARSHOT_LISTEN_ADDR", ":9095"),
+		EarshotAuthToken:    getEnv("EARSHOT_AUTH_TOKEN", ""),
 	}
 
 	var err error
@@ -257,6 +276,30 @@ func Load() (Config, error) {
 
 	if cfg.AppMode != "loopback" && cfg.AppMode != "agent" {
 		return Config{}, fmt.Errorf("config: APP_MODE must be \"loopback\" or \"agent\", got %q", cfg.AppMode)
+	}
+
+	switch cfg.Telephony {
+	case "asterisk":
+	case "freeswitch":
+		if cfg.EslPassword == "" {
+			return Config{}, fmt.Errorf("config: ESL_PASSWORD must be set when TELEPHONY=freeswitch (event_socket.conf.xml's password)")
+		}
+
+		// ponytail: F1 is loopback only; agent calls on FreeSWITCH are F2
+		// (docs/FREESWITCH.md section 7).
+		if cfg.AppMode != "loopback" {
+			return Config{}, fmt.Errorf("config: TELEPHONY=freeswitch supports only APP_MODE=loopback so far")
+		}
+
+		if cfg.EarshotAuthToken == "" {
+			slog.Warn("EARSHOT_AUTH_TOKEN not set; anyone who can reach EARSHOT_LISTEN_ADDR can start a call")
+		}
+	default:
+		return Config{}, fmt.Errorf("config: TELEPHONY must be \"asterisk\" or \"freeswitch\", got %q", cfg.Telephony)
+	}
+
+	if strings.ContainsAny(cfg.EarshotAuthToken, " \t\r\n") {
+		return Config{}, fmt.Errorf("config: EARSHOT_AUTH_TOKEN must not contain spaces (earshot's auth= option is split on spaces)")
 	}
 
 	if cfg.MediaEncapsulation != "rtp" && cfg.MediaEncapsulation != "audiosocket" {
@@ -373,6 +416,10 @@ func Load() (Config, error) {
 	// getEnv treats an explicitly-empty env var as unset, so these dev defaults
 	// silently apply when ARI_PASS/MEDIA_IP are missing. That's fine for local
 	// dev but exactly wrong for production, so say so loudly at startup.
+	if cfg.Telephony != "asterisk" {
+		return cfg, nil // ARI and MEDIA_IP aren't used with FreeSWITCH
+	}
+
 	if _, ok := os.LookupEnv("ARI_PASS"); !ok {
 		slog.Warn("ARI_PASS not set; using dev default credentials -- set ARI_PASS for anything beyond local dev")
 	}

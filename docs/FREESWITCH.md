@@ -1,10 +1,14 @@
 # FreeSWITCH support — Phase 1 research and design
 
-Status: **research and design only, no code.** Each fact below is marked
-**[source]** (read in mod_earshot `c5847cc` or FreeSWITCH `v1.10.12`
-source) or **[lab]** (a design assumption still to prove on a real call).
+Status: **F1 code done (loopback), awaiting the lab call** — see section 7.
+Each fact below is marked **[source]** (read in mod_earshot `c5847cc` or
+FreeSWITCH `v1.10.12`/`v1.11.3` source) or **[lab]** (a design assumption
+still to prove on a real call).
 
-Target: **FreeSWITCH 1.10.12** + **mod_earshot** (MIT,
+Target: **FreeSWITCH 1.11.x** (the lab box runs 1.11.3: SignalWire's
+`debian-release` repo now ships 1.11; the design was first checked against
+1.10.12, and mod_event_socket's message types and commands are identical in
+both) + **mod_earshot** (MIT,
 github.com/wiringai/mod_earshot) for media, and FreeSWITCH's built-in
 **Event Socket (ESL)** for call control. Asterisk support stays as it is;
 `TELEPHONY=asterisk|freeswitch` picks one per process.
@@ -19,7 +23,7 @@ FreeSWITCH).
 ## 1. The big picture
 
 ```
- caller ──SIP/RTP──► FreeSWITCH 1.10.12
+ caller ──SIP/RTP──► FreeSWITCH 1.11
                        │  dialplan: answer → earshot start → silence_stream
                        │
                        ├── mod_earshot ══ WebSocket (one per call) ══►  Vaani :9095
@@ -96,7 +100,7 @@ Compared with Asterisk:
   uses ESL for control, so the media socket never carries control.
 - `greeting=`: the opening line comes from the Dograh workflow.
 
-## 3. Event Socket (ESL) — what we use (verified, FreeSWITCH v1.10.12)
+## 3. Event Socket (ESL) — what we use (verified, FreeSWITCH v1.10.12 and v1.11.3)
 
 From `mod_event_socket.c` and the stock `event_socket.conf.xml`:
 
@@ -188,26 +192,35 @@ string, e.g. `sofia/gateway/<gw>/<number>` or `user/1002`):
 | What Earshot sends on `uuid_kill` (WS close code) | clean teardown, no "media dead" warnings |
 | Audio quality: 8 kHz G.711 caller → 16 kHz resample → Sarvam STT | STT accuracy vs Asterisk path |
 
-## 6. Code plan (for approval later — not started)
+## 6. Code
+
+Done in F1:
 
 - `internal/config`: `TELEPHONY` (`asterisk` default), `ESL_ADDR`,
-  `ESL_PASSWORD`, `EARSHOT_LISTEN_ADDR` (e.g. `:9095`).
-- `internal/esl/`: inbound ESL client (auth, api, bgapi, events) — **done**,
-  unit-tested against a fake switch; the call manager adds
-  reconnect-with-backoff like ARI.
-- `internal/media/`: WebSocket call media (gorilla/websocket — already a
-  dependency), re-framing reader, same Handler/pacer/pool/recorder.
-- Move the telephony-neutral parts of `internal/ari/handlers.go`
-  (`loadWorkflow`, `newAgentHandler`, `recordRun`, `logCallSummary`, barge-in
-  detector) into a shared package so ARI and FreeSWITCH call managers both
-  use them — biggest change, no behavior change for Asterisk.
-- `internal/freeswitch/`: call manager (WS accept → call, ESL events,
-  hangup, transfer).
-- `docs/SETUP.md`: FreeSWITCH + Earshot install, dialplan, ESL ACL.
+  `ESL_PASSWORD`, `EARSHOT_LISTEN_ADDR` (`:9095`), `EARSHOT_AUTH_TOKEN`.
+  `TELEPHONY=freeswitch` accepts only `APP_MODE=loopback` until F2.
+- `internal/esl/`: inbound ESL client (auth, api, bgapi, ordered events).
+- `internal/media/earshot.go`: the earshot wire for the existing framed-call
+  pipeline (same pacer, pool, Handler, recorder, watchdog as AudioSocket):
+  inbound binary messages re-framed into 640-byte frames, one binary message
+  per outbound frame, close code recorded.
+- `internal/freeswitch/`: call manager — accepts `/call` (auth token,
+  `X-Channel-UUID` validated before it's used anywhere), one call per channel
+  UUID, ESL connect with backoff and `CHANNEL_HANGUP_COMPLETE` → call ends;
+  any other end (socket closed, media dead, max duration, shutdown) →
+  `uuid_kill`. Lab logging: `call.ended` carries earshot message counts, odd
+  sizes and close code; `earshot.status` logs `play_buffered` every 30 s.
 
+Still to do:
+
+- F2: move the telephony-neutral parts of `internal/ari/handlers.go`
+  (`loadWorkflow`, `newAgentHandler`, `recordRun`, `logCallSummary`, barge-in
+  detector) into a shared package so both call managers use them; send
+  `{"type":"clear"}` on a confirmed barge-in.
+- F3: transfer (section 4).
 ## 7. Milestones
 
-- **F1 — lab proof:** FreeSWITCH 1.10.12 + Earshot installed; Vaani
+- **F1 — lab proof:** FreeSWITCH 1.11 + Earshot installed; Vaani
   `APP_MODE=loopback TELEPHONY=freeswitch`. Done = you hear your own voice;
   section 5 questions answered with real numbers.
 - **F2 — agent calls:** a Dograh workflow call end-to-end on FreeSWITCH;

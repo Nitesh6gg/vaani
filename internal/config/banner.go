@@ -41,11 +41,13 @@ func isTerminal(f *os.File) bool {
 
 func writeBanner(w io.Writer, fields []startupField) {
 	line := strings.Repeat("=", 54)
-	fmt.Fprintf(w, "%s\n    %s %s\n%s\n", line, ServiceName, version.Version, line)
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s\n    %s %s\n%s\n", line, ServiceName, version.Version, line)
 	for _, f := range fields {
-		fmt.Fprintf(w, "  %-12s %s\n", f.key, f.value)
+		fmt.Fprintf(&b, "  %-12s %s\n", f.key, f.value)
 	}
-	fmt.Fprintln(w, line)
+	b.WriteString(line + "\n")
+	_, _ = io.WriteString(w, b.String()) // best effort: the structured line follows anyway
 }
 
 func startupFields(cfg Config) []startupField {
@@ -57,8 +59,22 @@ func startupFields(cfg Config) []startupField {
 		{"go", fmt.Sprintf("%s %s/%s, %d CPUs, GOMEMLIMIT %s",
 			runtime.Version(), runtime.GOOS, runtime.GOARCH, runtime.NumCPU(), memLimit())},
 		{"environment", applied.env},
-		{"mode", fmt.Sprintf("%s (media: %s)", cfg.AppMode, cfg.MediaEncapsulation)},
-		{"ari", fmt.Sprintf("%s app=%s", SafeURL(cfg.AriURL), cfg.AriApp)},
+	}
+	if cfg.Telephony == "freeswitch" {
+		auth := "off"
+		if cfg.EarshotAuthToken != "" {
+			auth = "on"
+		}
+		fields = append(fields,
+			startupField{"mode", cfg.AppMode + " (telephony: freeswitch)"},
+			startupField{"esl", cfg.EslAddr},
+			startupField{"earshot", fmt.Sprintf("ws://%s/call auth=%s", cfg.EarshotListenAddr, auth)})
+	} else {
+		fields = append(fields,
+			startupField{"mode", fmt.Sprintf("%s (media: %s)", cfg.AppMode, cfg.MediaEncapsulation)},
+			startupField{"ari", fmt.Sprintf("%s app=%s", SafeURL(cfg.AriURL), cfg.AriApp)},
+			startupField{"media", fmt.Sprintf("ip %s ports %d-%d",
+				cfg.MediaIP, cfg.MediaPortBase, cfg.MediaPortBase+cfg.MediaPortCount-1)})
 	}
 	if cfg.AppMode == "agent" {
 		fields = append(fields, startupField{"dograh",
@@ -82,8 +98,6 @@ func startupFields(cfg Config) []startupField {
 	}
 
 	return append(fields,
-		startupField{"media", fmt.Sprintf("ip %s ports %d-%d",
-			cfg.MediaIP, cfg.MediaPortBase, cfg.MediaPortBase+cfg.MediaPortCount-1)},
 		startupField{"vad", fmt.Sprintf("%s barge-in %s", vad, bargeIn)},
 		startupField{"logs", fmt.Sprintf("%s level=%s pii=%s", applied.format, applied.level, pii)},
 		startupField{"metrics", cfg.MetricsAddr + " (/metrics, /healthz)"},

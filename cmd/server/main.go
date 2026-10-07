@@ -21,6 +21,7 @@ import (
 	vaaniari "github.com/nitesh/vaani/internal/ari"
 	"github.com/nitesh/vaani/internal/config"
 	"github.com/nitesh/vaani/internal/dograh"
+	"github.com/nitesh/vaani/internal/freeswitch"
 	"github.com/nitesh/vaani/internal/media"
 	"github.com/nitesh/vaani/internal/metrics"
 )
@@ -51,6 +52,10 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	if cfg.Telephony == "freeswitch" {
+		return runFreeSWITCH(ctx, cfg)
+	}
 
 	// clPtr is nil until ari.Connect below succeeds, and Serve's /healthz route
 	// needs to report "not connected" honestly during that startup/retry window
@@ -142,4 +147,27 @@ func run() error {
 
 		return nil
 	}
+}
+
+// runFreeSWITCH serves TELEPHONY=freeswitch (docs/FREESWITCH.md): calls arrive
+// as mod_earshot WebSockets, control goes over the Event Socket.
+func runFreeSWITCH(ctx context.Context, cfg config.Config) error {
+	mgr := freeswitch.New(cfg)
+
+	go func() {
+		if err := metrics.Serve(ctx, cfg.MetricsAddr, cfg.DebugAudio, mgr.Connected); err != nil {
+			slog.Error("metrics server error", "error", err)
+		}
+	}()
+
+	slog.Info("vaani running", "metrics_addr", cfg.MetricsAddr, "telephony", cfg.Telephony, "app_mode", cfg.AppMode,
+		"event", "service.started")
+
+	if err := mgr.Run(ctx); err != nil { // blocks until SIGTERM/SIGINT, then drains calls
+		return err
+	}
+
+	slog.Info("shutdown complete")
+
+	return nil
 }

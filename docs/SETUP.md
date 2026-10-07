@@ -86,6 +86,58 @@ What a healthy call logs at its start:
     agent workflow loaded ... start_node="Start Call" opening=llm start_tools="[...]" start_allow_interrupt=false start_interrupt=off idle_timeout_s=10 max_duration_s=300
     agent models ... llm=bifrost/<model> llm_url=... stt=sarvam/saaras:v4 ... tts_voice=...
 
+## FreeSWITCH instead of Asterisk (`TELEPHONY=freeswitch`)
+
+Loopback only so far (milestone F1); design in `docs/FREESWITCH.md`.
+
+1. FreeSWITCH 1.11 from SignalWire's apt repo (needs a free SignalWire
+   personal access token), plus the build tools for mod_earshot:
+
+       apt-get install -y freeswitch-meta-all libfreeswitch-dev libwebsockets-dev cmake build-essential pkg-config
+
+2. FreeSWITCH config, if it shares the box with Asterisk and Vaani:
+   - `vars.xml`: `internal_sip_port` off 5060 (e.g. 5070); and with no
+     internet STUN, `external_rtp_ip`/`external_sip_ip` as `set` to the
+     box's IP instead of `stun-set ... stun:stun.freeswitch.org` -- otherwise
+     mod_sofia fails to load ("Invalid ext-rtp-ip") and there's no SIP at all.
+     Change `default_password` from 1234 (the default dialplan sleeps 10s on
+     every call while it's 1234).
+   - `autoload_configs/switch.conf.xml`: RTP ports clear of Asterisk's
+     (10000-19999) and Vaani's (`MEDIA_PORT_BASE`...), e.g. 30000-34999.
+   - `autoload_configs/event_socket.conf.xml`: your own `password`, and
+     `listen-ip` 127.0.0.1 when Vaani is on the same box.
+   - `autoload_configs/modules.conf.xml`: `<load module="mod_earshot"/>`;
+     `mod_signalwire` can be commented out.
+3. mod_earshot: `git clone https://github.com/wiringai/mod_earshot`, then
+   `cmake -S . -B build && cmake --build build && cmake --install build`.
+4. A dialplan extension that hands the call to Vaani, e.g.
+   `dialplan/default/90_vaani.xml`:
+
+   ```xml
+   <include>
+     <extension name="vaani">
+       <condition field="destination_number" expression="^(7000)$">
+         <action application="set" data="EARSHOT_NO_RECONNECT=true"/>
+         <action application="set" data="EARSHOT_META={&quot;from&quot;:&quot;${caller_id_number}&quot;,&quot;to&quot;:&quot;${destination_number}&quot;}"/>
+         <action application="answer"/>
+         <action application="earshot" data="start ws://127.0.0.1:9095/call proto=native codec=l16 rate=16000"/>
+         <action application="playback" data="silence_stream://-1"/>
+       </condition>
+     </extension>
+   </include>
+   ```
+
+   Add ` auth=<EARSHOT_AUTH_TOKEN>` to the `earshot start` line when Vaani
+   listens beyond localhost.
+5. Vaani's `.env`: `TELEPHONY=freeswitch`, `ESL_PASSWORD=<event socket
+   password>`, and `EARSHOT_LISTEN_ADDR=127.0.0.1:9095` when FreeSWITCH is on
+   the same box. ARI and `MEDIA_*` settings are ignored.
+
+A healthy start logs `connected to FreeSWITCH event socket` and
+`listening for earshot`; each call logs `call.started` and `call.ended`
+(with `reason`, earshot message counts and close code), and `earshot.status`
+every 30s.
+
 ## Metrics and health
 
 `http://localhost:9091/metrics` (Prometheus format) -- see `internal/metrics` for
