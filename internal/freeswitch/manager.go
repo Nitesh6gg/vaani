@@ -21,6 +21,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"github.com/nitesh/vaani/internal/callagent"
 	"github.com/nitesh/vaani/internal/config"
 	"github.com/nitesh/vaani/internal/esl"
 	"github.com/nitesh/vaani/internal/media"
@@ -63,8 +64,9 @@ var upgrader = websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return
 
 // Manager owns the process's ESL connection and every live FreeSWITCH call.
 type Manager struct {
-	cfg config.Config
-	esl atomic.Pointer[esl.Client]
+	cfg    config.Config
+	agents *callagent.Builder
+	esl    atomic.Pointer[esl.Client]
 
 	mu      sync.Mutex
 	calls   map[string]*call
@@ -78,9 +80,10 @@ type call struct {
 	ctx    context.Context
 }
 
-// New returns a Manager for cfg (TELEPHONY=freeswitch).
-func New(cfg config.Config) *Manager {
-	return &Manager{cfg: cfg, calls: make(map[string]*call)}
+// New returns a Manager for cfg (TELEPHONY=freeswitch); agents builds each
+// call's agent (APP_MODE=agent) or leaves it a loopback.
+func New(cfg config.Config, agents *callagent.Builder) *Manager {
+	return &Manager{cfg: cfg, agents: agents, calls: make(map[string]*call)}
 }
 
 // Connected reports whether the Event Socket is up, for /healthz.
@@ -94,6 +97,8 @@ func (m *Manager) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("freeswitch: listen for earshot on %s: %w", m.cfg.EarshotListenAddr, err)
 	}
+
+	m.agents.SetProcessContext(ctx) // before the first call can arrive
 
 	srv := &http.Server{Handler: m, ReadHeaderTimeout: 5 * time.Second}
 	go func() {
@@ -124,7 +129,11 @@ func (m *Manager) Run(ctx context.Context) error {
 	m.mu.Unlock()
 
 	drained := make(chan struct{})
-	go func() { m.wg.Wait(); close(drained) }()
+	go func() {
+		m.wg.Wait()
+		m.agents.Wait() // the calls' Dograh records
+		close(drained)
+	}()
 	select {
 	case <-drained:
 	case <-time.After(shutdownDrain):
@@ -191,7 +200,8 @@ func (m *Manager) connectESL(ctx context.Context) (*esl.Client, error) {
 	// (switch_channel_perform_hangup, Hangup-Cause already set), while
 	// _COMPLETE waits for the channel's cleanup -- measured 5.4 s after
 	// earshot dropped the socket in the F1 lab.
-	if err := c.Subscribe(dctx, "CHANNEL_HANGUP"); err != nil {
+	// earshot::error: earshot couldn't connect to (or was refused by) Vaani.
+	if err := c.Subscribe(dctx, "CHANNEL_HANGUP", "CUSTOM", "earshot::error"); err != nil {
 		_ = c.Close()
 		return nil, err
 	}
@@ -200,16 +210,30 @@ func (m *Manager) connectESL(ctx context.Context) (*esl.Client, error) {
 }
 
 func (m *Manager) onEvent(ev *esl.Message) {
-	if ev.Name() != "CHANNEL_HANGUP" {
-		return
-	}
+	id := ev.Get("Unique-ID")
 
 	m.mu.Lock()
-	c := m.calls[ev.Get("Unique-ID")]
+	c := m.calls[id]
 	m.mu.Unlock()
 
-	if c != nil {
-		c.cancel(fmt.Errorf("%w: %s", errHangup, ev.Get("Hangup-Cause")))
+	switch ev.Name() {
+	case "CHANNEL_HANGUP":
+		if c != nil {
+			c.cancel(fmt.Errorf("%w: %s", errHangup, ev.Get("Hangup-Cause")))
+		}
+	case "earshot::error":
+		// Earshot couldn't connect to Vaani, or Vaani refused it (bad token,
+		// a duplicate...): with no reconnect, the dialplan's silence_stream
+		// would hold that caller in silence until the call's time cap.
+		// Assumes every earshot stream on this switch points at Vaani.
+		if c != nil || !channelUUID.MatchString(id) {
+			return
+		}
+
+		slog.Warn("earshot couldn't reach Vaani; hanging the call up", "call_id", id,
+			"reason", ev.Get("reason"), "component", "telephony", "event", "earshot.connect_failed")
+
+		go m.hangup(id) // not on the event loop: it waits for the switch's reply
 	}
 }
 
@@ -294,6 +318,20 @@ func (m *Manager) unregister(c *call) {
 	m.wg.Done()
 }
 
+// phoneNumberRE is what a caller or called number may look like: it goes into
+// Dograh's call history and the agent's prompt ({{caller_number}}), and it
+// arrives from the dialplan, i.e. from the caller's SIP headers.
+var phoneNumberRE = regexp.MustCompile(`^\+?[0-9*#]{1,32}$`)
+
+// phoneNumber returns n if it looks like a phone number, else "".
+func phoneNumber(n string) string {
+	if phoneNumberRE.MatchString(n) {
+		return n
+	}
+
+	return ""
+}
+
 // earshotMeta is the dialplan's EARSHOT_META, which earshot forwards as the
 // X-Earshot-Meta header: {"from":"${caller_id_number}","to":"${destination_number}"}.
 type earshotMeta struct {
@@ -307,15 +345,17 @@ func (m *Manager) runCall(c *call, ws *websocket.Conn, h http.Header) {
 
 	var meta earshotMeta
 	_ = json.Unmarshal([]byte(h.Get("X-Earshot-Meta")), &meta)
+	from, to := phoneNumber(meta.From), phoneNumber(meta.To)
 
 	slog.Info("call started", "call_id", c.id, "sip_call_id", h.Get("X-Call-ID"),
-		"caller_number", meta.From, "called_number", meta.To, "app_mode", m.cfg.AppMode,
+		"caller_number", from, "called_number", to, "app_mode", m.cfg.AppMode,
 		"component", "telephony", "event", "call.started")
 
-	var handler media.Handler = media.LoopbackHandler{}
-	if m.cfg.TestSilentHandler {
-		handler = media.SilentHandler{}
-	}
+	// The agent (APP_MODE=agent) runs on the call's context: it stops when
+	// the call ends. nil = loopback. Transfer is F3 (docs/FREESWITCH.md):
+	// until then the agent tells the caller it isn't available.
+	handler := m.agents.Handler(c.ctx, callagent.Call{ID: c.id, CallerNumber: from, CalledNumber: to},
+		callagent.Hooks{Hangup: func() { m.hangup(c.id) }})
 
 	asm, stats := media.NewEarshotCallMedia(c.id, ws, metrics.AudioSocketSink{}, media.AudioSocketConfig{
 		Handler:          handler,

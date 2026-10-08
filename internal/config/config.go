@@ -285,12 +285,6 @@ func Load() (Config, error) {
 			return Config{}, fmt.Errorf("config: ESL_PASSWORD must be set when TELEPHONY=freeswitch (event_socket.conf.xml's password)")
 		}
 
-		// ponytail: F1 is loopback only; agent calls on FreeSWITCH are F2
-		// (docs/FREESWITCH.md section 7).
-		if cfg.AppMode != "loopback" {
-			return Config{}, fmt.Errorf("config: TELEPHONY=freeswitch supports only APP_MODE=loopback so far")
-		}
-
 		if cfg.EarshotAuthToken == "" {
 			slog.Warn("EARSHOT_AUTH_TOKEN not set; anyone who can reach EARSHOT_LISTEN_ADDR can start a call")
 		}

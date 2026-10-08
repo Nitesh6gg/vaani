@@ -88,7 +88,7 @@ What a healthy call logs at its start:
 
 ## FreeSWITCH instead of Asterisk (`TELEPHONY=freeswitch`)
 
-Loopback only so far (milestone F1); design in `docs/FREESWITCH.md`.
+Agent and loopback calls (`APP_MODE` as with Asterisk); call transfer isn't supported yet (the agent tells the caller so). Design in `docs/FREESWITCH.md`.
 
 1. FreeSWITCH 1.11 from SignalWire's apt repo (needs a free SignalWire
    personal access token), plus the build tools for mod_earshot:
@@ -119,6 +119,7 @@ Loopback only so far (milestone F1); design in `docs/FREESWITCH.md`.
        <condition field="destination_number" expression="^(7000)$">
          <action application="set" data="EARSHOT_NO_RECONNECT=true"/>
          <action application="set" data="EARSHOT_META={&quot;from&quot;:&quot;${caller_id_number}&quot;,&quot;to&quot;:&quot;${destination_number}&quot;}"/>
+         <action application="sched_hangup" data="+600"/>
          <action application="answer"/>
          <action application="earshot" data="start ws://127.0.0.1:9095/call proto=native codec=l16 rate=16000"/>
          <action application="playback" data="silence_stream://-1"/>
@@ -128,10 +129,14 @@ Loopback only so far (milestone F1); design in `docs/FREESWITCH.md`.
    ```
 
    Add ` auth=<EARSHOT_AUTH_TOKEN>` to the `earshot start` line when Vaani
-   listens beyond localhost.
+   listens beyond localhost. `sched_hangup +600` ends the call if Vaani is
+   down (earshot can't connect and nothing else would); keep it above your
+   workflows' maximum call length. When Vaani is up but earshot fails to
+   connect, Vaani hangs that channel up itself.
 5. Vaani's `.env`: `TELEPHONY=freeswitch`, `ESL_PASSWORD=<event socket
    password>`, and `EARSHOT_LISTEN_ADDR=127.0.0.1:9095` when FreeSWITCH is on
-   the same box. ARI and `MEDIA_*` settings are ignored.
+   the same box. ARI and `MEDIA_*` settings are ignored; the Dograh and agent
+   settings ("Agent mode" above) apply as they do with Asterisk.
 
 A healthy start logs `connected to FreeSWITCH event socket` and
 `listening for earshot`; each call logs `call.started` and `call.ended`

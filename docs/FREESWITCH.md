@@ -1,6 +1,6 @@
 # FreeSWITCH support — Phase 1 research and design
 
-Status: **F1 code done (loopback), awaiting the lab call** — see section 7.
+Status: **F1 done (lab-verified); F2 code done (agent calls), awaiting its lab call** — see section 7.
 Each fact below is marked **[source]** (read in mod_earshot `c5847cc` or
 FreeSWITCH `v1.10.12`/`v1.11.3` source) or **[lab]** (a design assumption
 still to prove on a real call).
@@ -29,7 +29,7 @@ FreeSWITCH).
                        ├── mod_earshot ══ WebSocket (one per call) ══►  Vaani :9095
                        │     caller audio  → binary L16 16 kHz frames      (media)
                        │     agent audio   ← binary L16 16 kHz frames
-                       │     barge-in      ← {"type":"clear"}
+                       │     (barge-in: Vaani stops sending; see step 5)
                        │
                        └── mod_event_socket :8021 ◄══ TCP (ONE per Vaani) ══ Vaani
                              events → CHANNEL_ANSWER, CHANNEL_HANGUP, ...
@@ -142,6 +142,7 @@ Dialplan (on FreeSWITCH):
   <condition field="destination_number" expression="^(1001)$">
     <action application="set" data="EARSHOT_NO_RECONNECT=true"/>
     <action application="set" data="EARSHOT_META={&quot;from&quot;:&quot;${caller_id_number}&quot;,&quot;to&quot;:&quot;${destination_number}&quot;}"/>
+    <action application="sched_hangup" data="+600"/>
     <action application="answer"/>
     <action application="earshot" data="start ws://VAANI_IP:9095/call proto=native codec=l16 rate=16000"/>
     <action application="playback" data="silence_stream://-1"/>
@@ -149,11 +150,18 @@ Dialplan (on FreeSWITCH):
 </extension>
 ```
 
+`sched_hangup +600` is the switch's own cap (default cause
+`ALLOTTED_TIMEOUT`; mod_dptools v1.11.3): if Vaani is down, earshot can't
+connect and nothing else would ever end the call. Keep it above your
+workflows' maximum call length. **[F3]** it also applies after a transfer, so
+the transfer must cancel it.
+
 1. Caller dials 1001; FreeSWITCH answers and Earshot opens
    `ws://VAANI_IP:9095/call`.
 2. Vaani accepts. `call_id` = `X-Channel-UUID`; caller/called number from
-   `X-Earshot-Meta` (validated — digits/`+` only, as today). The SIP Call-ID
-   is logged too.
+   `X-Earshot-Meta`, validated (`+`, digits, `*`, `#`, at most 32; anything
+   else becomes empty) since it goes into Dograh and the agent's prompt. The
+   SIP Call-ID is logged too.
 3. Vaani loads the Dograh workflow and starts the same agent Handler used for
    Asterisk calls. The media pipeline is the AudioSocket one with WebSocket
    framing: reader goroutine (re-frame to 640 B) → 20 ms release tick →
@@ -163,8 +171,10 @@ Dialplan (on FreeSWITCH):
    sending; if we dumped whole sentences into Earshot's 2 MB buffer, a
    "pause" would be impossible to do and a cut would depend on `clear`
    alone.
-5. Barge-in confirmed → the 5 cuts as today **plus** `{"type":"clear"}` to
-   drop the frame or two already queued in Earshot.
+5. Barge-in confirmed → the 5 cuts as today, nothing more. **No
+   `{"type":"clear"}`**: the F1 lab measured Earshot's play buffer at one
+   20 ms frame throughout (Vaani paces), so the most a cut can leak is 20 ms.
+   If an F2 call ever shows more, `clear` is a ~10-line add.
 6. Agent ends the call → ESL `api uuid_kill <uuid> NORMAL_CLEARING`.
 7. Caller hangs up → ESL `CHANNEL_HANGUP` (with `Hangup-Cause`) and
    the WebSocket closes → same teardown path as today (once-guaranteed),
@@ -190,11 +200,28 @@ string, e.g. `sofia/gateway/<gw>/<number>` or `user/1002`):
 | Clock drift: Vaani's 20 ms ticker vs FreeSWITCH's write clock (`earshot <uuid> status` → `play_buffered`) | if Vaani runs fast, Earshot's buffer slowly grows = growing delay | **None seen**: `play_buffered` 320 B (one 8 kHz frame) at 30/60/90/120 s; `rx_frames` +1,500 per 30 s = exactly 50/s. Re-check on a 10-min call. |
 | How the call ends on hangup | clean teardown | Earshot drops the socket **without a close frame (1006)**. `CHANNEL_HANGUP_COMPLETE` came **5.4 s later** (it waits for the channel's cleanup), so Vaani listens for `CHANNEL_HANGUP` instead, which fires as the hangup starts (`switch_channel_perform_hangup`, cause already set), and a closed socket waits up to 1 s for it. |
 | `uuid_bridge` while the dialplan runs `silence_stream` | transfer | open (F3) |
-| Audio quality: 8 kHz G.711 caller → 16 kHz resample → Sarvam STT | STT accuracy vs Asterisk path | open (F2; needs a real phone) |
+| Audio quality: 8 kHz G.711 caller → 16 kHz resample → Sarvam STT | STT accuracy vs Asterisk path | open (F2 lab; needs a real phone) |
 
 Lab setup (2026-10-07, FreeSWITCH 1.11.3, earshot `c5847cc`): Vaani
 `TELEPHONY=freeswitch APP_MODE=loopback`; test call placed from the switch
 itself — `originate loopback/7000/default &playback(tone_stream://L=65;%(1000,0,440))`.
+
+F2 lab (same day, `APP_MODE=agent`, Dograh workflow 19: Sarvam saaras:v4
+hi-IN, bulbul:v3, LLM via Bifrost). The test caller is a loopback channel
+running `sleep:20000,playback:ivr-hello.wav,sleep:12000,playback:ivr-yes_we_have_no_bananas.wav,sleep:15000,hangup inline`:
+
+- Workflow loaded, Dograh run created, agent greeted (LLM TTFT 146-374 ms,
+  TTS first audio 524-607 ms), call ended `hangup: NORMAL_CLEARING`, run
+  completed with the recording uploaded to MinIO.
+- The caller's "Hello" was transcribed and ignored (`why=agent_speaking`:
+  it overlapped the greeting and the start node has interruption off);
+  "Yes, we have no bananas" became a caller turn and the agent answered it.
+  So caller audio reaches the STT over earshot.
+- Refused connection (Vaani with an `EARSHOT_AUTH_TOKEN` the dialplan
+  doesn't send): `earshot.unauthorized`, then `earshot::error` →
+  `uuid_kill` 10 ms later; no channel left.
+- Not yet covered: barge-in on a node that allows interruption, the agent's
+  own hangup (end_call), and real phone audio (G.711 → 16 kHz → STT).
 
 ## 6. Code
 
@@ -202,7 +229,6 @@ Done in F1:
 
 - `internal/config`: `TELEPHONY` (`asterisk` default), `ESL_ADDR`,
   `ESL_PASSWORD`, `EARSHOT_LISTEN_ADDR` (`:9095`), `EARSHOT_AUTH_TOKEN`.
-  `TELEPHONY=freeswitch` accepts only `APP_MODE=loopback` until F2.
 - `internal/esl/`: inbound ESL client (auth, api, bgapi, ordered events).
 - `internal/media/earshot.go`: the earshot wire for the existing framed-call
   pipeline (same pacer, pool, Handler, recorder, watchdog as AudioSocket):
@@ -215,20 +241,30 @@ Done in F1:
   `uuid_kill`. Lab logging: `call.ended` carries earshot message counts, odd
   sizes and close code; `earshot.status` logs `play_buffered` every 30 s.
 
+Done in F2:
+
+- `internal/callagent/`: the agent-building code moved out of
+  `internal/ari/handlers.go` unchanged (workflow load, STT/TTS with retry,
+  barge-in detector, Dograh run + MinIO, `call.summary`); a diff of the moved
+  code against the original, after the receiver/field renames, shows only
+  the hangup/transfer hooks and the plain `Call` value. Both call managers
+  use it; the ARI tests pass unchanged.
+- FreeSWITCH agent calls: `APP_MODE=agent` works with `TELEPHONY=freeswitch`;
+  the agent's hangup is `uuid_kill`; a workflow that won't load hangs up (as
+  on Asterisk); shutdown waits for the calls' Dograh runs. Transfer: the
+  agent says it isn't available (F3).
+- The F1 gap (caller left in silence when earshot can't reach Vaani):
+  `earshot::error` (connect/handshake failure, carries the channel's
+  Unique-ID) → Vaani `uuid_kill`s that channel unless it's a live call. Not
+  `earshot::disconnected`: that's also a normal end, and F3's transfer stops
+  the stream on purpose. When Vaani is down altogether, the dialplan's
+  `sched_hangup` ends the call. Assumes every earshot stream on the switch
+  points at Vaani.
+
 Still to do:
 
-- F2: move the telephony-neutral parts of `internal/ari/handlers.go`
-  (`loadWorkflow`, `newAgentHandler`, `recordRun`, `logCallSummary`, barge-in
-  detector) into a shared package so both call managers use them; send
-  `{"type":"clear"}` on a confirmed barge-in.
 - F3: transfer (section 4).
-- **Open gap (found in the F1 lab):** if Vaani is down when a call arrives,
-  earshot logs "ws closed: Unable to connect" and gives up
-  (`EARSHOT_NO_RECONNECT`), but the dialplan's `silence_stream://-1` keeps
-  the caller in silence **forever**. Fix in F2: Vaani subscribes to
-  `CUSTOM earshot::error earshot::disconnected` and `uuid_kill`s any channel
-  that isn't one of its live calls, plus a FreeSWITCH-side cap
-  (`sched_hangup`) so a call still ends when Vaani is down altogether.
+
 ## 7. Milestones
 
 - **F1 — lab proof:** FreeSWITCH 1.11 + Earshot installed; Vaani

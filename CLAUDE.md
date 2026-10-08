@@ -28,8 +28,10 @@ Real-time voice agent: Asterisk ARI (telephony) + Go media plane + Sarvam STT/TT
   `{{variable}}` rendering, tools (incl. `http_api`), models/keys, call limits;
   writes each call's `workflow_runs` record (`run.go`) and uploads its
   recording/transcript to Dograh's MinIO (`storage.go`)
-- `internal/freeswitch/` — FreeSWITCH calls (`TELEPHONY=freeswitch`,
-  loopback so far; `docs/FREESWITCH.md`): mod_earshot WebSocket per call
+- `internal/callagent/` — builds a call's Dograh agent and records the call
+  in Dograh; shared by the ARI and FreeSWITCH call managers
+- `internal/freeswitch/` — FreeSWITCH calls (`TELEPHONY=freeswitch`, no
+  transfer yet; `docs/FREESWITCH.md`): mod_earshot WebSocket per call
   (`internal/media/earshot.go`), control over the Event Socket;
   `internal/esl/` — the ESL client: ordered events, one command at a time
 - `internal/session/` — per-call state machine, barge-in orchestration

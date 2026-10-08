@@ -429,6 +429,7 @@ func componentFromFunction(fn string) string {
 		{"/internal/ai/stt", "stt"},
 		{"/internal/ai/tts", "tts"},
 		{"/internal/ari", "ari"},
+		{"/internal/callagent", "agent"},
 		{"/internal/freeswitch", "freeswitch"},
 		{"/internal/esl", "freeswitch"},
 		{"/internal/media", "media"},

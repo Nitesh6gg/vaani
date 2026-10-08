@@ -19,6 +19,7 @@ import (
 	"github.com/CyCoreSystems/ari/v5"
 
 	vaaniari "github.com/nitesh/vaani/internal/ari"
+	"github.com/nitesh/vaani/internal/callagent"
 	"github.com/nitesh/vaani/internal/config"
 	"github.com/nitesh/vaani/internal/dograh"
 	"github.com/nitesh/vaani/internal/freeswitch"
@@ -86,28 +87,12 @@ func run() error {
 
 	slog.Info("connected to ARI", "event", "ari.connected")
 
-	// Dograh's database holds the workflow the agent runs. Failing to reach it
-	// is fatal at startup rather than failing every call.
-	var store *dograh.Store
-
-	if cfg.DograhDBURL != "" {
-		pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		store, err = dograh.Open(pingCtx, cfg.DograhDBURL)
-		cancel()
-
-		if err != nil {
-			return err
-		}
-		defer store.Close()
-
-		slog.Info("connected to dograh database", "workflow_id", cfg.DograhWorkflowID, "event", "db.connected")
+	store, storage, err := openDograh(ctx, cfg)
+	if err != nil {
+		return err
 	}
-
-	// Dograh's MinIO, for call recordings and transcripts; nil = no uploads.
-	var storage *dograh.Storage
-	if cfg.MinioEndpoint != "" {
-		storage = &dograh.Storage{Endpoint: cfg.MinioEndpoint, AccessKey: cfg.MinioAccessKey,
-			SecretKey: cfg.MinioSecretKey, Bucket: cfg.MinioBucket, Secure: cfg.MinioSecure}
+	if store != nil {
+		defer store.Close()
 	}
 
 	ports := media.NewPortAllocator(cfg.MediaPortBase, cfg.MediaPortCount)
@@ -152,7 +137,15 @@ func run() error {
 // runFreeSWITCH serves TELEPHONY=freeswitch (docs/FREESWITCH.md): calls arrive
 // as mod_earshot WebSockets, control goes over the Event Socket.
 func runFreeSWITCH(ctx context.Context, cfg config.Config) error {
-	mgr := freeswitch.New(cfg)
+	store, storage, err := openDograh(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	if store != nil {
+		defer store.Close()
+	}
+
+	mgr := freeswitch.New(cfg, callagent.New(cfg, store, storage))
 
 	go func() {
 		if err := metrics.Serve(ctx, cfg.MetricsAddr, cfg.DebugAudio, mgr.Connected); err != nil {
@@ -170,4 +163,34 @@ func runFreeSWITCH(ctx context.Context, cfg config.Config) error {
 	slog.Info("shutdown complete")
 
 	return nil
+}
+
+// openDograh connects to Dograh's database (the workflow the agent runs; nil
+// without DOGRAH_DB_URL) and describes its MinIO (call recordings and
+// transcripts; nil = no uploads). An unreachable database is fatal at startup
+// rather than failing every call.
+func openDograh(ctx context.Context, cfg config.Config) (*dograh.Store, *dograh.Storage, error) {
+	var store *dograh.Store
+
+	if cfg.DograhDBURL != "" {
+		pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		s, err := dograh.Open(pingCtx, cfg.DograhDBURL)
+		cancel()
+
+		if err != nil {
+			return nil, nil, err
+		}
+
+		store = s
+
+		slog.Info("connected to dograh database", "workflow_id", cfg.DograhWorkflowID, "event", "db.connected")
+	}
+
+	var storage *dograh.Storage
+	if cfg.MinioEndpoint != "" {
+		storage = &dograh.Storage{Endpoint: cfg.MinioEndpoint, AccessKey: cfg.MinioAccessKey,
+			SecretKey: cfg.MinioSecretKey, Bucket: cfg.MinioBucket, Secure: cfg.MinioSecure}
+	}
+
+	return store, storage, nil
 }
