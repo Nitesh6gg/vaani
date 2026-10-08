@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"sort"
 	"sync"
 	"time"
 )
@@ -192,8 +193,11 @@ func (l *CallLog) NodeEntered(n *Node) {
 	l.visited = append(l.visited, n.Name)
 }
 
-// UserSaid: a caller transcript became a turn ([User]).
-func (l *CallLog) UserSaid(text string) {
+// UserSaid: a caller transcript became a turn ([User]). started is when the
+// caller began saying it -- the time Dograh's transcript shows (pipecat's
+// UserTurnStoppedMessage.timestamp, "when the user turn started"); the
+// event's own timestamp stays when it was logged. Zero means now.
+func (l *CallLog) UserSaid(text string, started time.Time) {
 	if l == nil {
 		return
 	}
@@ -203,12 +207,13 @@ func (l *CallLog) UserSaid(text string) {
 
 	l.turn++
 	l.userSpoke = l.userSpoke || text != ""
-	l.add(eventUserTranscription, map[string]any{"text": text, "final": true,
-		"timestamp": time.Now().UTC().Format(payloadTimeFormat)})
+	l.add(eventUserTranscription, map[string]any{"text": text, "final": true, "timestamp": turnTime(started)})
 }
 
-// AgentSaid: what the caller heard of one reply ([Agent]).
-func (l *CallLog) AgentSaid(text string) {
+// AgentSaid: what the caller heard of one reply ([Agent]). started is when
+// the reply began (pipecat's AssistantTurnStoppedMessage.timestamp: the LLM
+// response's start), as Dograh's transcript shows it. Zero means now.
+func (l *CallLog) AgentSaid(text string, started time.Time) {
 	if l == nil {
 		return
 	}
@@ -216,7 +221,32 @@ func (l *CallLog) AgentSaid(text string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	l.add(eventBotText, map[string]any{"text": text, "timestamp": time.Now().UTC().Format(payloadTimeFormat)})
+	l.add(eventBotText, map[string]any{"text": text, "timestamp": turnTime(started)})
+}
+
+// turnTime formats a turn's start for its payload (now if unknown).
+func turnTime(started time.Time) string {
+	if started.IsZero() {
+		started = time.Now()
+	}
+
+	return started.UTC().Format(payloadTimeFormat)
+}
+
+// sortKey is Dograh's _event_sort_key: the payload's (turn) timestamp, else
+// the event's own. Compared as times at the millisecond -- the turn stamps'
+// precision -- rather than as strings as Python does: within one millisecond
+// Python's string order puts the millisecond stamps first, this keeps the
+// order events were logged in.
+func sortKey(e LogEvent) time.Time {
+	ts, _ := e.Payload["timestamp"].(string)
+	if ts == "" {
+		ts = e.Timestamp
+	}
+
+	t, _ := time.Parse(time.RFC3339Nano, ts)
+
+	return t.Truncate(time.Millisecond)
 }
 
 // FunctionStarted / FunctionEnded: the LLM called a tool or took an edge
@@ -291,7 +321,7 @@ func (l *CallLog) Summary() CallSummary {
 	defer l.mu.Unlock()
 
 	s := CallSummary{
-		Events:        append([]LogEvent(nil), l.events...),
+		Events:        sortedEvents(l.events),
 		NodesVisited:  append([]string(nil), l.visited...),
 		EndReason:     l.reason,
 		UserSpoke:     l.userSpoke,
@@ -317,4 +347,15 @@ func (l *CallLog) Summary() CallSummary {
 	}
 
 	return s
+}
+
+// sortedEvents is Dograh's _sorted_events (what it stores, and what its
+// transcript is built from): a stable sort by sortKey, so a turn sits where
+// it started -- an interrupted reply before the caller who cut in -- and
+// events sharing a time keep the order they were logged in.
+func sortedEvents(events []LogEvent) []LogEvent {
+	out := append([]LogEvent(nil), events...)
+	sort.SliceStable(out, func(i, j int) bool { return sortKey(out[i]).Before(sortKey(out[j])) })
+
+	return out
 }

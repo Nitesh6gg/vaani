@@ -221,6 +221,12 @@ type genDuration struct {
 	d   time.Duration
 }
 
+// genTime is a moment within one generation.
+type genTime struct {
+	gen uint64
+	t   time.Time
+}
+
 // Handler implements media.Handler: Sarvam STT -> LLM -> Sarvam TTS with local
 // barge-in detection. See docs/AUDIO_PIPELINE.md's Handler Contract and
 // docs/AI_PROVIDERS.md.
@@ -404,6 +410,10 @@ type Handler struct {
 	// ttft is the LLM's time to first token for a generation, written by the
 	// turn goroutine and read by run() for the turn.agent line.
 	ttft atomic.Pointer[genDuration]
+	// replyStart is when the LLM response that first produced spoken text
+	// for a generation began -- Dograh's time for that reply's transcript
+	// line (pipecat: LLMFullResponseStartFrame). Same writer/reader as ttft.
+	replyStart atomic.Pointer[genTime]
 
 	// Caller-silence clock (Config.IdleTimeout), mirroring pipecat's
 	// UserIdleController: armed each time the agent finishes speaking,
@@ -1140,7 +1150,7 @@ func (h *Handler) handleFinalTranscript(text string) {
 	}
 
 	h.history = append(h.history, llm.Message{Role: "user", Content: text})
-	h.cfg.Log.UserSaid(text)
+	h.cfg.Log.UserSaid(text, h.utteranceStart())
 	h.turn++
 
 	// One line per caller turn: what they said and how long the STT took
@@ -1169,6 +1179,27 @@ func (h *Handler) handleFinalTranscript(text string) {
 	h.startTurn()
 	h.turnSpeechEndAt, h.turnLastSoundAt = speechEnd, lastSound
 }
+
+// utteranceStart is when the caller began the utterance just transcribed:
+// the STT's own speech start (sttUttStart), or zero -- "now" -- if there's
+// none, or only a stale one from long before (the STT never signalled this
+// utterance). Dograh's transcript times a caller turn by its start.
+func (h *Handler) utteranceStart() time.Time {
+	ns := h.sttUttStart.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+
+	if t := time.Unix(0, ns); time.Since(t) < maxUtteranceAge {
+		return t
+	}
+
+	return time.Time{}
+}
+
+// maxUtteranceAge: an STT speech start older than this belongs to an earlier
+// utterance, not the one just transcribed.
+const maxUtteranceAge = time.Minute
 
 // junkTranscript: no digit and fewer than two letters/vowel signs -- a lone
 // letter like "ह" or "म", or punctuation only. Deliberately narrow: real
@@ -1265,10 +1296,13 @@ func (h *Handler) runLLMTurn(ctx context.Context, history []llm.Message, ttsClie
 			msgs = plainHistory(msgs)
 		}
 
+		roundStart := time.Now()
+
 		calls, err = h.cfg.LLM.Stream(ctx, msgs, tools, func(tok string) {
 			if firstTokenAt.IsZero() {
 				firstTokenAt = time.Now()
 				h.ttft.Store(&genDuration{gen: gen, d: firstTokenAt.Sub(turnStartedAt)})
+				h.replyStart.Store(&genTime{gen: gen, t: roundStart})
 				slog.Debug("llm first token", "call_id", h.callID, "gen", gen, "event", "llm.first_token",
 					"latency_ms", firstTokenAt.Sub(turnStartedAt).Milliseconds())
 			}
@@ -2005,7 +2039,14 @@ func (h *Handler) recordReply(cut bool) {
 	}
 
 	slog.Info("agent turn", args...)
-	h.cfg.Log.AgentSaid(text)
+	// Timed by the LLM response that started the speaking (a round that only
+	// called tools has no line in Dograh); a greeting, by its turn's start.
+	started := h.turnStartedAt
+	if p := h.replyStart.Load(); p != nil && p.gen == h.curGen {
+		started = p.t
+	}
+
+	h.cfg.Log.AgentSaid(text, started)
 }
 
 // startTurnChunks resets reply tracking at the start of a new turn.

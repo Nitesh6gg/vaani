@@ -274,6 +274,9 @@ type fakeLLM struct {
 type fakeRound struct {
 	tokens    []string
 	toolCalls []llm.ToolCall
+	// firstTokenDelay, like a real model's, separates the response's start
+	// from what happens after it (needed where the log's times are compared).
+	firstTokenDelay time.Duration
 }
 
 func (f *fakeLLM) Stream(ctx context.Context, msgs []llm.Message, tools []llm.Tool, onToken func(string)) ([]llm.ToolCall, error) {
@@ -292,6 +295,8 @@ func (f *fakeLLM) Stream(ctx context.Context, msgs []llm.Message, tools []llm.To
 
 		round = f.rounds[n]
 	}
+
+	time.Sleep(round.firstTokenDelay)
 
 	for _, tok := range round.tokens {
 		select {
@@ -1139,7 +1144,8 @@ func TestHandler_EndCallHangsUpAfterGoodbyePlays(t *testing.T) {
 	fTTS := newFakeTTS()
 
 	call := llm.ToolCall{ID: "e1", Type: "function", Function: llm.FunctionCall{Name: "end_call", Arguments: "{}"}}
-	fLLM := &fakeLLM{rounds: []fakeRound{{tokens: []string{"Goodbye."}, toolCalls: []llm.ToolCall{call}}}}
+	fLLM := &fakeLLM{rounds: []fakeRound{{tokens: []string{"Goodbye."}, toolCalls: []llm.ToolCall{call},
+		firstTokenDelay: 5 * time.Millisecond}}}
 
 	var hangups atomic.Int32
 
@@ -1178,12 +1184,15 @@ func TestHandler_EndCallHangsUpAfterGoodbyePlays(t *testing.T) {
 		types = append(types, fmt.Sprintf("%s %v %v", e.Type, e.Payload["text"], e.Payload["function_name"]))
 	}
 
+	// As Dograh orders them: "Goodbye." came in the same LLM response as the
+	// end_call, so its line is timed by that response's start -- before the
+	// function call it made -- though it's logged once it has played.
 	assert.Equal(t, []string{
 		"rtf-node-transition <nil> <nil>",
 		"rtf-user-transcription bye <nil>",
+		"rtf-bot-text Goodbye. <nil>",
 		"rtf-function-call-start <nil> end_call",
 		"rtf-function-call-end <nil> end_call",
-		"rtf-bot-text Goodbye. <nil>",
 	}, types)
 }
 

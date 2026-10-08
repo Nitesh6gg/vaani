@@ -22,7 +22,7 @@ Real-time voice agent: Asterisk ARI (telephony) + Go media plane + Sarvam STT/TT
   barge-in, playout queue); `internal/ai/agent/tenvad/` — TEN VAD cgo wrapper
   (Linux only; native library vendored under `third_party/ten-vad/`);
   `workflow.go` — workflow nodes/edges; `tools.go` — tool kinds;
-  `calllog.go` — the call's events for Dograh's call history;
+  `calllog.go` — the call's events for Dograh's call history (turn lines timed by their start, sorted as Dograh does; see "Call history in Dograh" in `docs/ARCHITECTURE.md`);
   `extract.go` — Dograh's variable extraction
 - `internal/dograh/` — Dograh's Postgres: reads the workflow graph,
   `{{variable}}` rendering, tools (incl. `http_api`), models/keys, call limits;

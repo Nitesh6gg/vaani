@@ -296,6 +296,29 @@ call: failures are logged (`dograh run: ...`) and the call carries on.
     transition speech and tool messages included, as one entry);
   - `rtf-function-call-start` / `-end` for every function the LLM calls,
     tools and edges alike (Dograh registers both as functions).
+
+  **Times, as Dograh's:** each event's own `timestamp` is when it was logged
+  (UTC, microseconds); a caller or agent line also carries a
+  `payload.timestamp` (UTC, milliseconds) -- the time its transcript line
+  shows -- which is when that turn **started**, not when it was logged:
+  pipecat's `UserTurnStoppedMessage` / `AssistantTurnStoppedMessage`
+  timestamps, "when the turn started". For a caller line, when the STT
+  signalled the utterance began (`sttUttStart`; "now" if it never did); for
+  an agent line, when the LLM response that first produced its spoken text
+  began (pipecat's `LLMFullResponseStartFrame`; a greeting, its turn's
+  start). Seen on Dograh's own run 484: a caller line stamped 4.7 s and an
+  agent line 9.7 s before they were logged. Vaani used to stamp both at the
+  end, so its lines sat 1-10 s late on Dograh's run page.
+
+  **Order, as Dograh's** (`InMemoryLogsBuffer._sorted_events`): the events
+  are stored, and the transcript built, sorted by `payload.timestamp` (else
+  the event's own), stably -- so a reply cut by the caller sits before the
+  caller's words, and a goodbye said in the same LLM response as its
+  `end_call` sits before that function call. Compared as times at the
+  millisecond, not as strings as Python does: within one millisecond events
+  keep the order they were logged in. One difference remains: Dograh writes
+  one agent line per LLM response, Vaani one per turn (text before and after
+  a tool call is one line, timed by the first).
 - **When the agent leaves the call** (hangup, or a transfer handing the
   caller over), as Dograh's `on_pipeline_finished` and its completion job:
   - **How it ended** (`call_disposition`), whichever of these happened
@@ -324,7 +347,8 @@ call: failures are logged (`dograh run: ...`) and the call carries on.
     mono), capped at 100MB (~54 minutes; past it the rest is missing,
     logged and counted in `vaani_recording_truncated_total`); the
     transcript is Dograh's text format, `[timestamp] User: ...` /
-    `[timestamp] Agent: ...`, one line per event above.
+    `[timestamp] Agent: ...`, one line per event above, in that order, with
+    the turn's start time (`payload.timestamp`).
   - Log: `dograh run completed run_id=... disposition=... variables=N`.
 - **Time budgets:** creating the run is tried twice, 10s each. Completing it
   comes first and gets its own 10s; each upload 20s, the file update 10s --
