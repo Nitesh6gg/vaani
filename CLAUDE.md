@@ -69,6 +69,9 @@ Real-time voice agent: Asterisk ARI (telephony) + Go media plane + Sarvam STT/TT
    Dograh) — never only while listening, which clipped the first syllable of
    answers given over the agent; transcripts are filtered, not audio. A pause is not a cut — don't cancel anything
    before confirmation.
+   FreeSWITCH (earshot) differs in two ways: the pause also sends earshot's
+   `{"type":"clear"}` (drops audio queued there, not a cut), and the write tick
+   sends earshot no filler silence (it would only queue there); see `docs/FREESWITCH.md`.
 8. **Audio format**: slin16 (16kHz 16-bit mono PCM) end-to-end. Asterisk handles μ-law transcoding.
 9. **One media socket per call**, bound to a port from the managed pool (never shared
    across calls), and bound/listening *before* the externalMedia channel is created —

@@ -91,6 +91,58 @@ func conversationText(history []llm.Message) string {
 	return strings.Join(lines, "\n")
 }
 
+// plainHistory rewrites a request's messages for a node that offers no tools
+// (an End Call node, typically): Sarvam rejects tool calls or results in the
+// history then -- 400 "Tool messages found but no tools provided" -- which
+// left a live call without its goodbye (2026-10-08, sarvam-105b-conversations;
+// gemma4 via vLLM accepts them). Tool calls are dropped, results kept as text
+// the way Dograh renders them ("[Tool Response: name]", edge transitions'
+// {"status":"done"} dropped), and what that leaves as adjacent assistant
+// messages is joined into one. Only the request changes, never the history.
+func plainHistory(msgs []llm.Message) []llm.Message {
+	names := map[string]string{}
+
+	for _, m := range msgs {
+		for _, c := range m.ToolCalls {
+			names[c.ID] = c.Function.Name
+		}
+	}
+
+	out := make([]llm.Message, 0, len(msgs))
+	add := func(role, text string) {
+		if text == "" {
+			return
+		}
+
+		if n := len(out); n > 0 && role == "assistant" && out[n-1].Role == "assistant" {
+			out[n-1].Content += "\n\n" + text
+			return
+		}
+
+		out = append(out, llm.Message{Role: role, Content: text})
+	}
+
+	for _, m := range msgs {
+		switch m.Role {
+		case "tool":
+			name, ok := names[m.ToolCallID]
+			if !ok {
+				name = "unknown"
+			}
+
+			if text, keep := toolResponseText(m.Content); keep {
+				add("assistant", "[Tool Response: "+name+"]\n"+text)
+			}
+		case "assistant":
+			add("assistant", m.Content) // its ToolCalls, if any, are dropped
+		default:
+			out = append(out, llm.Message{Role: m.Role, Content: m.Content})
+		}
+	}
+
+	return out
+}
+
 // toolResponseText is Dograh's _format_tool_response: a JSON object's "data"
 // if it has one (an http_api tool's reply), else the object without its
 // status/status_code; anything else as-is; cut at 2000 characters. keep is

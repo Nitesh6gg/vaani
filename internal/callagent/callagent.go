@@ -86,7 +86,19 @@ type Hooks struct {
 	// caller over (see agent.Config.Transfer); nil = the switch can't
 	// transfer, and the agent tells the caller so.
 	Transfer func(ctx context.Context, destination string, timeout time.Duration) (connect func() error, err error)
+	// Interrupted, if set, is called when the caller starts talking over the
+	// agent and its reply pauses (agent.Sink.InterruptionPaused), on the
+	// agent's own goroutine: it must not block.
+	Interrupted func()
 }
+
+// interruptSink calls Hooks.Interrupted when a reply pauses for the caller.
+type interruptSink struct {
+	agent.NoopSink
+	fn func()
+}
+
+func (s interruptSink) InterruptionPaused() { s.fn() }
 
 // Handler builds call c's media Handler: the Dograh agent when APP_MODE=agent
 // (nil -- the transport's loopback -- otherwise). ctx scopes the agent: it
@@ -211,6 +223,16 @@ func toolNames(n *agent.Node) []string {
 	return names
 }
 
+// sinks is where the agent's events go: metrics, the call's own log, and the
+// switch's Interrupted hook if it has one.
+func sinks(callLog *agent.CallLog, hooks Hooks) agent.Sink {
+	if hooks.Interrupted == nil {
+		return agent.Sinks(metrics.AgentSink{}, callLog)
+	}
+
+	return agent.Sinks(metrics.AgentSink{}, callLog, interruptSink{fn: hooks.Interrupted})
+}
+
 // newAgentHandler wires internal/ai/{stt,tts,llm,agent} together for one
 // call: the models from Dograh (see dograh.Services), barge-in from b.cfg's
 // BARGE_IN_* settings. If the STT connection can't
@@ -286,7 +308,7 @@ func (b *Builder) newAgentHandler(ctx context.Context, c Call, hooks Hooks) medi
 		BargeInMinSpeech:   b.cfg.BargeInMinSpeech,
 		STTFlushAfter:      b.cfg.STTFlushAfter,
 		PostCutSilence:     b.cfg.PostCutSilence,
-		Sink:               agent.Sinks(metrics.AgentSink{}, callLog),
+		Sink:               sinks(callLog, hooks),
 		Log:                callLog,
 	})
 

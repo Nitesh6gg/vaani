@@ -222,3 +222,54 @@ func TestHandler_NoExtractionWithoutSettings(t *testing.T) {
 }
 
 var _ tts.Client = (*fakeTTS)(nil)
+
+// The End Call request of call 2026-10-08 (run 511), which Sarvam rejected
+// with 400 "Tool messages found but no tools provided".
+func TestPlainHistoryHasNoToolMessages(t *testing.T) {
+	call := func(id, name string) llm.Message {
+		return llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: id, Type: "function",
+			Function: llm.FunctionCall{Name: name, Arguments: "{}"}}}}
+	}
+	done := func(id string) llm.Message {
+		return llm.Message{Role: "tool", ToolCallID: id, Content: `{"status":"done"}`}
+	}
+
+	in := []llm.Message{
+		{Role: "system", Content: "End the call politely."},
+		{Role: "assistant", Content: "नमस्ते, आपका नाम?"},
+		{Role: "user", Content: "मेरा नाम नितेश है।"},
+		call("t1", "move_to_main_agenda"), done("t1"),
+		{Role: "assistant", Content: "सबसे बड़ा मुद्दा क्या है?"},
+		{Role: "user", Content: "महंगाई।"},
+		{Role: "assistant", Content: "एक सेकंड, देखती हूँ।", ToolCalls: []llm.ToolCall{{ID: "t2", Type: "function",
+			Function: llm.FunctionCall{Name: "lookup_order", Arguments: "{}"}}}},
+		{Role: "tool", ToolCallID: "t2", Content: `{"status":"success","data":{"order":"A12"}}`},
+		{Role: "assistant", Content: "आपका ऑर्डर मिल गया।"},
+		{Role: "user", Content: "नो मैम, थैंक यू।"},
+		call("t3", "end_call"), done("t3"),
+	}
+
+	out := plainHistory(in)
+
+	for _, m := range out {
+		assert.NotEqual(t, "tool", m.Role)
+		assert.Empty(t, m.ToolCalls)
+		assert.Empty(t, m.ToolCallID)
+	}
+	for i := 1; i < len(out); i++ {
+		assert.False(t, out[i].Role == "assistant" && out[i-1].Role == "assistant", "adjacent assistant messages at %d", i)
+	}
+
+	assert.Equal(t, []llm.Message{
+		{Role: "system", Content: "End the call politely."},
+		{Role: "assistant", Content: "नमस्ते, आपका नाम?"},
+		{Role: "user", Content: "मेरा नाम नितेश है।"},
+		{Role: "assistant", Content: "सबसे बड़ा मुद्दा क्या है?"},
+		{Role: "user", Content: "महंगाई।"},
+		{Role: "assistant", Content: "एक सेकंड, देखती हूँ।\n\n[Tool Response: lookup_order]\n{\"order\":\"A12\"}\n\nआपका ऑर्डर मिल गया।"},
+		{Role: "user", Content: "नो मैम, थैंक यू।"},
+	}, out)
+
+	assert.Len(t, in, 13, "the history itself is never changed")
+	assert.Len(t, in[3].ToolCalls, 1)
+}

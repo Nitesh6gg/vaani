@@ -354,16 +354,35 @@ func (m *Manager) runCall(c *call, ws *websocket.Conn, h http.Header) {
 	// The agent (APP_MODE=agent) runs on the call's context: it stops when
 	// the call ends. nil = loopback. Transfer is F3 (docs/FREESWITCH.md):
 	// until then the agent tells the caller it isn't available.
-	handler := m.agents.Handler(c.ctx, callagent.Call{ID: c.id, CallerNumber: from, CalledNumber: to},
-		callagent.Hooks{Hangup: func() { m.hangup(c.id) }})
+	// earshot is set just below, before the media (and so the agent) runs.
+	var earshot atomic.Pointer[media.Earshot]
 
-	asm, stats := media.NewEarshotCallMedia(c.id, ws, metrics.AudioSocketSink{}, media.AudioSocketConfig{
+	handler := m.agents.Handler(c.ctx, callagent.Call{ID: c.id, CallerNumber: from, CalledNumber: to},
+		callagent.Hooks{
+			Hangup: func() { m.hangup(c.id) },
+			// The caller started talking over the agent: drop the reply audio
+			// earshot still has queued, so the agent goes quiet at once. A
+			// false interruption replays from the sentence's start anyway, so
+			// nothing is lost. Off the agent's goroutine: it's a network write.
+			Interrupted: func() {
+				if e := earshot.Load(); e != nil {
+					go func() {
+						if err := e.Clear(); err != nil {
+							slog.Debug("earshot clear failed", "call_id", c.id, "error", err)
+						}
+					}()
+				}
+			},
+		})
+
+	asm, es := media.NewEarshotCallMedia(c.id, ws, metrics.AudioSocketSink{}, media.AudioSocketConfig{
 		Handler:          handler,
 		RecordDir:        m.cfg.RecordDir,
 		ToWire:           media.LittleEndian, // earshot's L16 is host order: LE on x86-64/ARM64
 		DebugAudio:       m.cfg.DebugAudio,
 		MediaDeadTimeout: m.cfg.MediaDeadTimeout,
 	})
+	earshot.Store(es)
 
 	go func() {
 		select {
@@ -392,7 +411,7 @@ func (m *Manager) runCall(c *call, ws *websocket.Conn, h http.Header) {
 		m.hangup(c.id) // the channel may still be up: ours to end
 	}
 
-	st := stats()
+	st := es.Stats()
 	slog.Info("call ended", "call_id", c.id, "reason", reason.Error(),
 		"duration_ms", time.Since(started).Milliseconds(),
 		"earshot_messages", st.Messages, "earshot_odd_size_messages", st.OddMessages,

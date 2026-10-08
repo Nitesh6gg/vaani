@@ -24,12 +24,20 @@ type EarshotStats struct {
 	CloseCode    int   // WebSocket close code from FreeSWITCH, 0 if none
 }
 
-// earshotWire is mod_earshot's proto=native codec=l16 rate=16000: raw
-// little-endian L16 in binary messages both ways (see docs/FREESWITCH.md).
-// Inbound messages are not guaranteed to be exactly one frame (earshot
-// resamples the 8 kHz channel), so they're re-framed: a frame may span
-// message boundaries.
-type earshotWire struct {
+// Earshot is one call's mod_earshot connection, proto=native codec=l16
+// rate=16000: raw little-endian L16 in binary messages both ways (see
+// docs/FREESWITCH.md). Inbound messages are not guaranteed to be exactly one
+// frame (earshot resamples the 8 kHz channel), so they're re-framed: a frame
+// may span message boundaries.
+//
+// Unlike RTP or AudioSocket, it is never sent filler silence: earshot plays
+// what it receives on FreeSWITCH's own clock and FreeSWITCH plays its own
+// audio when nothing is queued, so a frame sent "just to keep the stream
+// alive" only queues there. Audio delayed on the network and delivered in a
+// burst used to stay queued for the rest of the call that way -- 160-180 ms
+// of extra delay seen on live calls over a LAN (2026-10-08); with nothing
+// sent while the agent is quiet, the queue empties at every pause.
+type Earshot struct {
 	ws     *websocket.Conn
 	callID string
 
@@ -38,18 +46,38 @@ type earshotWire struct {
 
 	statsMu sync.Mutex
 	stats   EarshotStats
+
+	writeMu sync.Mutex // gorilla allows one writer at a time: writeLoop and Clear
 }
 
 // NewEarshotCallMedia runs the media pipeline over a FreeSWITCH call's
 // mod_earshot WebSocket (already upgraded). Same pipeline, pacing and
 // Handler contract as an AudioSocket call; ToWire must stay LittleEndian.
-func NewEarshotCallMedia(callID string, ws *websocket.Conn, sink AudioSocketSink, cfg AudioSocketConfig) (*AudioSocketCallMedia, func() EarshotStats) {
-	w := &earshotWire{ws: ws, callID: callID}
-	return newFramedCallMedia(callID, w, sink, cfg), w.Stats
+func NewEarshotCallMedia(callID string, ws *websocket.Conn, sink AudioSocketSink, cfg AudioSocketConfig) (*AudioSocketCallMedia, *Earshot) {
+	w := &Earshot{ws: ws, callID: callID}
+	return newFramedCallMedia(callID, w, sink, cfg), w
+}
+
+// noFillerSilence marks Earshot for writeLoop (see quietWire).
+func (*Earshot) noFillerSilence() {}
+
+// clearMessage is earshot's native "drop queued playback" control message.
+var clearMessage = []byte(`{"type":"clear"}`)
+
+// Clear drops the agent audio earshot has queued but not yet played, so the
+// caller stops hearing the agent at once (an interruption). Safe to call from
+// any goroutine.
+func (w *Earshot) Clear() error {
+	w.writeMu.Lock()
+	defer w.writeMu.Unlock()
+
+	_ = w.ws.SetWriteDeadline(time.Now().Add(earshotWriteTimeout))
+
+	return w.ws.WriteMessage(websocket.TextMessage, clearMessage)
 }
 
 // ReadFrame fills one pooled frame from as many binary messages as it takes.
-func (w *earshotWire) ReadFrame() (*[]byte, error) {
+func (w *Earshot) ReadFrame() (*[]byte, error) {
 	out := GetFrame()
 	buf := *out
 	filled := 0
@@ -88,7 +116,7 @@ func (w *earshotWire) ReadFrame() (*[]byte, error) {
 	return out, nil
 }
 
-func (w *earshotWire) endMessage() {
+func (w *Earshot) endMessage() {
 	w.statsMu.Lock()
 	w.stats.Messages++
 	w.stats.Bytes += w.n
@@ -101,7 +129,7 @@ func (w *earshotWire) endMessage() {
 
 // text drains a JSON control message (dtmf, command_result... -- nothing
 // Vaani asks earshot for yet).
-func (w *earshotWire) text(r io.Reader) {
+func (w *Earshot) text(r io.Reader) {
 	msg, _ := io.ReadAll(io.LimitReader(r, 4096))
 
 	w.statsMu.Lock()
@@ -113,7 +141,7 @@ func (w *earshotWire) text(r io.Reader) {
 
 // readErr maps a WebSocket close to io.EOF (a normal end of call) and
 // records its close code.
-func (w *earshotWire) readErr(err error) error {
+func (w *Earshot) readErr(err error) error {
 	var ce *websocket.CloseError
 	if errors.As(err, &ce) {
 		w.statsMu.Lock()
@@ -126,18 +154,20 @@ func (w *earshotWire) readErr(err error) error {
 	return err
 }
 
-// WriteFrame sends one frame as one binary message. Only writeLoop writes
-// (gorilla allows one concurrent writer).
-func (w *earshotWire) WriteFrame(pcm []byte) error {
+// WriteFrame sends one frame as one binary message.
+func (w *Earshot) WriteFrame(pcm []byte) error {
+	w.writeMu.Lock()
+	defer w.writeMu.Unlock()
+
 	_ = w.ws.SetWriteDeadline(time.Now().Add(earshotWriteTimeout))
 
 	return w.ws.WriteMessage(websocket.BinaryMessage, pcm)
 }
 
-func (w *earshotWire) Close() error { return w.ws.Close() }
+func (w *Earshot) Close() error { return w.ws.Close() }
 
 // Stats returns a snapshot of what the connection carried so far.
-func (w *earshotWire) Stats() EarshotStats {
+func (w *Earshot) Stats() EarshotStats {
 	w.statsMu.Lock()
 	defer w.statsMu.Unlock()
 

@@ -157,6 +157,11 @@ func (w *audioSocketWire) WriteFrame(pcm []byte) error {
 
 func (w *audioSocketWire) Close() error { return w.conn.Close() }
 
+// quietWire is a wire whose far end plays its own audio when nothing arrives
+// (Earshot): writeLoop sends it no filler silence. RTP and AudioSocket do get
+// filler -- their far end needs the steady 20 ms stream.
+type quietWire interface{ noFillerSilence() }
+
 func newFramedCallMedia(callID string, wire frameWire, sink AudioSocketSink, cfg AudioSocketConfig) *AudioSocketCallMedia {
 	handler := cfg.Handler
 	if handler == nil {
@@ -338,6 +343,8 @@ func (c *AudioSocketCallMedia) releaseLoop(ctx context.Context) {
 func (c *AudioSocketCallMedia) writeLoop(ctx context.Context) {
 	dead := false
 
+	_, quiet := c.wire.(quietWire)
+
 	c.writePacer.Run(func(_ time.Time) {
 		if ctx.Err() != nil || dead {
 			return
@@ -355,7 +362,12 @@ func (c *AudioSocketCallMedia) writeLoop(ctx context.Context) {
 			isSilenceFallback = true
 		}
 
-		c.recorder.WriteOut(*frame)
+		c.recorder.WriteOut(*frame) // filler too: keeps the recording on the call's clock
+
+		if isSilenceFallback && quiet {
+			PutFrame(frame)
+			return
+		}
 
 		// Symmetry hook with CallMedia.writeLoop; always LE (no-op) unless a
 		// caller ignored AudioSocketConfig.ToWire's contract.

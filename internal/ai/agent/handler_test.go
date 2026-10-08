@@ -1188,23 +1188,46 @@ func TestHandler_EndCallHangsUpAfterGoodbyePlays(t *testing.T) {
 }
 
 // TestHandler_UnknownToolReturnsErrorToLLM: a hallucinated tool name must not
-// break the turn -- the LLM gets an error result and carries on.
+// break the turn -- the LLM gets an error result and carries on. On a node
+// that offers tools it's an ordinary tool result; on one that offers none,
+// text (plainHistory), since a tool result without tools is a 400 on Sarvam.
 func TestHandler_UnknownToolReturnsErrorToLLM(t *testing.T) {
-	fSTT := newFakeSTT()
-	fTTS := newFakeTTS()
-
 	call := llm.ToolCall{ID: "x", Type: "function", Function: llm.FunctionCall{Name: "nope", Arguments: "{}"}}
-	fLLM := &fakeLLM{rounds: []fakeRound{{toolCalls: []llm.ToolCall{call}}, {tokens: []string{"Sorry."}}}}
 
-	NewHandler(context.Background(), "call1", testConfig(fSTT, fTTS, fLLM, 0, 0))
+	run := func(t *testing.T, start *Node) []llm.Message {
+		fSTT := newFakeSTT()
+		fTTS := newFakeTTS()
+		fLLM := &fakeLLM{rounds: []fakeRound{{toolCalls: []llm.ToolCall{call}}, {tokens: []string{"Sorry."}}}}
 
-	fSTT.sendFinal("hi")
-	require.Eventually(t, func() bool { return fTTS.spokenCount() == 1 }, time.Second, time.Millisecond)
+		cfg := testConfig(fSTT, fTTS, fLLM, 0, 0)
+		cfg.Start = start
+		NewHandler(context.Background(), "call1", cfg)
 
-	result := fLLM.seenAt(1)[2]
-	assert.Equal(t, "tool", result.Role)
-	assert.Contains(t, result.Content, `"status":"error"`)
-	assert.Contains(t, result.Content, "nope")
+		fSTT.sendFinal("hi")
+		require.Eventually(t, func() bool { return fTTS.spokenCount() == 1 }, time.Second, time.Millisecond)
+
+		return fLLM.seenAt(1)
+	}
+
+	t.Run("node with tools", func(t *testing.T) {
+		next := &Node{Name: "Next"}
+		msgs := run(t, &Node{AllowInterrupt: true, Edges: []Edge{{Def: llm.FunctionDef{Name: "go_next"}, To: next}}})
+
+		result := msgs[2]
+		assert.Equal(t, "tool", result.Role)
+		assert.Contains(t, result.Content, `"status":"error"`)
+		assert.Contains(t, result.Content, "nope")
+	})
+
+	t.Run("node without tools", func(t *testing.T) {
+		msgs := run(t, &Node{AllowInterrupt: true})
+
+		require.Len(t, msgs, 2)
+		assert.Equal(t, llm.Message{Role: "user", Content: "hi"}, msgs[0])
+		assert.Equal(t, "assistant", msgs[1].Role)
+		assert.Contains(t, msgs[1].Content, "[Tool Response: nope]")
+		assert.Empty(t, msgs[1].ToolCalls)
+	})
 }
 
 // TestHandler_DeadTTSIsReplacedNextTurn: the provider closing the TTS
@@ -1481,6 +1504,13 @@ func TestHandler_WorkflowWalk(t *testing.T) {
 	fSTT.sendFinal("bye")
 	require.Eventually(t, func() bool { return fTTS.spokenCount() == 3 }, time.Second, time.Millisecond)
 	assert.Equal(t, "end prompt", fLLM.seenAt(4)[0].Content)
+	// The end node offers no tools, so its request carries no tool calls or
+	// results either: Sarvam rejects those without tools (see plainHistory).
+	assert.Empty(t, fLLM.toolsAt(4))
+	for _, m := range fLLM.seenAt(4) {
+		assert.NotEqual(t, "tool", m.Role)
+		assert.Empty(t, m.ToolCalls)
+	}
 	assert.Zero(t, hangups.Load(), "must not hang up before the closing line has played")
 	playTurn(t, h, fTTS, 3, "Thanks, goodbye.")
 

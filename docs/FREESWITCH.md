@@ -171,12 +171,22 @@ the transfer must cancel it.
    sending; if we dumped whole sentences into Earshot's 2 MB buffer, a
    "pause" would be impossible to do and a cut would depend on `clear`
    alone.
-5. Barge-in confirmed → the 5 cuts as today, nothing more. **No
-   `{"type":"clear"}`**: the F1 lab measured Earshot's play buffer at one
-   20 ms frame throughout (Vaani paces), so the most a cut can leak is 20 ms.
-   If an F2 call ever shows more, `clear` is a ~10-line add.
-6. Agent ends the call → ESL `api uuid_kill <uuid> NORMAL_CLEARING`.
-7. Caller hangs up → ESL `CHANNEL_HANGUP` (with `Hangup-Cause`) and
+5. Barge-in: when the caller starts talking over the agent (the reply
+   *pauses*), Vaani sends `{"type":"clear"}` so earshot drops the reply audio
+   it still has queued and the agent goes quiet at once; the 5 cuts follow at
+   confirmation as today. Not at confirmation: by then (~700 ms+ of pause)
+   the queue has already played out. A false interruption replays from the
+   start of the sentence, so clearing at the pause loses nothing.
+6. **No filler silence over earshot.** RTP and AudioSocket get a silence
+   frame on every 20 ms tick the agent has nothing to send (invariants #1,
+   #7); earshot doesn't: FreeSWITCH plays its own audio when nothing is
+   queued, and filler only queues there. Real DID calls across the LAN
+   (2026-10-08) showed earshot's queue growing to 2560-2880 bytes (160-180 ms
+   of extra delay) after network bursts and never draining, because the
+   filler kept it topped up; with nothing sent while the agent is quiet it
+   empties at every pause. The write tick still fires every 20 ms.
+7. Agent ends the call → ESL `api uuid_kill <uuid> NORMAL_CLEARING`.
+8. Caller hangs up → ESL `CHANNEL_HANGUP` (with `Hangup-Cause`) and
    the WebSocket closes → same teardown path as today (once-guaranteed),
    then `recordRun` writes Dograh's `workflow_runs` + MinIO upload.
 

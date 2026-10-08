@@ -1260,7 +1260,12 @@ func (h *Handler) runLLMTurn(ctx context.Context, history []llm.Message, ttsClie
 			said  strings.Builder
 		)
 
-		calls, err = h.cfg.LLM.Stream(ctx, requestMessages(node, history), node.toolDefs(), func(tok string) {
+		tools, msgs := node.toolDefs(), requestMessages(node, history)
+		if len(tools) == 0 {
+			msgs = plainHistory(msgs)
+		}
+
+		calls, err = h.cfg.LLM.Stream(ctx, msgs, tools, func(tok string) {
 			if firstTokenAt.IsZero() {
 				firstTokenAt = time.Now()
 				h.ttft.Store(&genDuration{gen: gen, d: firstTokenAt.Sub(turnStartedAt)})
