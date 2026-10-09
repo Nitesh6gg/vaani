@@ -347,6 +347,14 @@ off (`D:\go-agent-worker` ADR-017). `END_SPEECH` is Sarvam's *detection*
 time, which trails the caller's actual last sound -- which is what the two
 VAD-based fields measure.
 
+**Dograh's UI.** `endpoint_ms` (service `stt`), `llm_ttft_ms` (`llm`) and
+`tts_ttfa_ms` (`tts`) are each also logged as an `rtf-ttfb-metric` call-history
+event (`TTFBMeasured` in `internal/ai/agent/calllog.go`), the same event type
+Dograh's own pipecat pipeline emits -- this is what puts the per-turn latency
+chips on Dograh's workflow-run UI for Vaani's calls, not just in Vaani's logs.
+`endpoint_ms` is skipped the same turns it's skipped above, so some turns have
+no `stt` chip; `llm`/`tts` are logged once per reply from `recordReply`.
+
 **VAD-based fields** (`end_detect_ms`, `since_last_speech_ms`) need
 `VAD_MODE=ten` with the native library loaded (with or without
 `BARGE_IN_ENABLED`): TEN VAD then also runs
@@ -370,4 +378,5 @@ next 20ms tick. So the caller's real wait is somewhat longer than
   -- neither retries nor says a fallback line yet.
 - Cost/latency tracing: whether provider call spans get their own metrics
   series (mirroring `vaani_audio_rms`-style transport-neutral naming) or reuse
-  existing ones. Today latency is only in the logs above.
+  existing ones. Latency is in the logs above and, per turn, Dograh's UI
+  (previous section) -- no separate metrics series yet.

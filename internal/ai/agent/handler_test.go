@@ -1663,7 +1663,9 @@ func TestHandler_LogsLatencyFromCallerSpeechEnd(t *testing.T) {
 	fSTT := newFakeSTT()
 	fTTS := newFakeTTS()
 	fLLM := &fakeLLM{tokens: []string{"Okay."}}
-	h := NewHandler(context.Background(), "call1", testConfig(fSTT, fTTS, fLLM, time.Hour, 0))
+	cfg := testConfig(fSTT, fTTS, fLLM, time.Hour, 0)
+	cfg.Log = &CallLog{}
+	h := NewHandler(context.Background(), "call1", cfg)
 
 	fSTT.results <- stt.Result{Signal: stt.SpeechStarted}
 	fSTT.results <- stt.Result{Signal: stt.SpeechEnded}
@@ -1693,6 +1695,20 @@ func TestHandler_LogsLatencyFromCallerSpeechEnd(t *testing.T) {
 	require.Len(t, second, 2)
 	assert.NotContains(t, second[0], "endpoint_ms=")
 	assert.NotContains(t, second[1], "since_speech_end_ms=")
+
+	// Dograh's UI/QA read endpoint_ms's same span as an rtf-ttfb-metric
+	// event, service "stt" (Dograh's own pipecat STT TTFB: speech end to
+	// final transcript) -- once, for the turn that had a speechEnd to time
+	// from; "second" (no signal of its own) gets none.
+	var sttTTFBs int
+
+	for _, e := range cfg.Log.Summary().Events {
+		if e.Type == "rtf-ttfb-metric" && e.Payload["service"] == "stt" {
+			sttTTFBs++
+		}
+	}
+
+	assert.Equal(t, 1, sttTTFBs)
 }
 
 // fakeClockDetector is a BargeInDetector that can say when it last heard

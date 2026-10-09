@@ -1203,8 +1203,15 @@ func (h *Handler) acceptUserTurn(text string, started, speechEnd, lastSound, flu
 	args := []any{"call_id", h.callID, "event", "turn.user", "turn", h.turn, "node", h.nodeName(),
 		"gen", h.curGen + 1, "text", text}
 	if !speechEnd.IsZero() {
-		// Sarvam's end-of-speech detection -> its transcript.
-		args = append(args, "endpoint_ms", time.Since(speechEnd).Milliseconds())
+		// Sarvam's end-of-speech detection -> its transcript: Dograh's STT
+		// TTFB (pipecat's stt_service.py measures the same span, VAD stop to
+		// final transcript), so it's also logged as an rtf-ttfb-metric event
+		// for Dograh's UI and QA's metrics (see TTFBMeasured; "llm"/"tts" are
+		// logged the same way in recordReply). Skipped with speechEnd, same
+		// as pipecat's own guard (stop_secs == 0 -> no STT TTFB to report).
+		endpoint := time.Since(speechEnd)
+		args = append(args, "endpoint_ms", endpoint.Milliseconds())
+		h.cfg.Log.TTFBMeasured("stt", endpoint)
 
 		if !lastSound.IsZero() {
 			// The caller's last sound (local VAD) -> Sarvam's end-of-speech.
