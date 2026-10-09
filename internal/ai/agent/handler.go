@@ -273,10 +273,10 @@ type Handler struct {
 	// playing -- at the end of a reply, its last sentence. Same writer and
 	// reader as playingReq.
 	playingSince atomic.Int64
-	// heldAck is an acknowledgement said while the reply was paused, waiting
-	// for the reply to finish to learn whether it was an answer (see
-	// Config.AckFilter). run()-goroutine only.
-	heldAck *heldAck
+	// held is what the caller said over the current reply, waiting for it to
+	// finish to learn whether it was an answer (see Config.AckFilter, and
+	// holdSpeech). run()-goroutine only.
+	held []heldSpeech
 	// toolRunning is set while a tool executes (runLLMTurn's goroutine).
 	// processSpeakingFrame pauses its dead-TTS drain timeout meanwhile: an
 	// empty queue is expected while the caller waits on a slow API after a
@@ -1159,7 +1159,7 @@ func (h *Handler) handleFinalTranscript(text string) {
 			// reply goes on, as after a false interruption. Held, not dropped:
 			// said during the reply's last sentence it's the caller's answer
 			// (a yes/no question), decided when the reply ends (settleAck).
-			h.holdAck(text)
+			h.holdSpeech(text, "an acknowledgement over a paused reply")
 			h.resumeReply("backchannel")
 
 			return
@@ -1174,6 +1174,14 @@ func (h *Handler) handleFinalTranscript(text string) {
 	// ended after it finished arrives in Listening instead, whole.
 	switch s := State(h.state.Load()); s {
 	case StateThinking, StateSpeaking:
+		if s == StateSpeaking && h.cfg.AckFilter && h.interruptible() && !junkTranscript(text) {
+			// Too short to pause the reply (a quick "हाँ" over the end of a
+			// question), at a node where the caller may talk: held, and their
+			// turn if said during the reply's last sentence (settleHeld).
+			h.holdSpeech(text, "said over the agent, too short to pause it")
+			return
+		}
+
 		slog.Info("transcript ignored: the agent is "+s.String(), "call_id", h.callID, "text", text,
 			"event", "stt.transcript.ignored", "why", "agent_"+s.String())
 		return
@@ -1992,14 +2000,14 @@ func (h *Handler) finishTurn(gen uint64) {
 	h.ttsBuf = nil
 
 	if h.hangupAfterTurn || h.ending {
-		h.dropAck("the call is ending")
+		h.dropHeld("the call is ending")
 		h.hangupAfterTurn = false
 		h.hangup()
 
 		return
 	}
 
-	if h.settleAck(gen) {
+	if h.settleHeld(gen) {
 		return // the caller's held answer is the next turn: no silence clock
 	}
 
@@ -2214,7 +2222,7 @@ func (h *Handler) confirmInterruption() {
 	h.state.Store(int32(StateTranscribing))
 	h.paused.Store(false)
 	h.cfg.Sink.BargeIn()
-	h.dropAck("a real interruption followed") // its words carry the meaning
+	h.dropHeld("a real interruption followed") // its words carry the meaning
 	slog.Info("agent barge-in confirmed; reply cut", "call_id", h.callID, "gen", h.curGen,
 		"paused_ms", time.Since(h.pausedAt).Milliseconds(), "event", "agent.barge_in.confirmed")
 	h.cutReply()

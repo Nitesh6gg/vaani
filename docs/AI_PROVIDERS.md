@@ -73,7 +73,8 @@ logs what it resolved to, never the keys:
   |---|---|
   | Agent listening | A new turn |
   | Reply paused by a possible interruption | Confirms it -- unless junk, too soon, or only an acknowledgement like "जी"/"ok": that resumes the reply and is held -- the caller's turn if said during the reply's last sentence, else dropped (see "Pause first") |
-  | Agent preparing or speaking a reply, not paused | Discarded and logged: `transcript ignored: the agent is speaking` (or `thinking`) |
+  | Agent speaking a reply, not paused, at a node that allows interruption | Held: the caller's turn if said during the reply's last sentence, else dropped (a quick "हाँ" over the end of a question is too short to pause the reply) |
+  | Agent preparing a reply, or speaking at a node that doesn't allow interruption | Discarded and logged: `transcript ignored: the agent is speaking` (or `thinking`) |
 
   An answer that starts over the agent but ends after it finishes arrives
   while listening, and is transcribed whole. Until 2026-10-01 Vaani fed the
@@ -265,22 +266,28 @@ reply keeps generating and queueing. Then one of two things happens:
   Telugu, Kannada, Malayalam or Urdu equivalents
   (`internal/ai/agent/backchannel.go`). Nothing is cut: the reply resumes as
   after a false alarm (counted in `false_interruptions`), and the
-  acknowledgement is **held** (`acknowledgement held; the reply goes on`)
-  until the reply has played out. Then:
+  acknowledgement is **held** (`caller speech held until the reply ends`,
+  `agent.speech.held`) until the reply has played out. The same happens to
+  anything said over a reply, at a node that allows interruption, that was
+  too short to pause it at all: call 516 (2026-10-09) lost three such
+  answers -- "हाँ" 78 ms and 0.7 s before a question ended, "ठीक है" 2 s
+  before -- to Dograh's mute. Then:
   - said during the reply's **last sentence** (from `ACK_END_MARGIN_MS`,
     default 300, before that sentence began) it is the caller's answer to
     what the agent was finishing -- typically a yes/no question -- and
-    becomes their turn at once (`acknowledgement delivered as the caller's
-    turn`); they don't have to say it again;
+    becomes their turn at once (`held caller speech delivered as their
+    turn`, `agent.speech.delivered`; several pieces are joined in the order
+    said); they don't have to say it again;
   - said during an **earlier** sentence the caller was only listening, and
-    it's dropped (`acknowledgement dropped why="said before the reply's last
+    it's dropped (`agent.speech.dropped why="said before the reply's last
     sentence"`).
 
-  A real interruption after it (`acknowledgement dropped why="a real
-  interruption followed"`), or the call ending, drops it too. Anything that
+  A real interruption after it (`why="a real interruption followed"`), or
+  the call ending, drops it too. At a node that doesn't allow interruption
+  the caller stays muted while the agent speaks, as in Dograh. Anything that
   refuses, asks or stops -- "नहीं", "जी नहीं", "क्या?", "ok wait" -- has a word
   outside the list and still confirms at once. `call.summary` carries
-  `acks_held` and `acks_delivered`. Why: call 509 (2026-10-08), where a lone
+  `held_speech` and `held_delivered`. Why: call 509 (2026-10-08), where a lone
   "जी" over a question cut it and the LLM, given "जी" as the answer,
   apologised for not understanding. Why held rather than dropped: Rapida
   drops filler words and pipecat's min-words strategy drops short

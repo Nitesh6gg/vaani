@@ -1974,10 +1974,18 @@ func (b *blockingLLM) Stream(ctx context.Context, _ []llm.Message, _ []llm.Tool,
 }
 
 // ackOverReply plays a two-sentence reply -- "Some info." then a question --
-// and has the caller say "हाँ" over sentence 1 or 2 (pausing the reply
-// there). It returns once the reply has played out, or the held "हाँ" has
-// become a turn.
+// and has the caller say "हाँ" over sentence 1 or 2, pausing the reply there
+// first. The reply then finishes delivering; the caller's "हाँ" is either
+// held for settleHeld or, by then, a turn.
 func ackOverReply(t *testing.T, sentence int) (*Handler, *fakeLLM) {
+	t.Helper()
+
+	return overReply(t, sentence, true, &Node{AllowInterrupt: true})
+}
+
+// overReply is ackOverReply with the pause optional (pause=false: a "हाँ"
+// too short to pause the reply) and the node given.
+func overReply(t *testing.T, sentence int, pause bool, node *Node) (*Handler, *fakeLLM) {
 	t.Helper()
 
 	fSTT := newFakeSTT()
@@ -1987,7 +1995,9 @@ func ackOverReply(t *testing.T, sentence int) (*Handler, *fakeLLM) {
 		{tokens: []string{"Great."}},
 	}}
 
-	h := NewHandler(context.Background(), "call1", testConfig(fSTT, fTTS, fLLM, 0, 0))
+	cfg := testConfig(fSTT, fTTS, fLLM, 0, 0)
+	cfg.Start = node
+	h := NewHandler(context.Background(), "call1", cfg)
 
 	fSTT.sendFinal("hi")
 	require.Eventually(t, func() bool { return fTTS.spokenCount() == 2 }, time.Second, time.Millisecond)
@@ -2001,15 +2011,23 @@ func ackOverReply(t *testing.T, sentence int) (*Handler, *fakeLLM) {
 		}
 	}
 
-	for i := 0; i < 3; i++ { // the caller talks over the agent: the reply pauses
-		h.ProcessFrame(context.Background(), "call1", constFrame(loudAmplitude))
-	}
-	require.True(t, h.paused.Load())
+	if pause {
+		for i := 0; i < 3; i++ { // the caller talks over the agent: the reply pauses
+			h.ProcessFrame(context.Background(), "call1", constFrame(loudAmplitude))
+		}
+		require.True(t, h.paused.Load())
 
-	fSTT.sendFinal("हाँ")
-	require.Eventually(t, func() bool { return !h.paused.Load() }, time.Second, time.Millisecond,
-		"an acknowledgement resumes the reply")
-	assert.False(t, fTTS.wasCancelled(), "...without cutting it")
+		fSTT.sendFinal("हाँ")
+		require.Eventually(t, func() bool { return !h.paused.Load() }, time.Second, time.Millisecond,
+			"an acknowledgement resumes the reply")
+	} else {
+		h.ProcessFrame(context.Background(), "call1", constFrame(quietAmplitude)) // this sentence starts
+		fSTT.sendFinal("हाँ")
+		time.Sleep(20 * time.Millisecond) // reaches run(): held or ignored
+		assert.Equal(t, StateSpeaking, h.State(), "never paused, never a turn mid-reply")
+	}
+
+	assert.False(t, fTTS.wasCancelled(), "nothing is cut")
 	time.Sleep(5 * time.Millisecond) // what plays from here starts after the "हाँ"
 
 	fTTS.done <- 1
@@ -2040,4 +2058,36 @@ func TestHandler_AckBeforeLastSentenceIsDropped(t *testing.T) {
 	drainUntilListening(t, h)
 	time.Sleep(20 * time.Millisecond)
 	assert.Equal(t, 1, fLLM.streamCalls(), "no turn for an acknowledgement said mid-explanation")
+}
+
+// A "हाँ" too short to pause the reply, over its last sentence at an
+// interruptible node, is held and becomes the caller's turn when the
+// question has played out (call 516: three such answers were dropped).
+func TestHandler_ShortAnswerOverLastSentenceIsKept(t *testing.T) {
+	h, fLLM := overReply(t, 2, false, &Node{AllowInterrupt: true})
+
+	require.Eventually(t, func() bool {
+		h.ProcessFrame(context.Background(), "call1", constFrame(quietAmplitude))
+		return fLLM.streamCalls() == 2
+	}, time.Second, time.Millisecond, "the held answer starts the next turn")
+	assert.Equal(t, llm.Message{Role: "user", Content: "हाँ"}, lastMessage(fLLM.seenAt(1)))
+}
+
+// Over an earlier sentence it's listening, dropped as before.
+func TestHandler_ShortSpeechOverEarlierSentenceIsDropped(t *testing.T) {
+	h, fLLM := overReply(t, 1, false, &Node{AllowInterrupt: true})
+
+	drainUntilListening(t, h)
+	time.Sleep(20 * time.Millisecond)
+	assert.Equal(t, 1, fLLM.streamCalls())
+}
+
+// At a node that doesn't allow interruption the caller stays muted while
+// the agent speaks, as in Dograh -- even over the last sentence.
+func TestHandler_NonInterruptibleNodeStillMutesTheCaller(t *testing.T) {
+	h, fLLM := overReply(t, 2, false, &Node{})
+
+	drainUntilListening(t, h)
+	time.Sleep(20 * time.Millisecond)
+	assert.Equal(t, 1, fLLM.streamCalls())
 }

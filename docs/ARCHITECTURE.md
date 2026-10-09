@@ -89,7 +89,9 @@ connection cancelled, queue drained), with the caller's utterance as the
 next turn; no transcript and 2s of quiet means it was noise, and the reply
 resumes from the start of the sentence it was paused in. A transcript of
 something said entirely while the agent spoke, with no interruption, is
-discarded (`transcript ignored: the agent is speaking`) -- Dograh's mute; an
+discarded (`transcript ignored: the agent is speaking`) -- Dograh's mute --
+except at a node that allows interruption, where it's held and becomes the
+caller's turn if said during the reply's last sentence; an
 answer that started over the agent and ended after it is transcribed whole
 (see "Fed continuously" in `docs/AI_PROVIDERS.md`).
 `BARGE_IN_ENABLED=0` puts the detector in observe-only mode: transitions keep

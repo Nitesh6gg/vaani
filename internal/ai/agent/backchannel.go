@@ -54,75 +54,94 @@ var backchannelWords = setOf(
 	"അതെ", "ശരി", "ഉം", "ഹാ", "ഓക്കെ", "ഓകെ",
 )
 
-// heldAck is an acknowledgement said while a reply was paused (see
-// Config.AckFilter): gen is the reply it was said over, at when the caller
-// began saying it.
-type heldAck struct {
+// heldSpeech is something the caller said over a reply that isn't (yet) a
+// turn (see Config.AckFilter): gen is the reply it was said over, at when
+// the caller began saying it.
+type heldSpeech struct {
 	text string
 	gen  uint64
 	at   time.Time
 }
 
-// holdAck keeps an acknowledgement until the paused reply finishes (a newer
-// one replaces it: the latest is the one that may answer). Like LiveKit's
-// held transcripts -- "interrupting the agent is recoverable, discarding a
-// real user turn is not" -- but decided by sentence, not a fixed second.
-func (h *Handler) holdAck(text string) {
+// holdSpeech keeps what the caller said over the agent until the reply
+// finishes, instead of dropping it: an acknowledgement over a paused reply,
+// or anything said over a reply at an interruptible node that was too short
+// to pause it -- a quick "हाँ" over the end of a question (call 516,
+// 2026-10-09: three such answers lost). Like LiveKit's held transcripts --
+// "interrupting the agent is recoverable, discarding a real user turn is
+// not" -- but decided by sentence, not a fixed second (settleHeld).
+func (h *Handler) holdSpeech(text, why string) {
 	at := h.utteranceStart()
 	if at.IsZero() {
 		at = time.Now() // unknown start: the benefit of the doubt goes to "an answer"
 	}
 
-	h.heldAck = &heldAck{text: text, gen: h.curGen, at: at}
-	h.cfg.Log.AckHeld()
+	h.held = append(h.held, heldSpeech{text: text, gen: h.curGen, at: at})
+	h.cfg.Log.SpeechHeld()
 
-	slog.Info("acknowledgement held; the reply goes on", "call_id", h.callID, "text", text,
-		"gen", h.curGen, "event", "agent.ack.held")
+	slog.Info("caller speech held until the reply ends", "call_id", h.callID, "text", text,
+		"gen", h.curGen, "why", why, "event", "agent.speech.held")
 }
 
-// dropAck discards a held acknowledgement, saying why.
-func (h *Handler) dropAck(why string) {
-	if h.heldAck == nil {
-		return
+// dropHeld discards everything held, saying why.
+func (h *Handler) dropHeld(why string) {
+	for _, s := range h.held {
+		h.logDropped(s, why)
 	}
 
-	slog.Info("acknowledgement dropped", "call_id", h.callID, "text", h.heldAck.text,
-		"why", why, "event", "agent.ack.dropped")
-	h.heldAck = nil
+	h.held = nil
 }
 
-// settleAck decides a held acknowledgement once reply gen has fully played:
-// said during its last sentence (from AckEndMargin before that sentence
-// began), it answers what the agent was finishing -- "...क्या आप संतुष्ट
-// हैं?" "हाँ" -- and becomes the caller's turn now (true: a turn started);
-// said earlier, the caller was only listening, and it's dropped.
-func (h *Handler) settleAck(gen uint64) bool {
-	a := h.heldAck
-	if a == nil {
+func (h *Handler) logDropped(s heldSpeech, why string) {
+	slog.Info("held caller speech dropped", "call_id", h.callID, "text", s.text,
+		"why", why, "event", "agent.speech.dropped")
+}
+
+// settleHeld decides what was held once reply gen has fully played: what
+// the caller said during its last sentence (from AckEndMargin before that
+// sentence began) answers what the agent was finishing -- "...क्या आप
+// संतुष्ट हैं?" "हाँ" -- and becomes their turn now, joined in the order said
+// (true: a turn started); what they said earlier was listening, and is
+// dropped.
+func (h *Handler) settleHeld(gen uint64) bool {
+	held := h.held
+	h.held = nil
+
+	from := time.Unix(0, h.playingSince.Load()).Add(-h.cfg.AckEndMargin)
+
+	var (
+		answer []string
+		at     time.Time
+	)
+
+	for _, s := range held {
+		switch {
+		case s.gen != gen:
+			h.logDropped(s, "said over an earlier reply")
+		case s.at.Before(from):
+			h.logDropped(s, "said before the reply's last sentence")
+		default:
+			if at.IsZero() {
+				at = s.at
+			}
+
+			answer = append(answer, s.text)
+		}
+	}
+
+	if len(answer) == 0 {
 		return false
 	}
 
-	if a.gen != gen {
-		h.dropAck("said over an earlier reply")
-		return false
-	}
+	text := strings.Join(answer, " ")
+	h.cfg.Log.SpeechDelivered()
 
-	lastSentence := time.Unix(0, h.playingSince.Load())
-	if a.at.Before(lastSentence.Add(-h.cfg.AckEndMargin)) {
-		h.dropAck("said before the reply's last sentence")
-		return false
-	}
-
-	h.heldAck = nil
-	h.cfg.Log.AckDelivered()
-
-	slog.Info("acknowledgement delivered as the caller's turn", "call_id", h.callID, "text", a.text,
-		"said_before_end_ms", time.Since(a.at).Milliseconds(), "event", "agent.ack.delivered")
-	h.acceptUserTurn(a.text, a.at, time.Time{}, time.Time{}, time.Time{})
+	slog.Info("held caller speech delivered as their turn", "call_id", h.callID, "text", text,
+		"said_before_end_ms", time.Since(at).Milliseconds(), "event", "agent.speech.delivered")
+	h.acceptUserTurn(text, at, time.Time{}, time.Time{}, time.Time{})
 
 	return true
 }
-
 func setOf(words ...string) map[string]struct{} {
 	m := make(map[string]struct{}, len(words))
 	for _, w := range words {
