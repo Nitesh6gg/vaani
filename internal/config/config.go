@@ -144,6 +144,13 @@ type Config struct {
 	// PostCutSilence is how long after an interruption pauses the reply
 	// transcripts are ignored. See internal/ai/agent.Config.PostCutSilence.
 	PostCutSilence time.Duration
+	// BargeInAckFilter (BARGE_IN_ACK_FILTER, default on): an acknowledgement
+	// ("जी", "हाँ", "ok") over a paused reply doesn't cut it; said during the
+	// reply's last sentence it becomes the caller's turn when the reply ends.
+	// AckEndMargin (ACK_END_MARGIN_MS, default 300) widens "last sentence"
+	// back that far. See agent.Config.AckFilter.
+	BargeInAckFilter bool
+	AckEndMargin     time.Duration
 	// VadMode selects the barge-in detector when BargeInEnabled: "energy"
 	// (default -- the RMS-threshold EnergyDetector, no native dependency) or
 	// "ten" (TEN VAD, a real neural VAD -- Linux/cgo only, vendored under
@@ -202,6 +209,7 @@ func Load() (Config, error) {
 		MinioBucket:         getEnv("MINIO_BUCKET", "voice-audio"),
 		MinioSecure:         strings.EqualFold(getEnv("MINIO_SECURE", "false"), "true"),
 		BargeInEnabled:      getEnv("BARGE_IN_ENABLED", "1") == "1",
+		BargeInAckFilter:    getEnv("BARGE_IN_ACK_FILTER", "1") == "1",
 		VadMode:             getEnv("VAD_MODE", "energy"),
 		Telephony:           getEnv("TELEPHONY", "asterisk"),
 		EslAddr:             getEnv("ESL_ADDR", "127.0.0.1:8021"),
@@ -372,6 +380,17 @@ func Load() (Config, error) {
 	}
 
 	cfg.PostCutSilence = time.Duration(postCutSilenceMS) * time.Millisecond
+
+	ackEndMarginMS, err := getEnvInt("ACK_END_MARGIN_MS", 300)
+	if err != nil {
+		return Config{}, err
+	}
+
+	if ackEndMarginMS < 0 {
+		return Config{}, fmt.Errorf("config: ACK_END_MARGIN_MS must be >= 0, got %d", ackEndMarginMS)
+	}
+
+	cfg.AckEndMargin = time.Duration(ackEndMarginMS) * time.Millisecond
 
 	// Fail fast at startup rather than at first call. Everything else the
 	// agent needs (models, keys, prompts) comes from Dograh per call.

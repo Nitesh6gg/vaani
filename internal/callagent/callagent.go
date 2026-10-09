@@ -308,6 +308,8 @@ func (b *Builder) newAgentHandler(ctx context.Context, c Call, hooks Hooks) medi
 		BargeInMinSpeech:   b.cfg.BargeInMinSpeech,
 		STTFlushAfter:      b.cfg.STTFlushAfter,
 		PostCutSilence:     b.cfg.PostCutSilence,
+		AckFilter:          b.cfg.BargeInAckFilter,
+		AckEndMargin:       b.cfg.AckEndMargin,
 		Sink:               sinks(callLog, hooks),
 		Log:                callLog,
 	})
@@ -404,6 +406,7 @@ func logCallSummary(callID string, duration time.Duration, disposition string, s
 		"duration_s", int(math.Round(duration.Seconds())), "disposition", disposition,
 		"user_turns", s.UserTurns, "agent_replies", s.AgentReplies,
 		"bargeins", s.BargeIns, "pauses", s.Pauses, "false_interruptions", s.FalseInterruptions,
+		"acks_held", s.AcksHeld, "acks_delivered", s.AcksDelivered,
 		"nodes", s.NodesVisited, "variables", len(s.Extracted), "recording_bytes", recordingBytes}
 
 	if p50, p95, ok := percentiles(s.ReplyLatenciesMS); ok {

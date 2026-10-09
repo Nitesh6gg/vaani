@@ -327,6 +327,7 @@ func testConfig(sttClient stt.Client, ttsClient tts.Client, llmClient llmStreame
 		BargeIn:        NewEnergyDetector(floor),
 		BargeInGuard:   guard,
 		PostCutSilence: postCut,
+		AckFilter:      true,
 		Sink:           NoopSink{},
 	}
 }
@@ -1809,8 +1810,9 @@ func TestJunkTranscript(t *testing.T) {
 }
 
 // TestHandler_PausedJunkDoesNotConfirmButAShortAnswerDoes: during a pause a
-// lone-letter transcript is noise and leaves the pause in place; a real
-// one-word answer like "जी" confirms the interruption.
+// lone-letter transcript is noise and leaves the pause in place; an
+// acknowledgement like "जी" (call 509) resumes the reply, uncut; a real
+// one-word answer like "नहीं" confirms the interruption.
 func TestHandler_PausedJunkDoesNotConfirmButAShortAnswerDoes(t *testing.T) {
 	fSTT := newFakeSTT()
 	fTTS := newFakeTTS()
@@ -1835,9 +1837,24 @@ func TestHandler_PausedJunkDoesNotConfirmButAShortAnswerDoes(t *testing.T) {
 	assert.False(t, fTTS.wasCancelled())
 
 	fSTT.sendFinal("जी")
+	require.Eventually(t, func() bool { return !h.paused.Load() }, time.Second, time.Millisecond,
+		"an acknowledgement resumes the reply")
+	assert.False(t, fTTS.wasCancelled(), "...without cutting it")
+	assert.Equal(t, 1, fLLM.streamCalls(), "...and isn't a turn")
+
+	for i := 0; i < 3; i++ {
+		h.ProcessFrame(context.Background(), "call1", constFrame(loudAmplitude))
+	}
+
+	require.Eventually(t, h.paused.Load, time.Second, time.Millisecond)
+
+	fSTT.sendFinal("नहीं")
 	require.Eventually(t, fTTS.wasCancelled, time.Second, time.Millisecond, "a real short answer confirms")
 	require.Eventually(t, func() bool { return fLLM.streamCalls() == 2 }, time.Second, time.Millisecond)
-	assert.Equal(t, llm.Message{Role: "user", Content: "जी"}, lastMessage(fLLM.seenAt(1)))
+	assert.Equal(t, llm.Message{Role: "user", Content: "नहीं"}, lastMessage(fLLM.seenAt(1)))
+	for _, m := range fLLM.seenAt(1) {
+		assert.NotEqual(t, "जी", m.Content, "the held acknowledgement is dropped once a real interruption follows")
+	}
 }
 
 // TestHandler_ReplyHeardWhenTheCallEndsIsLogged: the caller hanging up
@@ -1954,4 +1971,73 @@ func (b *blockingLLM) Stream(ctx context.Context, _ []llm.Message, _ []llm.Tool,
 	}
 
 	return nil, nil
+}
+
+// ackOverReply plays a two-sentence reply -- "Some info." then a question --
+// and has the caller say "हाँ" over sentence 1 or 2 (pausing the reply
+// there). It returns once the reply has played out, or the held "हाँ" has
+// become a turn.
+func ackOverReply(t *testing.T, sentence int) (*Handler, *fakeLLM) {
+	t.Helper()
+
+	fSTT := newFakeSTT()
+	fTTS := newFakeTTS()
+	fLLM := &fakeLLM{rounds: []fakeRound{
+		{tokens: []string{"Some info.", " Are you happy?"}},
+		{tokens: []string{"Great."}},
+	}}
+
+	h := NewHandler(context.Background(), "call1", testConfig(fSTT, fTTS, fLLM, 0, 0))
+
+	fSTT.sendFinal("hi")
+	require.Eventually(t, func() bool { return fTTS.spokenCount() == 2 }, time.Second, time.Millisecond)
+	fTTS.audio <- tts.Chunk{PCM: multiFrame(5, quietAmplitude), Gen: 1, Req: 1, Text: "Some info."}
+	fTTS.audio <- tts.Chunk{PCM: multiFrame(5, quietAmplitude), Gen: 1, Req: 2, Text: " Are you happy?"}
+	require.Eventually(t, func() bool { return h.State() == StateSpeaking && len(h.outbound) == 10 }, time.Second, time.Millisecond)
+
+	if sentence == 2 {
+		for i := 0; i < 5; i++ { // sentence 1 plays out
+			h.ProcessFrame(context.Background(), "call1", constFrame(quietAmplitude))
+		}
+	}
+
+	for i := 0; i < 3; i++ { // the caller talks over the agent: the reply pauses
+		h.ProcessFrame(context.Background(), "call1", constFrame(loudAmplitude))
+	}
+	require.True(t, h.paused.Load())
+
+	fSTT.sendFinal("हाँ")
+	require.Eventually(t, func() bool { return !h.paused.Load() }, time.Second, time.Millisecond,
+		"an acknowledgement resumes the reply")
+	assert.False(t, fTTS.wasCancelled(), "...without cutting it")
+	time.Sleep(5 * time.Millisecond) // what plays from here starts after the "हाँ"
+
+	fTTS.done <- 1
+
+	return h, fLLM
+}
+
+// A "हाँ" over the reply's last sentence -- the question -- is the caller's
+// answer: once the question has played out it becomes their turn, so they
+// needn't say it again.
+func TestHandler_AckDuringLastSentenceBecomesTheAnswer(t *testing.T) {
+	h, fLLM := ackOverReply(t, 2)
+
+	require.Eventually(t, func() bool {
+		h.ProcessFrame(context.Background(), "call1", constFrame(quietAmplitude))
+		return fLLM.streamCalls() == 2
+	}, time.Second, time.Millisecond, "the held answer starts the next turn")
+	assert.Equal(t, llm.Message{Role: "user", Content: "हाँ"}, lastMessage(fLLM.seenAt(1)))
+	assert.Equal(t, llm.Message{Role: "assistant", Content: "Some info. Are you happy?"},
+		fLLM.seenAt(1)[len(fLLM.seenAt(1))-2], "the question played out in full first")
+}
+
+// A "जी"-style acknowledgement over an earlier sentence is listening: the
+// reply plays on and it's dropped -- no turn, no LLM call (call 509).
+func TestHandler_AckBeforeLastSentenceIsDropped(t *testing.T) {
+	h, fLLM := ackOverReply(t, 1)
+
+	drainUntilListening(t, h)
+	time.Sleep(20 * time.Millisecond)
+	assert.Equal(t, 1, fLLM.streamCalls(), "no turn for an acknowledgement said mid-explanation")
 }

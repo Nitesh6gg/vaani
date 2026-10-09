@@ -80,7 +80,11 @@ gate -- watches the inbound audio. At workflow nodes whose Dograh
 is ignored until the agent finishes), unbroken speech for
 `BARGE_IN_MIN_SPEECH_MS` first **pauses** the reply: nothing plays, while
 the caller's audio keeps going to STT as always. A transcript (other than junk like a lone
-letter) confirms the interruption and the turn is cut (LLM stream and TTS
+letter, or only an acknowledgement like "जी", "हाँ", "ok" in any of the
+Indian languages Sarvam transcribes -- that resumes the reply, and becomes
+the caller's turn when the reply ends only if said during its last sentence)
+confirms the
+interruption and the turn is cut (LLM stream and TTS
 connection cancelled, queue drained), with the caller's utterance as the
 next turn; no transcript and 2s of quiet means it was noise, and the reply
 resumes from the start of the sentence it was paused in. A transcript of

@@ -72,7 +72,7 @@ logs what it resolved to, never the keys:
   | When the transcript arrives | What happens |
   |---|---|
   | Agent listening | A new turn |
-  | Reply paused by a possible interruption | Confirms it -- unless junk or too soon (see "Pause first") |
+  | Reply paused by a possible interruption | Confirms it -- unless junk, too soon, or only an acknowledgement like "जी"/"ok": that resumes the reply and is held -- the caller's turn if said during the reply's last sentence, else dropped (see "Pause first") |
   | Agent preparing or speaking a reply, not paused | Discarded and logged: `transcript ignored: the agent is speaking` (or `thinking`) |
 
   An answer that starts over the agent but ends after it finishes arrives
@@ -258,9 +258,39 @@ reply keeps generating and queueing. Then one of two things happens:
   transcript becomes the next turn (`agent barge-in confirmed; reply cut`).
   A **junk** transcript doesn't count (`transcript ignored: too short to be
   speech`): no digit and fewer than two letters/vowel signs, i.e. a lone
-  letter like "ह", which is what noise transcribes to. The rule is
-  deliberately narrow so one-word answers such as "जी", "ना", "हाँ" or "5"
-  still confirm.
+  letter like "ह", which is what noise transcribes to.
+- **Acknowledged** (`BARGE_IN_ACK_FILTER`, on by default): the transcript is
+  only acknowledgement words -- "जी", "हाँ", "ठीक है", "ok", "hmm",
+  "haan ji", or their Bengali, Gujarati, Marathi, Punjabi, Odia, Tamil,
+  Telugu, Kannada, Malayalam or Urdu equivalents
+  (`internal/ai/agent/backchannel.go`). Nothing is cut: the reply resumes as
+  after a false alarm (counted in `false_interruptions`), and the
+  acknowledgement is **held** (`acknowledgement held; the reply goes on`)
+  until the reply has played out. Then:
+  - said during the reply's **last sentence** (from `ACK_END_MARGIN_MS`,
+    default 300, before that sentence began) it is the caller's answer to
+    what the agent was finishing -- typically a yes/no question -- and
+    becomes their turn at once (`acknowledgement delivered as the caller's
+    turn`); they don't have to say it again;
+  - said during an **earlier** sentence the caller was only listening, and
+    it's dropped (`acknowledgement dropped why="said before the reply's last
+    sentence"`).
+
+  A real interruption after it (`acknowledgement dropped why="a real
+  interruption followed"`), or the call ending, drops it too. Anything that
+  refuses, asks or stops -- "नहीं", "जी नहीं", "क्या?", "ok wait" -- has a word
+  outside the list and still confirms at once. `call.summary` carries
+  `acks_held` and `acks_delivered`. Why: call 509 (2026-10-08), where a lone
+  "जी" over a question cut it and the LLM, given "जी" as the answer,
+  apologised for not understanding. Why held rather than dropped: Rapida
+  drops filler words and pipecat's min-words strategy drops short
+  transcripts, so an early "हाँ" to a yes/no question would be lost;
+  LiveKit holds transcripts said over the agent and keeps those from the
+  last 1s of its speech ("interrupting the agent is recoverable, discarding
+  a real user turn is not") -- Vaani keeps those from the whole last
+  sentence, which covers a long question. Once the agent has stopped, the
+  same word is an answer as always. (No minimum word count: the words that
+  must interrupt are often single words -- नहीं, रुको, stop.)
 - **False alarm:** no transcript, and the caller has been quiet for 2s (by
   TEN VAD's last speech, Sarvam's `END_SPEECH`, and Sarvam not reporting
   them mid-utterance). The reply resumes **from the start of the sentence it

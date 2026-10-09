@@ -168,6 +168,15 @@ type Config struct {
 	// what the caller is saying now. Junk later on is caught by content
 	// (junkTranscript), not time.
 	PostCutSilence time.Duration
+	// AckFilter: while a reply is paused for a possible interruption, an
+	// acknowledgement ("जी", "हाँ", "ok"; see backchannel) resumes it instead
+	// of cutting it, and is held: if the caller said it during the reply's
+	// last sentence it becomes their turn once the reply finishes (the answer
+	// to a yes/no question isn't lost), otherwise it's dropped as listening.
+	// AckEndMargin widens "during the last sentence" backwards a little (a
+	// "हाँ" started just as the question began). Off: every transcript cuts.
+	AckFilter    bool
+	AckEndMargin time.Duration
 
 	Sink Sink
 	// Log, if set, records the call for Dograh's call history (see CallLog).
@@ -260,6 +269,14 @@ type Handler struct {
 	// played yet. Written by ProcessFrame's goroutine, read by run() to decide
 	// what the caller actually heard when a reply is cut short.
 	playingReq atomic.Uint64
+	// playingSince (UnixNano) is when the sentence now playing started
+	// playing -- at the end of a reply, its last sentence. Same writer and
+	// reader as playingReq.
+	playingSince atomic.Int64
+	// heldAck is an acknowledgement said while the reply was paused, waiting
+	// for the reply to finish to learn whether it was an answer (see
+	// Config.AckFilter). run()-goroutine only.
+	heldAck *heldAck
 	// toolRunning is set while a tool executes (runLLMTurn's goroutine).
 	// processSpeakingFrame pauses its dead-TTS drain timeout meanwhile: an
 	// empty queue is expected while the caller waits on a slow API after a
@@ -646,12 +663,14 @@ func (h *Handler) processSpeakingFrame(pcm []byte) [][]byte {
 	select {
 	case frame := <-h.outbound:
 		h.emptyTicks = 0
-		h.playingReq.Store(frame.req)
 
 		if frame.gen != h.sentGen || frame.req != h.sentReq {
 			h.sentGen, h.sentReq = frame.gen, frame.req
 			h.sentFrames = h.sentFrames[:0]
+			h.playingSince.Store(time.Now().UnixNano()) // a new sentence starts playing
 		}
+
+		h.playingReq.Store(frame.req)
 
 		h.sentFrames = append(h.sentFrames, frame.pcm)
 
@@ -1135,6 +1154,17 @@ func (h *Handler) handleFinalTranscript(text string) {
 			return
 		}
 
+		if h.cfg.AckFilter && backchannel(text) {
+			// "जी", "हाँ", "ok", "hmm" while the agent talks: not "stop" -- the
+			// reply goes on, as after a false interruption. Held, not dropped:
+			// said during the reply's last sentence it's the caller's answer
+			// (a yes/no question), decided when the reply ends (settleAck).
+			h.holdAck(text)
+			h.resumeReply("backchannel")
+
+			return
+		}
+
 		h.confirmInterruption() // a real interruption: cut, and this becomes the next turn
 	}
 
@@ -1149,8 +1179,15 @@ func (h *Handler) handleFinalTranscript(text string) {
 		return
 	}
 
+	h.acceptUserTurn(text, h.utteranceStart(), speechEnd, lastSound, flushedAt)
+}
+
+// acceptUserTurn makes text the caller's turn and starts the agent's reply.
+// started is when they began saying it; speechEnd, lastSound and flushedAt
+// are the STT timings logged with it (zero: not known).
+func (h *Handler) acceptUserTurn(text string, started, speechEnd, lastSound, flushedAt time.Time) {
 	h.history = append(h.history, llm.Message{Role: "user", Content: text})
-	h.cfg.Log.UserSaid(text, h.utteranceStart())
+	h.cfg.Log.UserSaid(text, started)
 	h.turn++
 
 	// One line per caller turn: what they said and how long the STT took
@@ -1204,7 +1241,8 @@ const maxUtteranceAge = time.Minute
 // junkTranscript: no digit and fewer than two letters/vowel signs -- a lone
 // letter like "ह" or "म", or punctuation only. Deliberately narrow: real
 // one-word answers such as "जी", "ना", "हाँ" (letter + vowel sign) or "5"
-// must still count.
+// must still count. (While a reply is paused, an acknowledgement like "जी"
+// resumes it instead of cutting it: see backchannel.)
 func junkTranscript(text string) bool {
 	n := 0
 
@@ -1954,10 +1992,15 @@ func (h *Handler) finishTurn(gen uint64) {
 	h.ttsBuf = nil
 
 	if h.hangupAfterTurn || h.ending {
+		h.dropAck("the call is ending")
 		h.hangupAfterTurn = false
 		h.hangup()
 
 		return
+	}
+
+	if h.settleAck(gen) {
+		return // the caller's held answer is the next turn: no silence clock
 	}
 
 	// The agent has finished speaking: now the caller-silence clock runs.
@@ -2151,7 +2194,7 @@ func (h *Handler) resumeReply(reason string) {
 	h.paused.Store(false)
 
 	msg := "false interruption; resuming the reply"
-	if reason == "no transcript" {
+	if reason == "no transcript" || reason == "backchannel" {
 		h.cfg.Sink.FalseInterruption()
 	} else {
 		msg = "resuming the reply"
@@ -2171,6 +2214,7 @@ func (h *Handler) confirmInterruption() {
 	h.state.Store(int32(StateTranscribing))
 	h.paused.Store(false)
 	h.cfg.Sink.BargeIn()
+	h.dropAck("a real interruption followed") // its words carry the meaning
 	slog.Info("agent barge-in confirmed; reply cut", "call_id", h.callID, "gen", h.curGen,
 		"paused_ms", time.Since(h.pausedAt).Milliseconds(), "event", "agent.barge_in.confirmed")
 	h.cutReply()

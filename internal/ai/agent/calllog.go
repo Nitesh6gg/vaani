@@ -56,6 +56,7 @@ type CallLog struct {
 
 	// For the call.summary log line (CallLog is also a Sink).
 	replies, bargeIns, pauses, falseInterruptions int
+	acksHeld, acksDelivered                       int
 	errors                                        map[string]int
 	replyLatencies                                []int64
 }
@@ -77,8 +78,12 @@ type CallSummary struct {
 	// (Sink.Error). ReplyLatenciesMS: per reply, caller's last sound (or the
 	// STT's end of speech) to the reply's first audio.
 	UserTurns, AgentReplies, BargeIns, Pauses, FalseInterruptions int
-	Errors                                                        map[string]int
-	ReplyLatenciesMS                                              []int64
+	// AcksHeld counts acknowledgements said over a paused reply (Config.
+	// AckFilter); AcksDelivered those that turned out to be the caller's
+	// answer (said during the reply's last sentence).
+	AcksHeld, AcksDelivered int
+	Errors                  map[string]int
+	ReplyLatenciesMS        []int64
 }
 
 // Sink: a CallLog counts what the handler reports, for the call's summary.
@@ -86,6 +91,10 @@ func (l *CallLog) BargeIn()            { l.count(func() { l.bargeIns++ }) }
 func (l *CallLog) InterruptionPaused() { l.count(func() { l.pauses++ }) }
 func (l *CallLog) FalseInterruption()  { l.count(func() { l.falseInterruptions++ }) }
 func (l *CallLog) TurnStarted()        { l.count(func() { l.replies++ }) }
+
+// AckHeld / AckDelivered: see CallSummary.AcksHeld.
+func (l *CallLog) AckHeld()      { l.count(func() { l.acksHeld++ }) }
+func (l *CallLog) AckDelivered() { l.count(func() { l.acksDelivered++ }) }
 func (l *CallLog) Error(stage string) {
 	l.count(func() {
 		if l.errors == nil {
@@ -329,6 +338,8 @@ func (l *CallLog) Summary() CallSummary {
 
 		UserTurns: l.turn, AgentReplies: l.replies, BargeIns: l.bargeIns, Pauses: l.pauses,
 		FalseInterruptions: l.falseInterruptions,
+		AcksHeld:           l.acksHeld,
+		AcksDelivered:      l.acksDelivered,
 		ReplyLatenciesMS:   append([]int64(nil), l.replyLatencies...),
 	}
 
