@@ -187,6 +187,32 @@ func resolveServices(userConfigJSON, workflowConfigJSON string) (Services, []str
 	return s, warnings, nil
 }
 
+// resolveOwnerLLM is Dograh's resolve_user_llm_config (api/services/
+// workflow/qa/llm_config.py): the workflow owner's LLM user-configuration,
+// deliberately WITHOUT the workflow's model_overrides merged in -- unlike
+// resolveServices's "llm" section, which IS the conversation's effective
+// LLM. QA's qa_use_workflow_llm default reads this. "openai"/"gpt-4.1" are
+// Dograh's own fallbacks for an owner with no llm configuration at all; ok
+// is false when the resolved provider/model/key still can't make a call
+// (QA then reports "no_api_key", as Dograh does).
+func resolveOwnerLLM(userConfigJSON string) (cfg LLMConfig, ok bool) {
+	var user map[string]json.RawMessage
+	_ = json.Unmarshal([]byte(userConfigJSON), &user)
+
+	var sec section
+	_ = json.Unmarshal(user["llm"], &sec)
+
+	cfg = LLMConfig{Provider: sec.strOr("provider", "openai"), Model: sec.strOr("model", "gpt-4.1"), APIKey: sec.apiKey()}
+
+	if url, ok := llmBaseURLs[cfg.Provider]; ok {
+		cfg.BaseURL = url
+	} else if cfg.BaseURL = sec.str("base_url"); cfg.BaseURL == "" {
+		cfg.BaseURL = llmDefaultBaseURLs[cfg.Provider]
+	}
+
+	return cfg, cfg.BaseURL != "" && cfg.APIKey != ""
+}
+
 func (s section) str(key string) string {
 	v, _ := s[key].(string)
 	return v

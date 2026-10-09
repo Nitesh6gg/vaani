@@ -397,6 +397,16 @@ func (b *Builder) recordRun(c Call, wf *dograh.Workflow, callLog *agent.CallLog,
 	slog.Info("dograh run completed", "call_id", c.ID, "component", "dograh", "event", "run.completed",
 		"disposition", reason, "events", len(summary.Events), "variables", len(summary.Extracted),
 		"recording_bytes", len(recording), "minio", b.storage != nil)
+
+	// QA Analysis nodes: Dograh's own calls trigger these from a background
+	// job on completion (run_integrations_post_workflow_run); Vaani's calls,
+	// written straight to Dograh's database, never trigger that job, so
+	// RunQA runs it here instead. Skipped if Vaani is already shutting down
+	// -- a slow QA pass must not hold up the shutdown drain any more than
+	// necessary (RunQA bounds itself regardless, see qaOverallTimeout).
+	if b.procCtx.Err() == nil {
+		b.store.RunQA(context.Background(), wf, c.ID, runID, summary, duration)
+	}
 }
 
 // logCallSummary writes the call's one summary line: what to chart and alert

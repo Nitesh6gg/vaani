@@ -1187,13 +1187,19 @@ func TestHandler_EndCallHangsUpAfterGoodbyePlays(t *testing.T) {
 
 	// As Dograh orders them: "Goodbye." came in the same LLM response as the
 	// end_call, so its line is timed by that response's start -- before the
-	// function call it made -- though it's logged once it has played.
+	// function call it made -- though it's logged once it has played. The
+	// two rtf-ttfb-metric events (llm, tts) carry no turn-start payload
+	// timestamp (there isn't one for "how long the first token/audio took"),
+	// so they fall back to when they were logged -- last, at the very end
+	// of the turn.
 	assert.Equal(t, []string{
 		"rtf-node-transition <nil> <nil>",
 		"rtf-user-transcription bye <nil>",
 		"rtf-bot-text Goodbye. <nil>",
 		"rtf-function-call-start <nil> end_call",
 		"rtf-function-call-end <nil> end_call",
+		"rtf-ttfb-metric <nil> <nil>",
+		"rtf-ttfb-metric <nil> <nil>",
 	}, types)
 }
 

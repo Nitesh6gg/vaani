@@ -356,15 +356,55 @@ call: failures are logged (`dograh run: ...`) and the call carries on.
     `[timestamp] Agent: ...`, one line per event above, in that order, with
     the turn's start time (`payload.timestamp`).
   - Log: `dograh run completed run_id=... disposition=... variables=N`.
+- **Then QA Analysis**, if the workflow has any QA nodes (`internal/dograh/
+  qa.go`): Dograh's own calls trigger this from a background job on
+  completion (`run_integrations_post_workflow_run`) that Vaani's calls, written
+  straight to the database, never reach -- so `callagent.Builder.recordRun`
+  calls `Store.RunQA` itself, right after the run above completes (skipped if
+  Vaani is already shutting down; bounded to 5 minutes regardless, so a stuck
+  LLM provider can't hold up the shutdown drain any further than necessary).
+  A from-scratch Go port of `api/services/workflow/qa/*.py`, read against
+  Dograh's source rather than guessed at:
+  - **Per QA node**, unless disabled (`qa_enabled`) or skipped (too short --
+    `qa_min_call_duration`, default 15s; voicemail with `qa_voicemail_calls`
+    off; excluded by `qa_sample_rate`'s random sampling) -- logged either way,
+    `qa.completed`/`qa.skipped`/`qa.failed`.
+  - The call's events, split by node (falling back to one whole-call review
+    if an event ever lacks a node id -- doesn't happen for Vaani: every event
+    is tagged from the first, see `CallLog.NodeEntered`), each segment
+    reviewed by an LLM against the node's `qa_system_prompt`, filled in with
+    `{{node_summary}}` (a cached one-time summary of that node's script,
+    generated and persisted to `workflow_definitions.workflow_json.
+    node_summaries` the first time any call needs it -- Dograh regenerates
+    per QA node if more than one shares a missing summary; Vaani does it once
+    per call instead, a deliberate, behavior-preserving simplification),
+    `{{previous_conversation_summary}}` (the earlier nodes' transcript,
+    summarized), `{{transcript}}` (`[12.3s] user: ...` lines, timed like the
+    stored transcript above) and `{{metrics}}` (turn count, average/max reply
+    latency and TTFB -- Vaani's own `turn.agent` timings, logged as
+    `rtf-latency-measured`/`rtf-ttfb-metric` events purely for this).
+  - Which LLM: the QA node's own (`qa_use_workflow_llm` off: openai,
+    openrouter or anthropic -- azure isn't supported yet, a different
+    auth shape) or, by default, the workflow **owner's** raw LLM
+    configuration -- deliberately *not* the conversation's effective
+    LLM (`resolveOwnerLLM`, not `resolveServices`): Dograh's own
+    `resolve_user_llm_config` ignores the workflow's `model_overrides` too.
+  - Each node's result (tags, a 1-10 quality score, sentiment, a summary --
+    parsed from the review LLM's JSON reply with `agent.ParseLLMJSON`, the
+    same parser variable extraction uses) is merged into the run's
+    `annotations` as `qa_<node id>`, plus a top-level `tags` list across every
+    QA node (Dograh's run list filters by this).
 - **Time budgets:** creating the run is tried twice, 10s each. Completing it
   comes first and gets its own 10s; each upload 20s, the file update 10s --
   so a slow MinIO costs only the files, never leaves a run at `running`
   (Dograh likewise uploads in a later job). When Vaani is stopping (SIGTERM,
   a deploy), the end-of-call variable extraction is skipped so the
-  completion is written inside the shutdown window.
+  completion is written inside the shutdown window; QA Analysis (above) is
+  skipped outright rather than started.
 - **Not done** (Dograh's completion job, which Vaani can't run): cost
-  calculation, QA, integrations/webhooks. LLM/TTS/STT usage in `usage_info`
-  is left empty.
+  calculation, integrations/webhooks. LLM/TTS/STT usage in `usage_info` is
+  left empty (QA's own token usage isn't currently counted either -- Dograh's
+  job computes it, but never actually records a non-zero value either).
 
 ### Variable extraction
 

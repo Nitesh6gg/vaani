@@ -26,6 +26,14 @@ const (
 	eventNodeTransition    = "rtf-node-transition"
 	eventFunctionCallStart = "rtf-function-call-start"
 	eventFunctionCallEnd   = "rtf-function-call-end"
+	// eventLatencyMeasured/eventTTFBMetric: turn timing QA's per-call
+	// metrics read (qa/metrics.py's compute_call_metrics). Dograh emits
+	// these from pipecat's latency/TTFB observers (run_pipeline.py,
+	// realtime_feedback_observer.py); Vaani's equivalents are its own
+	// reply-latency and first-token/first-audio measurements, already taken
+	// for the turn.agent log line -- see ReplyLatency and TTFBMeasured.
+	eventLatencyMeasured = "rtf-latency-measured"
+	eventTTFBMetric      = "rtf-ttfb-metric"
 )
 
 // LogEvent is one entry of Dograh's realtime_feedback_events, shaped as its
@@ -105,9 +113,23 @@ func (l *CallLog) Error(stage string) {
 	})
 }
 
-// ReplyLatency records one reply's wait as the caller experienced it.
+// ReplyLatency records one reply's wait as the caller experienced it:
+// Dograh's "user-to-bot response latency" (pipecat's on_latency_measured),
+// logged as an rtf-latency-measured event (QA's avg/max_latency_seconds)
+// alongside the call.summary percentiles.
 func (l *CallLog) ReplyLatency(d time.Duration) {
-	l.count(func() { l.replyLatencies = append(l.replyLatencies, d.Milliseconds()) })
+	l.count(func() {
+		l.replyLatencies = append(l.replyLatencies, d.Milliseconds())
+		l.add(eventLatencyMeasured, map[string]any{"latency_seconds": d.Seconds()})
+	})
+}
+
+// TTFBMeasured records one turn's time to first byte for one service ("llm",
+// "tts"): Dograh's per-service TTFB (pipecat's TTFBMetricsData), logged as
+// an rtf-ttfb-metric event. QA's avg_ttfb_seconds averages every service's
+// values together, as Dograh's own compute_call_metrics does.
+func (l *CallLog) TTFBMeasured(service string, d time.Duration) {
+	l.count(func() { l.add(eventTTFBMetric, map[string]any{"ttfb_seconds": d.Seconds(), "service": service}) })
 }
 
 func (l *CallLog) count(f func()) {
@@ -242,12 +264,14 @@ func turnTime(started time.Time) string {
 	return started.UTC().Format(payloadTimeFormat)
 }
 
-// sortKey is Dograh's _event_sort_key: the payload's (turn) timestamp, else
-// the event's own. Compared as times at the millisecond -- the turn stamps'
-// precision -- rather than as strings as Python does: within one millisecond
-// Python's string order puts the millisecond stamps first, this keeps the
-// order events were logged in.
-func sortKey(e LogEvent) time.Time {
+// EventTime is Dograh's _safe_parse_timestamp/_event_sort_key: the payload's
+// (turn) timestamp, else the event's own. Compared as times at the
+// millisecond -- the turn stamps' precision -- rather than as strings as
+// Python does: within one millisecond Python's string order puts the
+// millisecond stamps first, this keeps the order events were logged in.
+// Exported for QA analysis (internal/dograh), which times a transcript the
+// same way.
+func EventTime(e LogEvent) time.Time {
 	ts, _ := e.Payload["timestamp"].(string)
 	if ts == "" {
 		ts = e.Timestamp
@@ -366,7 +390,7 @@ func (l *CallLog) Summary() CallSummary {
 // events sharing a time keep the order they were logged in.
 func sortedEvents(events []LogEvent) []LogEvent {
 	out := append([]LogEvent(nil), events...)
-	sort.SliceStable(out, func(i, j int) bool { return sortKey(out[i]).Before(sortKey(out[j])) })
+	sort.SliceStable(out, func(i, j int) bool { return EventTime(out[i]).Before(EventTime(out[j])) })
 
 	return out
 }

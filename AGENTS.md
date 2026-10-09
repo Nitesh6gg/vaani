@@ -27,7 +27,9 @@ Real-time voice agent: Asterisk ARI (telephony) + Go media plane + Sarvam STT/TT
 - `internal/dograh/` — Dograh's Postgres: reads the workflow graph,
   `{{variable}}` rendering, tools (incl. `http_api`), models/keys, call limits;
   writes each call's `workflow_runs` record (`run.go`) and uploads its
-  recording/transcript to Dograh's MinIO (`storage.go`)
+  recording/transcript to Dograh's MinIO (`storage.go`); runs QA Analysis
+  nodes after each call (`qa.go`), which Dograh's own background job would
+  do for a call started in Dograh itself
 - `internal/callagent/` — builds a call's Dograh agent and records the call
   in Dograh; shared by the ARI and FreeSWITCH call managers
 - `internal/freeswitch/` — FreeSWITCH calls (`TELEPHONY=freeswitch`, no

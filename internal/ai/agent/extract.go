@@ -185,10 +185,13 @@ func toolResponseText(raw string) (text string, keep bool) {
 
 var codeBlock = regexp.MustCompile("```(?:json)?\\s*([\\s\\S]*?)\\s*```")
 
-// parseLLMJSON is Dograh's parse_llm_json: the reply as JSON, else the JSON
-// inside a ``` block, else the first {...} or [...] in it; failing all that,
-// {"raw": reply}. Returns the parsed value (a map or a slice) as raw JSON.
-func parseLLMJSON(reply string) json.RawMessage {
+// ParseLLMJSON is Dograh's parse_llm_json (api/services/gen_ai/
+// json_parser.py): the reply as JSON, else the JSON inside a ``` block, else
+// the first {...} or [...] in it; failing all that, {"raw": reply}. Never
+// errors -- an unparseable reply still comes back as valid JSON. Returns the
+// parsed value (a map or a slice) as raw JSON. Exported for QA analysis
+// (internal/dograh), which parses an LLM's review the same way.
+func ParseLLMJSON(reply string) json.RawMessage {
 	s := strings.TrimSpace(reply)
 	if s == "" {
 		return json.RawMessage(`{}`)
@@ -242,7 +245,7 @@ func (h *Handler) extract(ctx context.Context, node *Node, history []llm.Message
 		return
 	}
 
-	raw := parseLLMJSON(reply.String())
+	raw := ParseLLMJSON(reply.String())
 
 	vars, keys := objectInOrder(raw)
 	if vars == nil {

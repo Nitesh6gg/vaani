@@ -28,6 +28,37 @@ type workflowJSON struct {
 			TransitionSpeech string `json:"transition_speech"`
 		} `json:"data"`
 	} `json:"edges"`
+	// NodeSummaries caches each agentNode/startCall node's QA script summary
+	// (qa.go), keyed by node id -- a sibling of "nodes"/"edges" in
+	// workflow_json, not a node itself (node_summary.py).
+	NodeSummaries map[string]nodeSummaryEntry `json:"node_summaries"`
+}
+
+// nodeSummaryEntry is one cached node summary: node_summary.py's
+// get_node_summary_text handles both the current shape
+// ({"summary": "...", "trace_url": "..."}) and the legacy plain-string one.
+type nodeSummaryEntry struct {
+	Summary string
+}
+
+func (e *nodeSummaryEntry) UnmarshalJSON(b []byte) error {
+	var s string
+	if json.Unmarshal(b, &s) == nil {
+		e.Summary = s
+		return nil
+	}
+
+	var obj struct {
+		Summary string `json:"summary"`
+	}
+
+	if err := json.Unmarshal(b, &obj); err != nil {
+		return err
+	}
+
+	e.Summary = obj.Summary
+
+	return nil
 }
 
 type nodeData struct {
@@ -49,6 +80,19 @@ type nodeData struct {
 		Type   string  `json:"type"`
 		Prompt *string `json:"prompt"`
 	} `json:"extraction_variables"`
+
+	// QA Analysis node settings (type "qa"; node_specs/qa.py). Harmless on
+	// any other node type: the JSON field names don't collide with theirs.
+	QAEnabled         *bool    `json:"qa_enabled"` // default true
+	QASystemPrompt    string   `json:"qa_system_prompt"`
+	QAMinCallDuration *float64 `json:"qa_min_call_duration"` // seconds, default 15
+	QAVoicemailCalls  bool     `json:"qa_voicemail_calls"`   // default false
+	QASampleRate      *float64 `json:"qa_sample_rate"`       // percent, default 100
+	QAUseWorkflowLLM  *bool    `json:"qa_use_workflow_llm"`  // default true
+	QAProvider        string   `json:"qa_provider"`
+	QAModel           string   `json:"qa_model"`
+	QAAPIKey          string   `json:"qa_api_key"`
+	QAEndpoint        string   `json:"qa_endpoint"`
 }
 
 const globalNodeType = "globalNode"

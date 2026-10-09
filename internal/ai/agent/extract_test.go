@@ -78,7 +78,7 @@ func TestParseLLMJSONMatchesDograh(t *testing.T) {
 		"no json here":                             `{"raw": "no json here"}`,
 	}
 	for in, want := range cases {
-		assert.JSONEq(t, want, string(parseLLMJSON(in)), in)
+		assert.JSONEq(t, want, string(ParseLLMJSON(in)), in)
 	}
 }
 

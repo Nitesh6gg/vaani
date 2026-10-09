@@ -225,13 +225,11 @@ func gatheredContext(sum agent.CallSummary, mapDisposition func(string) string) 
 	}
 
 	// An extracted one counts only as non-empty text (Dograh: any truthy value).
-	d, extracted := sum.Extracted["call_disposition"].(string)
-	if extracted && d != "" {
-		g["extracted_call_disposition"] = d
-	} else if d = sum.EndReason; d == "" {
-		d = agent.EndReasonUserHangup
+	if ed, extracted := sum.Extracted["call_disposition"].(string); extracted && ed != "" {
+		g["extracted_call_disposition"] = ed
 	}
 
+	d := callDisposition(sum)
 	mapped = mapDisposition(d)
 	g["call_disposition"] = d
 	g["mapped_call_disposition"] = mapped
@@ -251,6 +249,23 @@ func gatheredContext(sum agent.CallSummary, mapDisposition func(string) string) 
 	g["call_tags"] = tags
 
 	return g, mapped
+}
+
+// callDisposition is the call's outcome as Dograh records and QA's
+// voicemail skip rule reads it (gatheredContext's call_disposition; QA's
+// _should_skip_qa compares it to EndTaskReason.VOICEMAIL_DETECTED): an
+// extracted call_disposition variable if there is one and it's non-empty,
+// else why the call ended, else "user_hangup".
+func callDisposition(sum agent.CallSummary) string {
+	if d, extracted := sum.Extracted["call_disposition"].(string); extracted && d != "" {
+		return d
+	}
+
+	if sum.EndReason != "" {
+		return sum.EndReason
+	}
+
+	return agent.EndReasonUserHangup
 }
 
 func containsTag(tags []any, s string) bool {

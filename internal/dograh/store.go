@@ -126,8 +126,12 @@ func (s *Store) Workflow(ctx context.Context, workflowID int, callVars map[strin
 		warnings = append(warnings, warn)
 	}
 
+	ownerLLM, ownerLLMOK := resolveOwnerLLM(userConfig)
+	qaConfig := buildQAConfig(wf, tools, ownerLLM, ownerLLMOK)
+
 	return &Workflow{ID: workflowID, DefinitionID: defID, OrgID: orgID,
-		Start: start, Services: services, IdleTimeout: idle, MaxDuration: maxDuration}, warnings, nil
+		Start: start, Services: services, IdleTimeout: idle, MaxDuration: maxDuration,
+		QA: qaConfig}, warnings, nil
 }
 
 // Workflow is what one call runs.
@@ -140,6 +144,9 @@ type Workflow struct {
 	// From the workflow's settings (see callLimits); 0 disables.
 	IdleTimeout time.Duration
 	MaxDuration time.Duration
+	// QA is the workflow's QA Analysis setup (qa.go); zero value if it has
+	// no QA nodes.
+	QA QAConfig
 }
 
 // Dograh's backend defaults (api/services/pipecat/run_pipeline.py), used

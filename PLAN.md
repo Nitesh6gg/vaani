@@ -170,6 +170,21 @@ Status, item by item — "live" means seen working on a real call:
 
 **Step 3b is done.**
 
+- **QA Analysis** (2026-10-09, after the FreeSWITCH phase): Dograh's own
+  calls trigger a post-call QA review from a background job; Vaani's calls,
+  written straight to the database, never reach that job, so
+  `internal/dograh/qa.go` is a from-scratch Go port, run right after the
+  call's record is written. Per QA node in the workflow: split by node,
+  summarize each node's script (cached, generated once and persisted) and
+  the conversation so far, review against the node's prompt with an LLM
+  (the owner's configured one by default -- deliberately not the
+  conversation's own model override, matching Dograh's
+  `resolve_user_llm_config`), save tags/score/sentiment to the run's
+  annotations. See "Call history in Dograh" in `docs/ARCHITECTURE.md` —
+  unit-tested (every pure step, plus an end-to-end per-node run against a
+  fake LLM); `go test -race` clean on the Linux server; **not yet tried
+  against a real Dograh database with a live QA node configured**.
+
 - **Robustness pass** (2026-10-06, after an external code review, each
   finding verified against the code first): fixes for calls that could get
   stuck (a dropped barge-in signal leaving a reply paused, a dead TTS

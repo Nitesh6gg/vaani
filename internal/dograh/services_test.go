@@ -72,3 +72,26 @@ func TestResolveServicesUnsupported(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, warnings, 1)
 }
+
+// resolveOwnerLLM is Dograh's resolve_user_llm_config (QA's
+// qa_use_workflow_llm default): the owner's own llm config, deliberately
+// NOT riyaOverrides's model_overrides -- unlike resolveServices.
+func TestResolveOwnerLLM(t *testing.T) {
+	cfg, ok := resolveOwnerLLM(userConfig)
+	require.True(t, ok)
+	assert.Equal(t, LLMConfig{Provider: "bifrost", BaseURL: "http://192.168.26.130:8080/v1",
+		APIKey: "user-llm-key", Model: "gemini/gemini-3.1-flash-lite"}, cfg,
+		"the owner's raw llm section, not the workflow's model_overrides")
+
+	// No user configuration at all: Dograh's own fallbacks -- but no key,
+	// so unusable.
+	cfg, ok = resolveOwnerLLM("")
+	assert.False(t, ok)
+	assert.Equal(t, LLMConfig{Provider: "openai", BaseURL: "https://api.openai.com/v1", Model: "gpt-4.1"}, cfg)
+
+	// A provider resolveServices doesn't special-case (no fixed/default
+	// base_url) still resolves via the section's own base_url.
+	cfg, ok = resolveOwnerLLM(`{"llm": {"provider": "custom", "api_key": "k", "model": "m", "base_url": "https://x/v1"}}`)
+	require.True(t, ok)
+	assert.Equal(t, "https://x/v1", cfg.BaseURL)
+}

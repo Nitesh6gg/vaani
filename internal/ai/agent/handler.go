@@ -2079,10 +2079,12 @@ func (h *Handler) recordReply(cut bool) {
 		"gen", h.curGen, "cut", cut, "text", text}
 	if t := h.ttft.Load(); t != nil && t.gen == h.curGen {
 		args = append(args, "llm_ttft_ms", t.d.Milliseconds())
+		h.cfg.Log.TTFBMeasured("llm", t.d)
 	}
 
 	if h.turnTTFA > 0 {
 		args = append(args, "tts_ttfa_ms", h.turnTTFA.Milliseconds())
+		h.cfg.Log.TTFBMeasured("tts", h.turnTTFA)
 	}
 
 	if h.turnReplyLatency > 0 {
