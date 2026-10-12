@@ -87,16 +87,25 @@ type Sink interface {
 	FalseInterruption()
 	TurnStarted()
 	Error(stage string)
+	// TTFB: a service's time-to-first-byte for this turn (service: "stt",
+	// "llm", or "tts" -- same values as CallLog.TTFBMeasured, which records
+	// the same spans for Dograh's UI; this is the Prometheus-metrics side).
+	TTFB(service string, d time.Duration)
+	// ToolCall: a tool run (runTool's t.Run branch) finished, ok reporting
+	// whether it returned an error.
+	ToolCall(tool string, ok bool, d time.Duration)
 }
 
 // NoopSink discards every event; useful for tests and as a safe default.
 type NoopSink struct{}
 
-func (NoopSink) BargeIn()            {}
-func (NoopSink) InterruptionPaused() {}
-func (NoopSink) FalseInterruption()  {}
-func (NoopSink) TurnStarted()        {}
-func (NoopSink) Error(string)        {}
+func (NoopSink) BargeIn()                             {}
+func (NoopSink) InterruptionPaused()                  {}
+func (NoopSink) FalseInterruption()                   {}
+func (NoopSink) TurnStarted()                         {}
+func (NoopSink) Error(string)                         {}
+func (NoopSink) TTFB(string, time.Duration)           {}
+func (NoopSink) ToolCall(string, bool, time.Duration) {}
 
 // Config bundles one call's agent dependencies.
 type Config struct {
@@ -1212,6 +1221,7 @@ func (h *Handler) acceptUserTurn(text string, started, speechEnd, lastSound, flu
 		endpoint := time.Since(speechEnd)
 		args = append(args, "endpoint_ms", endpoint.Milliseconds())
 		h.cfg.Log.TTFBMeasured("stt", endpoint)
+		h.cfg.Sink.TTFB("stt", endpoint)
 
 		if !lastSound.IsZero() {
 			// The caller's last sound (local VAD) -> Sarvam's end-of-speech.
@@ -1557,15 +1567,18 @@ func (h *Handler) runTool(ctx context.Context, ttsClient tts.Client, node *Node,
 	start := time.Now()
 
 	result, err := t.Run(tctx, json.RawMessage(call.Function.Arguments))
+	duration := time.Since(start)
+	h.cfg.Sink.ToolCall(call.Function.Name, err == nil, duration)
+
 	if err != nil {
 		slog.Error("tool failed", "call_id", h.callID, "gen", gen, "event", "tool.error", "tool", call.Function.Name,
-			"duration_ms", time.Since(start).Milliseconds(), "error", err)
+			"duration_ms", duration.Milliseconds(), "error", err)
 
 		return toolErrorResult(err), actionNone
 	}
 
 	slog.Info("tool result", "call_id", h.callID, "gen", gen, "event", "tool.result", "tool", call.Function.Name,
-		"duration_ms", time.Since(start).Milliseconds(), "result", truncate(result, 200))
+		"duration_ms", duration.Milliseconds(), "result", truncate(result, 200))
 
 	return result, actionNone
 }
@@ -2087,11 +2100,13 @@ func (h *Handler) recordReply(cut bool) {
 	if t := h.ttft.Load(); t != nil && t.gen == h.curGen {
 		args = append(args, "llm_ttft_ms", t.d.Milliseconds())
 		h.cfg.Log.TTFBMeasured("llm", t.d)
+		h.cfg.Sink.TTFB("llm", t.d)
 	}
 
 	if h.turnTTFA > 0 {
 		args = append(args, "tts_ttfa_ms", h.turnTTFA.Milliseconds())
 		h.cfg.Log.TTFBMeasured("tts", h.turnTTFA)
+		h.cfg.Sink.TTFB("tts", h.turnTTFA)
 	}
 
 	if h.turnReplyLatency > 0 {

@@ -100,6 +100,13 @@ func (l *CallLog) InterruptionPaused() { l.count(func() { l.pauses++ }) }
 func (l *CallLog) FalseInterruption()  { l.count(func() { l.falseInterruptions++ }) }
 func (l *CallLog) TurnStarted()        { l.count(func() { l.replies++ }) }
 
+// TTFB and ToolCall are no-ops on CallLog: it already gets this data through
+// TTFBMeasured (called directly by handler.go, not via the Sink interface)
+// and has no tool-call counters of its own -- only Prometheus's AgentSink
+// acts on these two Sink events.
+func (l *CallLog) TTFB(string, time.Duration)           {}
+func (l *CallLog) ToolCall(string, bool, time.Duration) {}
+
 // SpeechHeld / SpeechDelivered: see CallSummary.HeldSpeech.
 func (l *CallLog) SpeechHeld()      { l.count(func() { l.heldSpeech++ }) }
 func (l *CallLog) SpeechDelivered() { l.count(func() { l.heldDelivered++ }) }
@@ -176,6 +183,18 @@ func (m multiSink) TurnStarted() {
 func (m multiSink) Error(stage string) {
 	for _, s := range m {
 		s.Error(stage)
+	}
+}
+
+func (m multiSink) TTFB(service string, d time.Duration) {
+	for _, s := range m {
+		s.TTFB(service, d)
+	}
+}
+
+func (m multiSink) ToolCall(tool string, ok bool, d time.Duration) {
+	for _, s := range m {
+		s.ToolCall(tool, ok, d)
 	}
 }
 

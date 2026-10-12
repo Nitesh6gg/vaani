@@ -1,6 +1,8 @@
 package metrics
 
 import (
+	"time"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 
@@ -37,6 +39,39 @@ var (
 		Name: "vaani_agent_errors_total",
 		Help: "Total agent-pipeline errors by stage (stt, llm, tts_open, tts_speak, tts_cancel, tts_outbound_full).",
 	}, []string{"stage"})
+
+	// ttfbBuckets: 50ms..~25.6s, covering a fast TTS first-chunk through a
+	// slow LLM first-token on a cold connection.
+	ttfbBuckets = prometheus.ExponentialBuckets(50, 2, 10)
+
+	LLMTTFTMs = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "vaani_llm_ttft_ms",
+		Help:    "Time from transcript accepted to the first LLM token, in milliseconds.",
+		Buckets: ttfbBuckets,
+	})
+
+	TTSTTFAMs = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "vaani_tts_ttfa_ms",
+		Help:    "Time from transcript accepted to the first TTS audio chunk, in milliseconds.",
+		Buckets: ttfbBuckets,
+	})
+
+	STTEndpointMs = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "vaani_stt_endpoint_ms",
+		Help:    "Time from Sarvam's END_SPEECH to its final transcript, in milliseconds.",
+		Buckets: ttfbBuckets,
+	})
+
+	ToolCallsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "vaani_tool_calls_total",
+		Help: "Total tool runs (runTool's t.Run branch) by tool name and outcome (ok, error).",
+	}, []string{"tool", "outcome"})
+
+	ToolCallDurationMs = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "vaani_tool_call_duration_ms",
+		Help:    "Tool run duration by tool name, in milliseconds.",
+		Buckets: prometheus.ExponentialBuckets(10, 2, 12), // 10ms..~20.5s
+	}, []string{"tool"})
 )
 
 // AgentSink adapts the package-level agent counters to agent.Sink, keeping
@@ -49,5 +84,28 @@ func (AgentSink) InterruptionPaused() { AgentInterruptionPausesTotal.Inc() }
 func (AgentSink) FalseInterruption()  { AgentFalseInterruptionsTotal.Inc() }
 func (AgentSink) TurnStarted()        { AgentTurnsTotal.Inc() }
 func (AgentSink) Error(stage string)  { AgentErrorsTotal.WithLabelValues(stage).Inc() }
+
+func (AgentSink) TTFB(service string, d time.Duration) {
+	ms := float64(d.Milliseconds())
+
+	switch service {
+	case "llm":
+		LLMTTFTMs.Observe(ms)
+	case "tts":
+		TTSTTFAMs.Observe(ms)
+	case "stt":
+		STTEndpointMs.Observe(ms)
+	}
+}
+
+func (AgentSink) ToolCall(tool string, ok bool, d time.Duration) {
+	outcome := "ok"
+	if !ok {
+		outcome = "error"
+	}
+
+	ToolCallsTotal.WithLabelValues(tool, outcome).Inc()
+	ToolCallDurationMs.WithLabelValues(tool).Observe(float64(d.Milliseconds()))
+}
 
 var _ agent.Sink = AgentSink{}
