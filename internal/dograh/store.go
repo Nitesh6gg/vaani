@@ -126,8 +126,7 @@ func (s *Store) Workflow(ctx context.Context, workflowID int, callVars map[strin
 		warnings = append(warnings, warn)
 	}
 
-	ownerLLM, ownerLLMOK := resolveOwnerLLM(userConfig)
-	qaConfig := buildQAConfig(wf, tools, ownerLLM, ownerLLMOK)
+	qaConfig := buildQAConfig(wf, tools, services.LLM)
 
 	return &Workflow{ID: workflowID, DefinitionID: defID, OrgID: orgID,
 		Start: start, Services: services, IdleTimeout: idle, MaxDuration: maxDuration,

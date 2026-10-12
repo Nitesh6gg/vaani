@@ -139,38 +139,52 @@ func TestQAProviderBaseURL(t *testing.T) {
 }
 
 func TestResolveQALLM(t *testing.T) {
-	owner := LLMConfig{Provider: "bifrost", BaseURL: "http://x/v1", APIKey: "owner-key", Model: "owner-model"}
+	wfLLM := LLMConfig{Provider: "bifrost", BaseURL: "http://x/v1", APIKey: "wf-key", Model: "wf-model"}
 
-	// Default: the owner's LLM, unchanged.
-	cfg, ok := resolveQALLM(QANode{UseWorkflowLLM: true}, owner, true)
+	// Default: the workflow's LLM, unchanged.
+	cfg, ok := resolveQALLM(QANode{UseWorkflowLLM: true}, wfLLM)
 	require.True(t, ok)
-	assert.Equal(t, owner, cfg)
+	assert.Equal(t, wfLLM, cfg)
 
-	// The owner's LLM with this QA node's own model substituted in.
-	cfg, ok = resolveQALLM(QANode{UseWorkflowLLM: true, Model: "gpt-5"}, owner, true)
+	// The workflow's LLM with this QA node's own model substituted in.
+	cfg, ok = resolveQALLM(QANode{UseWorkflowLLM: true, Model: "gpt-5"}, wfLLM)
 	require.True(t, ok)
 	assert.Equal(t, "gpt-5", cfg.Model)
-	assert.Equal(t, owner.APIKey, cfg.APIKey)
+	assert.Equal(t, wfLLM.APIKey, cfg.APIKey)
 
 	// "default" is a no-op, not a literal model name.
-	cfg, ok = resolveQALLM(QANode{UseWorkflowLLM: true, Model: "default"}, owner, true)
+	cfg, ok = resolveQALLM(QANode{UseWorkflowLLM: true, Model: "default"}, wfLLM)
 	require.True(t, ok)
-	assert.Equal(t, owner.Model, cfg.Model)
+	assert.Equal(t, wfLLM.Model, cfg.Model)
 
-	// No owner LLM configured at all.
-	_, ok = resolveQALLM(QANode{UseWorkflowLLM: true}, LLMConfig{}, false)
+	// No key: unusable (QA reports no_api_key).
+	_, ok = resolveQALLM(QANode{UseWorkflowLLM: true}, LLMConfig{Provider: "openai", BaseURL: "https://api.openai.com/v1"})
 	assert.False(t, ok)
 
 	// The QA node's own LLM.
-	cfg, ok = resolveQALLM(QANode{UseWorkflowLLM: false, Provider: "openai", APIKey: "k", Model: "gpt-4o"}, owner, true)
+	cfg, ok = resolveQALLM(QANode{UseWorkflowLLM: false, Provider: "openai", APIKey: "k", Model: "gpt-4o"}, wfLLM)
 	require.True(t, ok)
 	assert.Equal(t, LLMConfig{Provider: "openai", BaseURL: "https://api.openai.com/v1", APIKey: "k", Model: "gpt-4o"}, cfg)
 
 	// Azure (unsupported) or a missing key/model: unusable.
-	_, ok = resolveQALLM(QANode{UseWorkflowLLM: false, Provider: "azure", APIKey: "k", Model: "m"}, owner, true)
+	_, ok = resolveQALLM(QANode{UseWorkflowLLM: false, Provider: "azure", APIKey: "k", Model: "m"}, wfLLM)
 	assert.False(t, ok)
-	_, ok = resolveQALLM(QANode{UseWorkflowLLM: false, Provider: "openai", Model: "gpt-4o"}, owner, true)
+	_, ok = resolveQALLM(QANode{UseWorkflowLLM: false, Provider: "openai", Model: "gpt-4o"}, wfLLM)
 	assert.False(t, ok, "no api key")
+}
+
+// TestResolveQALLMUsesWorkflowOverride: workflow 19's case. The account LLM
+// is Gemini, the workflow's model_overrides LLM is Sarvam; with "Use
+// Workflow's LLM" on, QA must review on Sarvam, the model the conversation
+// ran on (see resolveQALLM's divergence note).
+func TestResolveQALLMUsesWorkflowOverride(t *testing.T) {
+	services, _, err := resolveServices(userConfig, riyaOverrides)
+	require.NoError(t, err)
+
+	cfg, ok := resolveQALLM(QANode{UseWorkflowLLM: true}, services.LLM)
+	require.True(t, ok)
+	assert.Equal(t, "sarvam-v2/gemma4", cfg.Model, "the workflow's override, not the account's gemini")
+	assert.Equal(t, "wf-llm-key", cfg.APIKey)
 }
 
 func TestParseQAReply(t *testing.T) {
@@ -247,8 +261,7 @@ func TestRunQANodePerNode(t *testing.T) {
 		Nodes:         parseQANodes(wfJSON),
 		NodeScripts:   buildNodeScripts(wfJSON, nil),
 		NodeSummaries: map[string]string{"a1": "cached, not regenerated"}, // s1 is missing -> generated
-		OwnerLLM:      LLMConfig{Provider: "openai", BaseURL: srv.URL, APIKey: "k", Model: "gpt-test"},
-		ownerLLMOK:    true,
+		WorkflowLLM:   LLMConfig{Provider: "openai", BaseURL: srv.URL, APIKey: "k", Model: "gpt-test"},
 	}}
 
 	sum := agent.CallSummary{Events: []agent.LogEvent{

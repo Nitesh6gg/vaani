@@ -39,14 +39,13 @@ const (
 // QAConfig is a workflow's QA Analysis setup, built once per call alongside
 // its agent graph (store.go's Workflow): its QA nodes, the node summaries
 // it already has cached, the script info needed to generate any that are
-// missing, and the workflow owner's own (unmerged) LLM -- see
-// resolveOwnerLLM. Zero value (no QA nodes) is a no-op throughout.
+// missing, and the LLM the workflow runs with (see resolveQALLM). Zero value
+// (no QA nodes) is a no-op throughout.
 type QAConfig struct {
 	Nodes         []QANode
 	NodeSummaries map[string]string       // node_id -> cached summary text (key present = cached, even if "")
 	NodeScripts   map[string]qaNodeScript // node_id -> info to summarize (agentNode/startCall only)
-	OwnerLLM      LLMConfig
-	ownerLLMOK    bool
+	WorkflowLLM   LLMConfig
 }
 
 // QANode is one QA Analysis node's configuration (node_specs/qa.py's
@@ -211,7 +210,7 @@ func buildNodeScripts(wf workflowJSON, tools []ToolRow) map[string]qaNodeScript 
 // buildQAConfig assembles a workflow's QA setup. Returns the zero QAConfig
 // (no further work anywhere) when the workflow has no QA nodes at all --
 // the overwhelmingly common case, so nothing else here runs per call.
-func buildQAConfig(wf workflowJSON, tools []ToolRow, ownerLLM LLMConfig, ownerLLMOK bool) QAConfig {
+func buildQAConfig(wf workflowJSON, tools []ToolRow, workflowLLM LLMConfig) QAConfig {
 	nodes := parseQANodes(wf)
 	if len(nodes) == 0 {
 		return QAConfig{}
@@ -221,8 +220,7 @@ func buildQAConfig(wf workflowJSON, tools []ToolRow, ownerLLM LLMConfig, ownerLL
 		Nodes:         nodes,
 		NodeSummaries: existingNodeSummaries(wf),
 		NodeScripts:   buildNodeScripts(wf, tools),
-		OwnerLLM:      ownerLLM,
-		ownerLLMOK:    ownerLLMOK,
+		WorkflowLLM:   workflowLLM,
 	}
 }
 
@@ -269,11 +267,18 @@ func qaProviderBaseURL(provider string) (string, bool) {
 }
 
 // resolveQALLM is Dograh's resolve_llm_config: a QA node's own LLM when
-// qa_use_workflow_llm is off, else the workflow owner's (ownerLLM, ok --
-// resolveOwnerLLM; deliberately not the conversation's effective LLM, see
-// its doc comment), with this node's own qa_model substituted in if it set
-// one.
-func resolveQALLM(n QANode, ownerLLM LLMConfig, ownerOK bool) (LLMConfig, bool) {
+// qa_use_workflow_llm is off, else the LLM the workflow runs with
+// (workflowLLM: the owner's user_configurations LLM with the workflow's
+// model_overrides merged in, as the conversation uses), with this node's
+// own qa_model substituted in if it set one.
+//
+// Deliberate divergence: Dograh's code (resolve_user_llm_config) reads only
+// user_configurations and ignores model_overrides, which contradicts its
+// own toggle label ("uses the same LLM the workflow runs with", node_specs/
+// qa.py). Vaani follows the label: on workflow 19, Dograh's code picked the
+// account's Gemini for QA while the conversation ran on the workflow's
+// Sarvam.
+func resolveQALLM(n QANode, workflowLLM LLMConfig) (LLMConfig, bool) {
 	if !n.UseWorkflowLLM {
 		url, ok := qaProviderBaseURL(n.Provider)
 		if !ok || n.APIKey == "" || n.Model == "" {
@@ -283,16 +288,13 @@ func resolveQALLM(n QANode, ownerLLM LLMConfig, ownerOK bool) (LLMConfig, bool) 
 		return LLMConfig{Provider: n.Provider, BaseURL: url, APIKey: n.APIKey, Model: n.Model}, true
 	}
 
-	if !ownerOK {
-		return LLMConfig{}, false
-	}
-
-	cfg := ownerLLM
+	cfg := workflowLLM
 	if n.Model != "" && n.Model != "default" {
 		cfg.Model = n.Model
 	}
 
-	return cfg, true
+	// No key or endpoint: QA reports "no_api_key", as Dograh does.
+	return cfg, cfg.BaseURL != "" && cfg.APIKey != ""
 }
 
 // qaTag is one QA tag the reviewing LLM raised (qa.py's DEFAULT_QA_SYSTEM_
@@ -420,7 +422,7 @@ func (s *Store) ensureNodeSummariesIfNeeded(ctx context.Context, wf *Workflow, c
 	}
 
 	for _, n := range wf.QA.Nodes {
-		cfg, ok := resolveQALLM(n, wf.QA.OwnerLLM, wf.QA.ownerLLMOK)
+		cfg, ok := resolveQALLM(n, wf.QA.WorkflowLLM)
 		if !ok {
 			continue
 		}
@@ -478,7 +480,7 @@ func (s *Store) runQANode(ctx context.Context, n QANode, wf *Workflow, sum agent
 		return qaRunResult{}, errors.New("no system prompt defined for QA node")
 	}
 
-	cfg, ok := resolveQALLM(n, wf.QA.OwnerLLM, wf.QA.ownerLLMOK)
+	cfg, ok := resolveQALLM(n, wf.QA.WorkflowLLM)
 	if !ok {
 		if !n.UseWorkflowLLM && n.Provider == "azure" {
 			return qaRunResult{}, errors.New("azure QA LLM provider isn't supported yet")

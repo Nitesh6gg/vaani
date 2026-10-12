@@ -385,10 +385,15 @@ call: failures are logged (`dograh run: ...`) and the call carries on.
     `rtf-latency-measured`/`rtf-ttfb-metric` events purely for this).
   - Which LLM: the QA node's own (`qa_use_workflow_llm` off: openai,
     openrouter or anthropic -- azure isn't supported yet, a different
-    auth shape) or, by default, the workflow **owner's** raw LLM
-    configuration -- deliberately *not* the conversation's effective
-    LLM (`resolveOwnerLLM`, not `resolveServices`): Dograh's own
-    `resolve_user_llm_config` ignores the workflow's `model_overrides` too.
+    auth shape) or, by default ("Use Workflow's LLM"), the LLM the
+    workflow runs with: the owner's configuration with the workflow's
+    `model_overrides` merged in (`resolveServices`'s LLM), a QA node's
+    `qa_model` substituted in if set. **Deliberately diverges from
+    Dograh's code**, whose `resolve_user_llm_config` ignores
+    `model_overrides` -- contradicting its own toggle label ("uses the
+    same LLM the workflow runs with"). On workflow 19 that sent QA to the
+    account's Gemini while the conversation ran on the workflow's Sarvam;
+    Vaani follows the label.
   - Each node's result (tags, a 1-10 quality score, sentiment, a summary --
     parsed from the review LLM's JSON reply with `agent.ParseLLMJSON`, the
     same parser variable extraction uses) is merged into the run's
