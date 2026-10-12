@@ -200,3 +200,50 @@ func TestHandler_RecordedClipCostsNoTTSCharacters(t *testing.T) {
 	assert.Zero(t, cfg.Log.Summary().TTSChars)
 
 }
+
+func TestStripRecordingRefs(t *testing.T) {
+	for _, tc := range []struct {
+		name, in, want string
+		ids            []string
+	}{
+		{"plain reply", "ठीक है, noted.", "ठीक है, noted.", nil},
+		{"one recording", "● vbdplx3x ठीक है, वर्तमान राज्य सरकार?", "ठीक है, वर्तमान राज्य सरकार?", []string{"vbdplx3x"}},
+		{"transition clip then a recording", "चलिए बात करते हैं. ● x62otbiy हम राय ले रहे हैं.", "चलिए बात करते हैं. हम राय ले रहे हैं.", []string{"x62otbiy"}},
+		{"two recordings", "● a1 One. ● b2 Two.", "One. Two.", []string{"a1", "b2"}},
+		{"recording then spoken text", "● a1 One. और कुछ?", "One. और कुछ?", []string{"a1"}},
+		{"nothing but a reference", "● a1 ", "", []string{"a1"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ids := stripRecordingRefs(tc.in)
+			assert.Equal(t, tc.want, got)
+			assert.Equal(t, tc.ids, ids)
+		})
+	}
+}
+
+// TestRecordReplyHidesRecordingRefs: the call's transcript shows only what
+// was said, while the LLM's own history keeps "● <id>" so it keeps using the
+// format.
+func TestRecordReplyHidesRecordingRefs(t *testing.T) {
+	log := &CallLog{}
+	h := &Handler{cfg: Config{Sink: NoopSink{}, Log: log}}
+	h.turnChunks = []spokenChunk{
+		{req: 1, text: "चलिए मुख्य विषय पर बात करते हैं. "},
+		{req: 2, text: "● x62otbiy हम राय ले रहे हैं. "},
+	}
+
+	h.recordReply(false)
+
+	require.Len(t, h.history, 1)
+	assert.Equal(t, "चलिए मुख्य विषय पर बात करते हैं. ● x62otbiy हम राय ले रहे हैं.", h.history[0].Content)
+
+	var said []string
+
+	for _, e := range log.Summary().Events {
+		if e.Type == eventBotText {
+			said = append(said, e.Payload["text"].(string))
+		}
+	}
+
+	assert.Equal(t, []string{"चलिए मुख्य विषय पर बात करते हैं. हम राय ले रहे हैं."}, said)
+}

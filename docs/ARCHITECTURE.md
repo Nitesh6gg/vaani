@@ -472,8 +472,13 @@ no Sarvam characters billed (`internal/dograh/recordings.go`,
 The greeting, transition and tool references are recordings' primary keys
 (numbers or numeric strings, read like Dograh's `int()`); the response mode
 uses `recording_id`s. What's played is recorded like speech: its transcript
-(a `●` reply: marker, id and transcript, as Dograh's context holds it) goes
-into the LLM's history and the call log.
+goes into the LLM's history and the call log. The LLM's history keeps a `●`
+reply as marker, id and transcript (`● x62otbiy ...`, as Dograh's context
+holds it), so the model keeps following the format; the call log and
+Dograh's call history -- the run page, the stored transcript file, what QA
+reads -- get only the spoken words (`stripRecordingRefs`; Dograh's own
+transcript shows the `● id` too). The `turn.agent` log line lists the ids
+that played in `recordings`.
 
 **Ordering:** a clip joins the TTS client's request queue (`tts.Client.Play`)
 behind every sentence already sent, so it plays after them and counts

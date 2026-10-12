@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"log/slog"
+	"regexp"
 	"strings"
 
 	"github.com/nitesh/vaani/internal/ai/tts"
@@ -134,6 +135,22 @@ func (r *clipRouter) flush() (speak, recordingID string) {
 	}
 
 	return "", ""
+}
+
+// recordingRefPattern is the "● <recording_id> " a recorded reply carries in
+// the LLM's history (see playRecording).
+var recordingRefPattern = regexp.MustCompile(`●\s*(\S+)\s*`)
+
+// stripRecordingRefs is text without the "● <recording_id> " references of
+// recorded replies, and those ids in order. The LLM's own history keeps them
+// (it needs the format it's asked to follow); the call's log and transcript
+// show only what was said.
+func stripRecordingRefs(text string) (spoken string, ids []string) {
+	for _, m := range recordingRefPattern.FindAllStringSubmatch(text, -1) {
+		ids = append(ids, m[1])
+	}
+
+	return strings.TrimSpace(recordingRefPattern.ReplaceAllString(text, "")), ids
 }
 
 // playClip queues clip in place of synthesized speech, after whatever this

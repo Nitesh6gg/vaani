@@ -2139,11 +2139,20 @@ func (h *Handler) recordReply(cut bool) {
 		return
 	}
 
+	// The LLM's memory keeps recorded replies' "● <id>" (the format it's asked
+	// to follow); the log and the call's transcript get only what was said.
 	h.history = append(h.history, llm.Message{Role: "assistant", Content: text})
+
+	spoken, recordings := stripRecordingRefs(text)
+
 	// One line per agent reply: exactly what the caller heard of it (cut:
 	// only up to where it was interrupted), with the turn's timings.
 	args := []any{"call_id", h.callID, "event", "turn.agent", "turn", h.turn, "node", h.nodeName(),
-		"gen", h.curGen, "cut", cut, "text", text}
+		"gen", h.curGen, "cut", cut, "text", spoken}
+	if len(recordings) > 0 {
+		args = append(args, "recordings", recordings)
+	}
+
 	if t := h.ttft.Load(); t != nil && t.gen == h.curGen {
 		args = append(args, "llm_ttft_ms", t.d.Milliseconds())
 		h.cfg.Log.TTFBMeasured("llm", t.d)
@@ -2168,7 +2177,9 @@ func (h *Handler) recordReply(cut bool) {
 		started = p.t
 	}
 
-	h.cfg.Log.AgentSaid(text, started)
+	if spoken != "" {
+		h.cfg.Log.AgentSaid(spoken, started)
+	}
 }
 
 // startTurnChunks resets reply tracking at the start of a new turn.
