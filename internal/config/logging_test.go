@@ -25,7 +25,7 @@ func testHandler(t *testing.T, env string) (*bytes.Buffer, slog.Handler) {
 	RegisterCallTrace("c1", NewTraceID())
 	t.Cleanup(func() { UnregisterCallTrace("c1") })
 
-	return buf, newHandler(buf, env, "json", slog.LevelInfo, true)
+	return buf, newHandler(buf, env, "json", slog.LevelInfo, true, nil)
 }
 
 // TestJSONLineShape is the golden-record test: one emitted line must
@@ -143,7 +143,7 @@ func TestPIIMasking(t *testing.T) {
 
 	for _, tc := range cases {
 		buf := &bytes.Buffer{}
-		slog.New(newHandler(buf, "production", "json", slog.LevelInfo, tc.pii)).
+		slog.New(newHandler(buf, "production", "json", slog.LevelInfo, tc.pii, nil)).
 			Info("turn.user", "caller_number", "08448805135", "text", "मेरा नाम नितेश", "gen", 3)
 
 		for _, w := range tc.want {
@@ -264,7 +264,7 @@ func TestNewHandler_TextFormat(t *testing.T) {
 	RegisterCallTrace("c1", NewTraceID())
 	t.Cleanup(func() { UnregisterCallTrace("c1") })
 
-	logger := slog.New(newHandler(buf, "production", "text", slog.LevelInfo, true))
+	logger := slog.New(newHandler(buf, "production", "text", slog.LevelInfo, true, nil))
 	logger.Info("hello", "call_id", "c1")
 
 	out := buf.String()
@@ -278,7 +278,7 @@ func TestNewHandler_TextFormat(t *testing.T) {
 // TestNewHandler_LevelFiltering: LOG_LEVEL gates emission.
 func TestNewHandler_LevelFiltering(t *testing.T) {
 	buf := &bytes.Buffer{}
-	logger := slog.New(newHandler(buf, "production", "json", slog.LevelWarn, true))
+	logger := slog.New(newHandler(buf, "production", "json", slog.LevelWarn, true, nil))
 
 	logger.Info("hidden at warn")
 	logger.Debug("also hidden")

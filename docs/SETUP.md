@@ -150,6 +150,16 @@ the full list of series. `http://localhost:9091/healthz` returns 200 JSON while
 the ARI WebSocket is connected, 503 otherwise. Neither endpoint requires
 authentication -- see "Operability endpoints" in `docs/ARCHITECTURE.md`.
 
+Metrics reach an observability backend (SigNoz etc.) by it scraping
+`/metrics` -- see `observability/dashboard.json` and
+`observability/performance.json` for ready-made panels. Logs are the
+opposite direction: set `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` (or
+`OTEL_EXPORTER_OTLP_ENDPOINT`, e.g. `http://<signoz-host>:4318`) to also push
+every log line there over OTLP/HTTP, alongside (not instead of) the normal
+stderr JSON/text output -- the same env var name and endpoint shape a Spring
+Boot app's `management.otlp.logging.endpoint` would use. Unset (the
+default): no OTLP client is even constructed, zero overhead.
+
 ## Memory limit (`GOMEMLIMIT`)
 
 Set Go's soft memory limit to about **90% of the memory Vaani may use**

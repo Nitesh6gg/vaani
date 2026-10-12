@@ -56,10 +56,18 @@ const (
 )
 
 func main() {
-	config.ConfigureLogging()
+	shutdownLogging := config.ConfigureLogging()
 
-	if err := run(); err != nil {
+	err := run()
+	if err != nil {
 		slog.Error("endianness-check failed", "error", err)
+	}
+
+	flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	_ = shutdownLogging(flushCtx)
+	cancel()
+
+	if err != nil {
 		os.Exit(1)
 	}
 }

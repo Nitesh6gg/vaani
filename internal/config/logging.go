@@ -148,7 +148,15 @@ func lookupTrace(callID string) string {
 // LOG_FORMAT ("json" default, or "text" for development), and LOG_LEVEL
 // ("info" default; "debug", "warn", "error" also accepted). Invalid values
 // fall back to the defaults with a warning -- never fatal.
-func ConfigureLogging() {
+//
+// If OTEL_EXPORTER_OTLP_LOGS_ENDPOINT or OTEL_EXPORTER_OTLP_ENDPOINT is set
+// (e.g. "http://<signoz-host>:4318" -- the same OTLP/HTTP endpoint and env
+// var names a Spring Boot app's otlp.logging.endpoint would use), every log
+// line is also pushed there via go.opentelemetry.io/contrib/bridges/otelslog,
+// alongside (not instead of) the existing stderr output. Call the returned
+// shutdown func once, after the last line that should reach it, so the
+// batched exporter flushes before the process exits.
+func ConfigureLogging() (shutdown func(context.Context) error) {
 	// Apply .env before reading logging config: this runs before
 	// config.Load, and without this a .env-set LOG_FORMAT/LOG_LEVEL/
 	// DEPLOYMENT_ENVIRONMENT would be invisible. Real environment variables
@@ -177,9 +185,17 @@ func ConfigureLogging() {
 			"log_pii", pii)
 	}
 
-	slog.SetDefault(slog.New(newHandler(os.Stderr, env, format, level, pii)))
+	otelHandler, otelShutdown, err := otelLogsHandler(context.Background(), env)
+	if err != nil {
+		slog.Warn("otlp log export disabled; could not configure it", "error", err)
+		otelShutdown = func(context.Context) error { return nil }
+	}
+
+	slog.SetDefault(slog.New(newHandler(os.Stderr, env, format, level, pii, otelHandler)))
 
 	applied = logSettings{env: env, format: format, level: strings.ToLower(level.String()), pii: pii}
+
+	return otelShutdown
 }
 
 // parseLogPII reads LOG_PII: whether logs may carry personal data in full
@@ -262,22 +278,15 @@ func parseLogLevel(v string) (slog.Level, bool) {
 }
 
 // newHandler builds the enriched handler for the requested format and level;
-// with pii false, personal data is masked (see piiKeys).
-func newHandler(w io.Writer, env, format string, level slog.Level, pii bool) slog.Handler {
-	replace := replaceAttr
-	if !pii {
-		replace = func(groups []string, a slog.Attr) slog.Attr {
-			if len(groups) == 0 && piiKeys[a.Key] {
-				a.Value = redact(a.Key, a.Value)
-			}
-
-			return replaceAttr(groups, a)
-		}
-	}
-
+// with pii false, personal data is masked (see piiKeys). otelHandler, if
+// non-nil, receives every record too (see ConfigureLogging) -- redaction is
+// applied once, centrally in enrichHandler.Handle, rather than relying on
+// slog.HandlerOptions.ReplaceAttr (which only base would honour, leaving
+// otelHandler an unredacted record).
+func newHandler(w io.Writer, env, format string, level slog.Level, pii bool, otelHandler slog.Handler) slog.Handler {
 	opts := &slog.HandlerOptions{
 		Level:       level,
-		ReplaceAttr: replace,
+		ReplaceAttr: replaceAttr,
 	}
 
 	var base slog.Handler
@@ -288,7 +297,7 @@ func newHandler(w io.Writer, env, format string, level slog.Level, pii bool) slo
 		base = slog.NewJSONHandler(w, opts)
 	}
 
-	return &enrichHandler{inner: base, env: env}
+	return &enrichHandler{inner: base, otel: otelHandler, env: env, maskPII: !pii}
 }
 
 // replaceAttr rewrites the top-level time (UTC ISO-8601 with milliseconds)
@@ -319,7 +328,9 @@ func replaceAttr(groups []string, a slog.Attr) slog.Attr {
 // over derived ones.
 type enrichHandler struct {
 	inner   slog.Handler
+	otel    slog.Handler // nil unless OTLP log export is configured; see ConfigureLogging
 	env     string
+	maskPII bool
 	presets []slog.Attr
 }
 
@@ -332,13 +343,23 @@ func (e *enrichHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	presets = append(presets, e.presets...)
 	presets = append(presets, attrs...)
 
-	return &enrichHandler{inner: e.inner.WithAttrs(attrs), env: e.env, presets: presets}
+	otel := e.otel
+	if otel != nil {
+		otel = otel.WithAttrs(attrs)
+	}
+
+	return &enrichHandler{inner: e.inner.WithAttrs(attrs), otel: otel, env: e.env, maskPII: e.maskPII, presets: presets}
 }
 
 func (e *enrichHandler) WithGroup(name string) slog.Handler {
 	// No call site uses groups today; if one appears, the injected fields
 	// would nest under that group too. Accepted and documented.
-	return &enrichHandler{inner: e.inner.WithGroup(name), env: e.env, presets: e.presets}
+	otel := e.otel
+	if otel != nil {
+		otel = otel.WithGroup(name)
+	}
+
+	return &enrichHandler{inner: e.inner.WithGroup(name), otel: otel, env: e.env, maskPII: e.maskPII, presets: e.presets}
 }
 
 func (e *enrichHandler) Handle(_ context.Context, r slog.Record) error {
@@ -368,16 +389,36 @@ func (e *enrichHandler) Handle(_ context.Context, r slog.Record) error {
 	}
 
 	for _, a := range e.presets {
-		out.AddAttrs(a)
+		out.AddAttrs(e.maskAttr(a))
 	}
 
 	r.Attrs(func(a slog.Attr) bool {
-		out.AddAttrs(a)
+		out.AddAttrs(e.maskAttr(a))
 
 		return true
 	})
 
-	return e.inner.Handle(context.Background(), out)
+	err := e.inner.Handle(context.Background(), out)
+
+	if e.otel != nil {
+		if oerr := e.otel.Handle(context.Background(), out); oerr != nil && err == nil {
+			err = oerr
+		}
+	}
+
+	return err
+}
+
+// maskAttr redacts a's value if it's a PII-bearing key (see piiKeys) and
+// masking is on -- applied once here, centrally, rather than through
+// slog.HandlerOptions.ReplaceAttr: that hook only base (stderr) would honour,
+// leaving e.otel an unredacted record.
+func (e *enrichHandler) maskAttr(a slog.Attr) slog.Attr {
+	if e.maskPII && piiKeys[a.Key] {
+		a.Value = redact(a.Key, a.Value)
+	}
+
+	return a
 }
 
 // scanAttrs reads, in one pass, the record's call_id and whether it already

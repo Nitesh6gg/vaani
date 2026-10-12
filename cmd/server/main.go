@@ -34,10 +34,18 @@ import (
 const shutdownDrainDeadline = 10 * time.Second
 
 func main() {
-	config.ConfigureLogging()
+	shutdownLogging := config.ConfigureLogging()
 
-	if err := run(); err != nil {
+	err := run()
+	if err != nil {
 		slog.Error("fatal", "error", err)
+	}
+
+	flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	_ = shutdownLogging(flushCtx)
+	cancel()
+
+	if err != nil {
 		os.Exit(1)
 	}
 }
