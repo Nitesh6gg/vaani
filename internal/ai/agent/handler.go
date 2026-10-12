@@ -534,7 +534,7 @@ func NewHandler(ctx context.Context, callID string, cfg Config) *Handler {
 
 	// The buffer is fresh, so these can't block.
 	switch {
-	case cfg.Start.Greeting != "":
+	case cfg.Start.Greeting != "" || cfg.Start.GreetingClip != nil:
 		h.events <- greetingEvent{}
 	case cfg.Start.Prompt != "":
 		h.events <- openingEvent{} // Dograh: no greeting -> the LLM opens the call
@@ -1100,7 +1100,15 @@ func (h *Handler) handleGreeting() {
 
 	// The greeting reaches history the same way LLM replies do (recordReply,
 	// once it has played -- or only the heard part if cut off), so the LLM
-	// knows it already greeted and doesn't do it again.
+	// knows it already greeted and doesn't do it again. A recorded greeting
+	// goes in as its transcript, as Dograh's does (append_to_context).
+	if clip := h.cfg.Start.GreetingClip; clip != nil {
+		h.playClip(h.baseCtx, h.tts, clip, clip.Transcript, gen)
+		h.tts.EndGeneration(gen)
+
+		return
+	}
+
 	chunker := &SentenceChunker{}
 	for _, chunk := range chunker.Feed(h.cfg.Start.Greeting) {
 		if gen != h.curGen {
@@ -1359,6 +1367,26 @@ func (h *Handler) runLLMTurn(ctx context.Context, history []llm.Message, ttsClie
 			msgs = plainHistory(msgs)
 		}
 
+		// A node with recordings answers "● <id>" (play it) or "▸ <text>".
+		var router *clipRouter
+		if node.Clips != nil {
+			router = &clipRouter{}
+		}
+
+		roundNode := node // the node may change below (takeEdge), the router's clips don't
+		route := func(tok string) string {
+			if router == nil {
+				return tok
+			}
+
+			speak, id := router.feed(tok)
+			if id != "" {
+				h.playRecording(ctx, ttsClient, roundNode, id, gen)
+			}
+
+			return speak
+		}
+
 		roundStart := time.Now()
 
 		calls, err = h.cfg.LLM.Stream(ctx, msgs, tools, func(tok string) {
@@ -1372,7 +1400,7 @@ func (h *Handler) runLLMTurn(ctx context.Context, history []llm.Message, ttsClie
 
 			said.WriteString(tok)
 
-			for _, chunk := range chunker.Feed(tok) {
+			for _, chunk := range chunker.Feed(route(tok)) {
 				h.sendToTTS(ctx, ttsClient, chunk, gen)
 			}
 		})
@@ -1389,6 +1417,17 @@ func (h *Handler) runLLMTurn(ctx context.Context, history []llm.Message, ttsClie
 
 		if err != nil {
 			break
+		}
+
+		if router != nil {
+			speak, id := router.flush()
+			if id != "" {
+				h.playRecording(ctx, ttsClient, roundNode, id, gen)
+			}
+
+			for _, chunk := range chunker.Feed(speak) {
+				h.sendToTTS(ctx, ttsClient, chunk, gen)
+			}
 		}
 
 		// Speak the tail now -- before any tool runs -- so the caller isn't
@@ -1500,9 +1539,12 @@ const (
 // prompt and tools the next LLM round uses -- and returns Dograh's
 // transition result.
 func (h *Handler) takeEdge(ctx context.Context, ttsClient tts.Client, from *Node, e *Edge, gen uint64) (*Node, string) {
-	if e.Speech != "" {
-		// Trailing space: a piece spoken on its own must not run into the
-		// LLM's reply in the recorded text ("...हैं।धन्यवाद।").
+	// Trailing space: a piece spoken on its own must not run into the LLM's
+	// reply in the recorded text ("...हैं।धन्यवाद।").
+	switch {
+	case e.SpeechClip != nil:
+		h.playClip(ctx, ttsClient, e.SpeechClip, e.SpeechClip.Transcript+" ", gen)
+	case e.Speech != "":
 		h.sendToTTS(ctx, ttsClient, e.Speech+" ", gen)
 	}
 
@@ -1534,8 +1576,11 @@ func (h *Handler) runTool(ctx context.Context, ttsClient tts.Client, node *Node,
 	slog.Info("tool call", "call_id", h.callID, "gen", gen, "event", "tool.call", "tool", call.Function.Name,
 		"args", truncate(call.Function.Arguments, 200))
 
-	if t.Message != "" {
-		h.sendToTTS(ctx, ttsClient, t.Message+" ", gen) // trailing space: see takeEdge
+	switch { // trailing space: see takeEdge
+	case t.MessageClip != nil:
+		h.playClip(ctx, ttsClient, t.MessageClip, t.MessageClip.Transcript+" ", gen)
+	case t.Message != "":
+		h.sendToTTS(ctx, ttsClient, t.Message+" ", gen)
 	}
 
 	h.toolRunning.Store(true)

@@ -15,6 +15,13 @@ type Node struct {
 	// Greeting, start node only: spoken as-is before the caller says
 	// anything. Empty means the LLM generates the opening from Prompt.
 	Greeting string
+	// GreetingClip, start node only, is played instead of Greeting (Dograh's
+	// greeting_type "audio").
+	GreetingClip *Clip
+	// Clips, when set, are the recordings this node's LLM may play instead
+	// of speaking: its prompt asks for "● <recording_id>" or "▸ <text>"
+	// replies (Dograh's recording response mode; see clipRouter).
+	Clips map[string]*Clip
 	// End marks an end node: reaching it, the LLM says its closing line and
 	// the call hangs up once that has played.
 	End bool
@@ -53,9 +60,18 @@ type ExtractionVar struct {
 type Edge struct {
 	Def llm.FunctionDef
 	// Speech, if set, is spoken before moving to To (Dograh's
-	// transition_speech).
-	Speech string
-	To     *Node
+	// transition_speech); SpeechClip, if set, is played instead.
+	Speech     string
+	SpeechClip *Clip
+	To         *Node
+}
+
+// Clip is a pre-recorded audio clip (one of Dograh's workflow recordings),
+// played in place of synthesizing its Transcript: 16kHz mono s16le PCM.
+type Clip struct {
+	ID         string // Dograh's recording_id
+	PCM        []byte
+	Transcript string
 }
 
 // InterruptMode is "on" when the caller can cut in while the agent speaks at

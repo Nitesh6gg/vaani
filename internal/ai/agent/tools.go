@@ -41,7 +41,9 @@ type Tool struct {
 	Kind ToolKind
 	// Message is spoken before the tool acts -- Dograh's "customMessage"
 	// (e.g. "please stay on the line" before a transfer). Empty means none.
-	Message string
+	// MessageClip, if set, is played instead (Dograh's "audio" message).
+	Message     string
+	MessageClip *Clip
 
 	// Run executes a ToolFunction with the LLM's JSON arguments and returns
 	// the result, JSON text sent back to the LLM. An error becomes a

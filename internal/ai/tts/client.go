@@ -50,6 +50,10 @@ type Client interface {
 	// call's audio and completion are identified by gen, not by connection
 	// state.
 	Speak(text string, gen uint64) error
+	// Play queues pre-recorded 16kHz s16le PCM in Speak's place: delivered on
+	// Audio tagged with gen and text, in order after every earlier Speak/Play
+	// call's audio, and counted toward gen's Done. No synthesis.
+	Play(pcm []byte, text string, gen uint64) error
 	// EndGeneration signals that no further Speak calls will be made for gen
 	// (the turn's LLM stream is done producing text). Once every Speak(gen)
 	// call's audio has fully arrived, gen is emitted on Done -- including

@@ -200,5 +200,10 @@ func openDograh(ctx context.Context, cfg config.Config) (*dograh.Store, *dograh.
 			SecretKey: cfg.MinioSecretKey, Bucket: cfg.MinioBucket, Secure: cfg.MinioSecure}
 	}
 
+	// Dograh's workflow recordings live in the same MinIO.
+	if store != nil && storage != nil {
+		store.UseStorage(storage)
+	}
+
 	return store, storage, nil
 }

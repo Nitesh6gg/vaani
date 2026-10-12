@@ -147,6 +147,8 @@ type fakeTTS struct {
 	mu         sync.Mutex
 	spoken     []string
 	spokenGens []uint64
+	played     []string // Play calls' text
+	calls      []string // "speak:<text>" / "play:<text>", in call order
 	ended      []uint64
 	cancelled  bool
 	audio      chan tts.Chunk
@@ -164,6 +166,19 @@ func (f *fakeTTS) Speak(text string, gen uint64) error {
 
 	f.spoken = append(f.spoken, text)
 	f.spokenGens = append(f.spokenGens, gen)
+	f.calls = append(f.calls, "speak:"+text)
+
+	return nil
+}
+
+// Play records the clip by its text; spoken and played keep one shared
+// order in calls, so a test can check a clip came after a sentence.
+func (f *fakeTTS) Play(pcm []byte, text string, gen uint64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.played = append(f.played, text)
+	f.calls = append(f.calls, "play:"+text)
 
 	return nil
 }

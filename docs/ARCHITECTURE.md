@@ -438,6 +438,53 @@ call: failures are logged (`dograh run: ...`) and the call carries on.
 - **Not done** (Dograh's completion job, which Vaani can't run):
   integrations/webhooks.
 
+### Pre-recorded audio (Dograh's workflow recordings)
+
+An organization's uploaded recordings (`workflow_recordings`: a
+`recording_id`, a transcript, the file's MinIO key) play instead of TTS --
+no Sarvam characters billed (`internal/dograh/recordings.go`,
+`internal/ai/agent/recordings.go`). Where, as in Dograh:
+
+- **Start node** `greeting_type` "audio" (`greeting_recording_id`); if the
+  recording can't be loaded the LLM opens the call, as in Dograh.
+- **Edge** `transition_speech_type` "audio"
+  (`transition_speech_recording_id`); its text isn't spoken either way.
+- **end_call / transfer_call** `messageType` "audio" (`audioRecordingId`);
+  **http_api** `customMessageType` "audio" (`customMessageRecordingId`).
+- **Recording response mode:** a node whose own prompt contains
+  `RECORDING_ID:` (in an organization with any recordings) gets Dograh's
+  `RECORDING_RESPONSE_MODE_INSTRUCTIONS` appended, word for word: each reply
+  starts with `▸` (spoken) or `●` followed by a `recording_id` and its
+  transcript (that recording plays). `agent.clipRouter` is Dograh's
+  `RecordingRouterProcessor`: the reply is held until its marker, the text
+  after `▸` goes to TTS, a `●` reply plays as soon as a space ends the id.
+  No marker: spoken as-is. An unknown id: logged, nothing plays. One
+  difference: when both markers arrive in one chunk, the earlier one wins
+  (Dograh checks `●` first wherever it is).
+
+The greeting, transition and tool references are recordings' primary keys
+(numbers or numeric strings, read like Dograh's `int()`); the response mode
+uses `recording_id`s. What's played is recorded like speech: its transcript
+(a `●` reply: marker, id and transcript, as Dograh's context holds it) goes
+into the LLM's history and the call log.
+
+**Ordering:** a clip joins the TTS client's request queue (`tts.Client.Play`)
+behind every sentence already sent, so it plays after them and counts
+toward the turn's completion like a sentence -- barge-in, the playout queue
+and the call log treat it like any other speech.
+
+**Loading** (at call setup, inside the workflow load's budget): the
+recordings the workflow needs (referenced ones; all of them if any node uses
+response mode) are downloaded from Dograh's MinIO (`storage_backend`
+`minio` only), converted by **ffmpeg** to 16kHz mono s16le exactly as
+Dograh's `convert_audio_file`, trimmed of leading/trailing silence
+(Dograh's `_trim_silence`: 10ms frames, amplitude 20), and cached in memory
+and in `$TMPDIR/vaani-recordings`, keyed by storage key -- a re-upload is a
+new key, so nothing is served stale. A load the call can't wait for keeps
+going in the background (30s) and serves the next call; that call falls
+back as above, with a `workflow.warning`. Needs ffmpeg on the server's PATH
+and `MINIO_*` set.
+
 ### Variable extraction
 
 Ported from Dograh's `pipecat_engine_variable_extractor.py`

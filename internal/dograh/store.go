@@ -20,7 +20,8 @@ import (
 // Store is a connection pool to Dograh's database, shared by every call --
 // one pool per process, like the shared LLM http.Client.
 type Store struct {
-	pool *pgxpool.Pool
+	pool  *pgxpool.Pool
+	clips *clipCache // nil until UseStorage: recordings can't be played
 }
 
 // Open connects to Dograh's Postgres at url and verifies the connection.
@@ -109,10 +110,15 @@ func (s *Store) Workflow(ctx context.Context, workflowID int, callVars map[strin
 		return nil, nil, err
 	}
 
-	start, warnings, err := buildWorkflow(wf, vars, tools, time.Now())
+	pks, byID := wf.recordingNeeds(tools)
+	clips, warnings := s.loadClips(ctx, orgID, pks, byID)
+
+	start, buildWarnings, err := buildWorkflow(wf, vars, tools, clips, time.Now())
 	if err != nil {
 		return nil, nil, fmt.Errorf("dograh: workflow %d: %w", workflowID, err)
 	}
+
+	warnings = append(warnings, buildWarnings...)
 
 	services, serviceWarnings, err := resolveServices(userConfig, defConfig)
 	if err != nil {

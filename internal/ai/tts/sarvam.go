@@ -80,11 +80,12 @@ type sarvamClient struct {
 
 	writeMu sync.Mutex
 
-	genMu     sync.Mutex
-	pending   []pendingReq    // FIFO: one entry per outstanding Speak call, in send order
-	endedGens map[uint64]bool // EndGeneration has been called for this gen
-	last      pendingReq      // most recent request sent, for tagging audio if pending is briefly empty
-	nextReq   uint64          // Req assigned to the next Speak call; starts at 1 so 0 means "none"
+	genMu       sync.Mutex
+	pending     []pendingReq    // FIFO: one entry per outstanding Speak/Play call, in send order
+	endedGens   map[uint64]bool // EndGeneration has been called for this gen
+	last        pendingReq      // most recent request sent to Sarvam, for tagging audio if pending is briefly empty
+	nextReq     uint64          // Req assigned to the next Speak/Play call; starts at 1 so 0 means "none"
+	chansClosed bool            // audio and done are closed: nothing may be sent on them again
 
 	stateMu sync.Mutex
 	closed  bool // connection already torn down; guards against a double-close
@@ -95,11 +96,14 @@ type sarvamClient struct {
 
 // pendingReq is one outstanding Speak call: its generation (for Done
 // bookkeeping), its per-client request number, and its text (for tagging its
-// audio and for naming it in provider-error logs).
+// audio and for naming it in provider-error logs). A Play call is one too,
+// with pcm set: never sent to Sarvam, its audio goes out as soon as every
+// request before it has finished (see drainClipsLocked).
 type pendingReq struct {
 	gen  uint64
 	req  uint64
 	text string
+	pcm  []byte
 }
 
 // NewSarvamClient dials Sarvam's Bulbul v3 TTS WebSocket, sends the initial
@@ -212,17 +216,66 @@ func (c *sarvamClient) Speak(text string, gen uint64) error {
 	return nil
 }
 
+// Play queues pre-recorded audio (16kHz s16le PCM) as if Sarvam had
+// synthesized text: it comes out on Audio, tagged with gen and text, right
+// after the audio of every Speak/Play call made before it, and counts toward
+// gen's Done like a Speak call. Nothing is sent to Sarvam.
+func (c *sarvamClient) Play(pcm []byte, text string, gen uint64) error {
+	if len(pcm) == 0 {
+		return nil
+	}
+
+	c.stateMu.Lock()
+	closed := c.closed
+	c.stateMu.Unlock()
+
+	if closed {
+		return fmt.Errorf("tts: client closed")
+	}
+
+	c.genMu.Lock()
+	defer c.genMu.Unlock()
+
+	c.nextReq++
+	c.pending = append(c.pending, pendingReq{gen: gen, req: c.nextReq, text: text, pcm: pcm})
+	c.drainClipsLocked()
+
+	return nil
+}
+
+// drainClipsLocked emits every Play call at the head of pending: once the
+// requests before one have finished, its audio is next in line. genMu held.
+func (c *sarvamClient) drainClipsLocked() {
+	for len(c.pending) > 0 && c.pending[0].pcm != nil {
+		p := c.pending[0]
+		c.pending = c.pending[1:]
+
+		if c.chansClosed {
+			continue
+		}
+
+		select {
+		case c.audio <- Chunk{PCM: p.pcm, Gen: p.gen, Req: p.req, Text: p.text}:
+		default:
+			slog.Warn("tts audio buffer full, dropping recorded clip", "call_id", c.callID)
+		}
+
+		if c.endedGens[p.gen] && !c.genHasPendingLocked(p.gen) {
+			c.emitDoneLocked(p.gen)
+		}
+	}
+}
+
 // EndGeneration signals no further Speak calls are coming for gen. If none
 // were ever pending (an LLM turn that produced no text), gen is done
 // immediately.
 func (c *sarvamClient) EndGeneration(gen uint64) {
 	c.genMu.Lock()
-	c.endedGens[gen] = true
-	pending := c.genHasPendingLocked(gen)
-	c.genMu.Unlock()
+	defer c.genMu.Unlock()
 
-	if !pending {
-		c.emitDone(gen)
+	c.endedGens[gen] = true
+	if !c.genHasPendingLocked(gen) {
+		c.emitDoneLocked(gen)
 	}
 }
 
@@ -236,7 +289,13 @@ func (c *sarvamClient) genHasPendingLocked(gen uint64) bool {
 	return false
 }
 
-func (c *sarvamClient) emitDone(gen uint64) {
+// emitDoneLocked sends gen on Done unless the channels are already closed (a
+// send on a closed channel would panic the process). genMu held.
+func (c *sarvamClient) emitDoneLocked(gen uint64) {
+	if c.chansClosed {
+		return
+	}
+
 	select {
 	case c.done <- gen:
 	default:
@@ -282,22 +341,20 @@ func (c *sarvamClient) forceClose() {
 // one Sarvam just finished synthesizing or rejected), for error logging.
 func (c *sarvamClient) onFinal() string {
 	c.genMu.Lock()
-	if len(c.pending) == 0 {
-		c.genMu.Unlock()
+	defer c.genMu.Unlock()
 
+	if len(c.pending) == 0 {
 		return ""
 	}
 
 	popped := c.pending[0]
 	c.pending = c.pending[1:]
 
-	pending := c.genHasPendingLocked(popped.gen)
-	ended := c.endedGens[popped.gen]
-	c.genMu.Unlock()
-
-	if !pending && ended {
-		c.emitDone(popped.gen)
+	if c.endedGens[popped.gen] && !c.genHasPendingLocked(popped.gen) {
+		c.emitDoneLocked(popped.gen)
 	}
+
+	c.drainClipsLocked() // clips queued behind this request play now
 
 	return popped.text
 }
@@ -318,8 +375,16 @@ func (c *sarvamClient) peekReq() pendingReq {
 }
 
 func (c *sarvamClient) receiveLoop() {
-	defer close(c.audio)
-	defer close(c.done)
+	// Closed under genMu: Play and EndGeneration send from other goroutines,
+	// and check chansClosed under the same lock first.
+	defer func() {
+		c.genMu.Lock()
+		defer c.genMu.Unlock()
+
+		c.chansClosed = true
+		close(c.audio)
+		close(c.done)
+	}()
 
 	for {
 		_, data, err := c.conn.ReadMessage()

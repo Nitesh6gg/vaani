@@ -34,7 +34,7 @@ func TestBuildWorkflowRiya(t *testing.T) {
 	rows := []ToolRow{{UUID: "tr-1", Name: "Transfer to Support", Category: "transfer_call",
 		Definition: json.RawMessage(`{"config": {"destination": "PJSIP/100@pbx"}}`)}}
 
-	start, warnings, err := buildWorkflow(wf, map[string]any{"caller_number": "08448805135"}, rows, time.Now())
+	start, warnings, err := buildWorkflow(wf, map[string]any{"caller_number": "08448805135"}, rows, clipSet{}, time.Now())
 	require.NoError(t, err)
 
 	assert.Equal(t, "Start Call", start.Name)
@@ -67,17 +67,17 @@ func TestBuildWorkflowGreetingAndErrors(t *testing.T) {
 		"data": {"name": "S", "is_start": true, "greeting": "Namaste {{name | ji}}"}}], "edges": []}`))
 	require.NoError(t, err)
 
-	start, _, err := buildWorkflow(wf, map[string]any{}, nil, time.Now())
+	start, _, err := buildWorkflow(wf, map[string]any{}, nil, clipSet{}, time.Now())
 	require.NoError(t, err)
 	assert.Equal(t, "Namaste ji", start.Greeting)
 
 	noStart, _ := parseWorkflow([]byte(`{"nodes": [{"id": "1", "type": "agentNode", "data": {}}]}`))
-	_, _, err = buildWorkflow(noStart, nil, nil, time.Now())
+	_, _, err = buildWorkflow(noStart, nil, nil, clipSet{}, time.Now())
 	assert.Error(t, err)
 
 	badEdge, _ := parseWorkflow([]byte(`{"nodes": [{"id": "1", "data": {"is_start": true}}],
 		"edges": [{"source": "1", "target": "9", "data": {"label": "x"}}]}`))
-	_, _, err = buildWorkflow(badEdge, nil, nil, time.Now())
+	_, _, err = buildWorkflow(badEdge, nil, nil, clipSet{}, time.Now())
 	assert.Error(t, err)
 }
 
@@ -95,7 +95,7 @@ func TestBuildWorkflowExtraction(t *testing.T) {
 	], "edges": []}`))
 	require.NoError(t, err)
 
-	start, _, err := buildWorkflow(wf, map[string]any{"city": "Delhi"}, nil, time.Now())
+	start, _, err := buildWorkflow(wf, map[string]any{"city": "Delhi"}, nil, clipSet{}, time.Now())
 	require.NoError(t, err)
 
 	require.NotNil(t, start.Extraction)

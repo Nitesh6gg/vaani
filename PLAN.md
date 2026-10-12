@@ -205,5 +205,12 @@ Not done yet:
 - **Step 4:** knowledge base (Dograh's documents, pgvector).
 - Dograh features Vaani skips for now: muting the caller during queued
   messages (tool messages, transition speech) regardless of the node,
-  audio greetings and recordings, `delayed_start`, voicemail detection,
-  pre-call fetch, context summarization, realtime (speech-to-speech) models.
+  `delayed_start`, voicemail detection, pre-call fetch, context
+  summarization, realtime (speech-to-speech) models.
+
+Recordings are done (2026-10-12): Dograh's workflow recordings play instead
+of TTS for an audio greeting, an audio transition, an end_call/transfer/
+http_api tool's audio message, and an LLM reply in recording response mode
+("● <recording_id>" / "▸ <text>"). Downloaded from MinIO, converted with
+ffmpeg, cached in memory and on disk. Verified by unit tests including a real
+ffmpeg conversion; a live call with an uploaded recording still to do.

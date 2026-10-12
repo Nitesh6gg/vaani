@@ -273,6 +273,82 @@ func TestSarvamClient_AudioTaggedWithItsSentence(t *testing.T) {
 	}
 }
 
+// TestSarvamClient_PlayWaitsForEarlierSpeech: a clip queued behind an
+// unfinished sentence comes out only after that sentence's audio and final,
+// then counts toward its generation's Done; a clip with nothing ahead of it
+// comes out at once.
+func TestSarvamClient_PlayWaitsForEarlierSpeech(t *testing.T) {
+	finalNow := make(chan struct{})
+
+	srv := ttsServer(t, func(conn *websocket.Conn, r *http.Request) {
+		_, _, _ = conn.ReadMessage() // config
+		_, _, _ = conn.ReadMessage() // text
+		_, _, _ = conn.ReadMessage() // flush
+		<-finalNow
+		_ = conn.WriteJSON(map[string]any{
+			"type": "audio",
+			"data": map[string]any{"audio": base64.StdEncoding.EncodeToString([]byte{1, 2})},
+		})
+		_ = sendFinal(conn)
+	})
+
+	c, err := NewSarvamClient(context.Background(), "call1", Config{WSURL: wsURL(srv.URL), APIKey: "k", Model: "bulbul:v3", Voice: "shubh"})
+	require.NoError(t, err)
+	defer func() { _ = c.Close() }()
+
+	require.NoError(t, c.Speak("sentence.", 7))
+	require.NoError(t, c.Play([]byte{9, 9}, "clip", 7))
+	c.EndGeneration(7)
+
+	select {
+	case <-c.Audio():
+		t.Fatal("the clip came out before the sentence ahead of it")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(finalNow)
+
+	for _, want := range []struct {
+		pcm  []byte
+		text string
+	}{{[]byte{1, 2}, "sentence."}, {[]byte{9, 9}, "clip"}} {
+		select {
+		case chunk := <-c.Audio():
+			assert.Equal(t, want.pcm, chunk.PCM)
+			assert.Equal(t, want.text, chunk.Text)
+			assert.Equal(t, uint64(7), chunk.Gen)
+		case <-time.After(time.Second):
+			t.Fatalf("no audio for %q", want.text)
+		}
+	}
+
+	select {
+	case gen := <-c.Done():
+		assert.Equal(t, uint64(7), gen)
+	case <-time.After(time.Second):
+		t.Fatal("Done never fired after the clip")
+	}
+
+	// Nothing ahead: out at once, Done right after EndGeneration.
+	require.NoError(t, c.Play([]byte{5}, "alone", 8))
+
+	select {
+	case chunk := <-c.Audio():
+		assert.Equal(t, "alone", chunk.Text)
+	case <-time.After(time.Second):
+		t.Fatal("a clip with nothing ahead didn't come out")
+	}
+
+	c.EndGeneration(8)
+
+	select {
+	case gen := <-c.Done():
+		assert.Equal(t, uint64(8), gen)
+	case <-time.After(time.Second):
+		t.Fatal("no Done for the clip-only generation")
+	}
+}
+
 func TestSarvamClient_DoneFiresOnceItsFinalArrives(t *testing.T) {
 	finalNow := make(chan struct{})
 

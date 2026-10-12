@@ -52,7 +52,10 @@ models and keys are all configured there (see "Configured in Dograh" in
   MinIO, for each call's recording and transcript: copy the values from
   Dograh's own environment, with `MINIO_ENDPOINT` as `host:port` reachable
   from Vaani. Without `MINIO_ENDPOINT` calls still appear in Dograh's call
-  history, without recording or transcript.
+  history, without recording or transcript. The same MinIO holds Dograh's
+  uploaded workflow recordings (audio greetings, messages): playing those
+  also needs **ffmpeg** on Vaani's PATH (`apt install ffmpeg`) -- it converts
+  them to 16kHz PCM, once per recording, cached in `$TMPDIR/vaani-recordings`.
 
 No `LLM_*` or `SARVAM_*` settings -- they were removed; if still present in
 an old `.env` they're ignored.

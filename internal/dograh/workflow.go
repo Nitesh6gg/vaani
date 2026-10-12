@@ -26,6 +26,9 @@ type workflowJSON struct {
 			Label            string `json:"label"`
 			Condition        string `json:"condition"`
 			TransitionSpeech string `json:"transition_speech"`
+			// "audio": transition_speech_recording_id is played instead.
+			TransitionSpeechType        string       `json:"transition_speech_type"`
+			TransitionSpeechRecordingID recordingRef `json:"transition_speech_recording_id"`
 		} `json:"data"`
 	} `json:"edges"`
 	// NodeSummaries caches each agentNode/startCall node's QA script summary
@@ -71,6 +74,8 @@ type nodeData struct {
 	Greeting        string   `json:"greeting"`
 	GreetingType    string   `json:"greeting_type"`
 	ToolUUIDs       []string `json:"tool_uuids"`
+	// greeting_type "audio": this recording is played instead of Greeting.
+	GreetingRecordingID recordingRef `json:"greeting_recording_id"`
 
 	// Variable extraction (dto.py: extraction_enabled defaults to false).
 	ExtractionEnabled   bool   `json:"extraction_enabled"`
@@ -124,6 +129,37 @@ func (wf workflowJSON) toolUUIDs() []string {
 	return out
 }
 
+// recordingNeeds is which recordings a call of wf may play: the primary keys
+// its greeting, transitions and tools reference, and whether any node
+// prompt names recordings by recording_id (then all of them are needed).
+func (wf workflowJSON) recordingNeeds(tools []ToolRow) (pks map[int64]bool, byID bool) {
+	pks = map[int64]bool{}
+
+	for _, n := range wf.Nodes {
+		if n.Data.IsStart && n.Data.GreetingType == "audio" && n.Data.GreetingRecordingID > 0 {
+			pks[int64(n.Data.GreetingRecordingID)] = true
+		}
+
+		if strings.Contains(n.Data.Prompt, promptRecordingRef) {
+			byID = true
+		}
+	}
+
+	for _, e := range wf.Edges {
+		if e.Data.TransitionSpeechType == "audio" && e.Data.TransitionSpeechRecordingID > 0 {
+			pks[int64(e.Data.TransitionSpeechRecordingID)] = true
+		}
+	}
+
+	for _, r := range tools {
+		if pk := toolClipRef(r); pk > 0 {
+			pks[pk] = true
+		}
+	}
+
+	return pks, byID
+}
+
 // buildWorkflow turns a parsed workflow into the agent's node graph and
 // returns its start node, composing each node the way Dograh's engine does
 // (pipecat_engine_context_composer.py): system prompt = global node prompt
@@ -136,13 +172,13 @@ func (wf workflowJSON) toolUUIDs() []string {
 //
 // Problems that shouldn't stop a call (a tool that's missing, archived, of
 // an unsupported category, or misconfigured) come back as warnings.
-func buildWorkflow(wf workflowJSON, vars map[string]any, tools []ToolRow, now time.Time) (start *agent.Node, warnings []string, err error) {
+func buildWorkflow(wf workflowJSON, vars map[string]any, tools []ToolRow, clips clipSet, now time.Time) (start *agent.Node, warnings []string, err error) {
 	render := func(s string) string { return renderTemplate(s, vars, now) }
 
 	byUUID := make(map[string]agent.Tool, len(tools))
 
 	for _, r := range tools {
-		t, warn, err := buildTool(r)
+		t, warn, err := buildTool(r, clips)
 		if err != nil {
 			warnings = append(warnings, err.Error())
 			continue
@@ -178,8 +214,16 @@ func buildWorkflow(wf workflowJSON, vars map[string]any, tools []ToolRow, now ti
 			parts = append(parts, globalPrompt)
 		}
 
-		if p := render(d.Prompt); p != "" {
+		p := render(d.Prompt)
+		if p != "" {
 			parts = append(parts, p)
+		}
+
+		// Dograh's recording response mode: only for a node whose own prompt
+		// names recordings, and only if the organization has any.
+		if clips.HasAny && strings.Contains(p, promptRecordingRef) {
+			parts = append(parts, recordingInstructions)
+			node.Clips = clips.byID
 		}
 
 		node.Prompt = strings.Join(parts, "\n\n")
@@ -223,9 +267,12 @@ func buildWorkflow(wf workflowJSON, vars map[string]any, tools []ToolRow, now ti
 
 			switch {
 			case d.GreetingType == "audio":
-				// Recorded greetings aren't supported yet; Dograh itself falls
-				// back to an LLM opening when it can't fetch the recording.
-				warnings = append(warnings, "audio greeting not supported yet; the LLM opens the call instead")
+				// Without its recording, Dograh falls back to an LLM opening.
+				if clip := clips.byPK[int64(d.GreetingRecordingID)]; clip != nil {
+					node.GreetingClip = clip
+				} else {
+					warnings = append(warnings, "audio greeting's recording unavailable; the LLM opens the call instead")
+				}
 			case d.Greeting != "":
 				node.Greeting = render(d.Greeting)
 			}
@@ -252,11 +299,22 @@ func buildWorkflow(wf workflowJSON, vars map[string]any, tools []ToolRow, now ti
 			}
 		}
 
-		from.Edges = append(from.Edges, agent.Edge{
-			Def:    llm.FunctionDef{Name: name, Description: e.Data.Condition},
-			Speech: render(e.Data.TransitionSpeech),
-			To:     to,
-		})
+		edge := agent.Edge{
+			Def: llm.FunctionDef{Name: name, Description: e.Data.Condition},
+			To:  to,
+		}
+
+		// "audio" plays its recording, or nothing if it's unavailable (Dograh
+		// doesn't fall back to the text either).
+		if e.Data.TransitionSpeechType == "audio" {
+			if edge.SpeechClip = clips.byPK[int64(e.Data.TransitionSpeechRecordingID)]; edge.SpeechClip == nil {
+				warnings = append(warnings, fmt.Sprintf("edge %q: transition recording unavailable; nothing is said", e.Data.Label))
+			}
+		} else {
+			edge.Speech = render(e.Data.TransitionSpeech)
+		}
+
+		from.Edges = append(from.Edges, edge)
 	}
 
 	return start, warnings, nil

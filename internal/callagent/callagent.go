@@ -188,7 +188,11 @@ func (b *Builder) loadWorkflow(ctx context.Context, c Call) (*dograh.Workflow, e
 	}
 
 	opening := "llm"
-	if wf.Start.Greeting != "" {
+
+	switch {
+	case wf.Start.GreetingClip != nil:
+		opening = "recorded_greeting"
+	case wf.Start.Greeting != "":
 		opening = "greeting"
 	}
 

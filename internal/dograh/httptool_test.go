@@ -77,7 +77,7 @@ func TestHTTPToolRun(t *testing.T) {
 	defer srv.Close()
 
 	build := func(config string) func(context.Context, json.RawMessage) (string, error) {
-		tool, warn, err := buildTool(ToolRow{
+		tool, warn, err := buildToolNoClips(ToolRow{
 			Name: "web search", Category: "http_api",
 			Definition: json.RawMessage(`{"config": ` + config + `}`),
 			Credential: &Credential{Type: "bearer_token", Data: json.RawMessage(`{"token": "secret"}`)},
@@ -131,7 +131,7 @@ func TestHTTPToolRun(t *testing.T) {
 }
 
 func TestBuildHTTPToolWarningsAndMessage(t *testing.T) {
-	tool, warn, err := buildTool(ToolRow{
+	tool, warn, err := buildToolNoClips(ToolRow{
 		UUID: "u1", Name: "lookup", Category: "http_api",
 		Definition: json.RawMessage(`{"config": {"url": "https://x", "credential_uuid": "gone", "customMessage": "एक पल रुकिए", "messageType": "none"}}`),
 	})
@@ -139,14 +139,14 @@ func TestBuildHTTPToolWarningsAndMessage(t *testing.T) {
 	assert.Contains(t, warn, "credential gone not found or not active")
 	assert.Equal(t, "एक पल रुकिए", tool.Message, "http tools speak customMessage whatever messageType says")
 
-	tool, _, err = buildTool(ToolRow{
+	tool, _, err = buildToolNoClips(ToolRow{
 		Name: "lookup", Category: "http_api",
 		Definition: json.RawMessage(`{"config": {"url": "https://x", "customMessageType": "audio", "customMessage": "x"}}`),
 	})
 	require.NoError(t, err)
 	assert.Empty(t, tool.Message, "audio messages aren't supported yet")
 
-	_, _, err = buildTool(ToolRow{Name: "lookup", Category: "http_api", Definition: json.RawMessage(`{"config": {}}`)})
+	_, _, err = buildToolNoClips(ToolRow{Name: "lookup", Category: "http_api", Definition: json.RawMessage(`{"config": {}}`)})
 	assert.Error(t, err, "no url")
 
 	assert.Equal(t, "5.0", pySeconds(5*time.Second))

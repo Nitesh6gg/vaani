@@ -61,6 +61,47 @@ func (s *Storage) Put(ctx context.Context, key, contentType string, body []byte)
 	return nil
 }
 
+// Get downloads object key, at most maxBytes of it.
+func (s *Storage) Get(ctx context.Context, key string, maxBytes int64) ([]byte, error) {
+	scheme := "http"
+	if s.Secure {
+		scheme = "https"
+	}
+
+	u := url.URL{Scheme: scheme, Host: s.Endpoint, Path: "/" + s.Bucket + "/" + key}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("minio get %s: %w", key, err)
+	}
+
+	// sign signs content-type, so a GET sends one too.
+	req.Header.Set("Content-Type", "application/octet-stream")
+	s.sign(req, nil, time.Now())
+
+	resp, err := llm.SharedHTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("minio get %s: %w", key, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("minio get %s: %s: %s", key, resp.Status, msg)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("minio get %s: %w", key, err)
+	}
+
+	if int64(len(body)) > maxBytes {
+		return nil, fmt.Errorf("minio get %s: larger than %d bytes", key, maxBytes)
+	}
+
+	return body, nil
+}
+
 // sign adds AWS Signature V4 headers to req, signing content-type, host,
 // x-amz-content-sha256 and x-amz-date -- what the MinIO Python client
 // (minio/signer.py) signs for the same request.
