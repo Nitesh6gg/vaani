@@ -2,6 +2,7 @@ package config
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"log/slog"
 	"regexp"
@@ -288,4 +289,39 @@ func TestNewHandler_LevelFiltering(t *testing.T) {
 	logger.Error("shown")
 
 	assert.Contains(t, buf.String(), `"level":"error"`)
+}
+
+// recordingHandler captures every record.Attrs key it's handed, for
+// asserting what reached it without depending on a real OTel backend.
+type recordingHandler struct{ keys []string }
+
+func (h *recordingHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *recordingHandler) Handle(_ context.Context, r slog.Record) error {
+	r.Attrs(func(a slog.Attr) bool {
+		h.keys = append(h.keys, a.Key)
+		return true
+	})
+
+	return nil
+}
+
+func (h *recordingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *recordingHandler) WithGroup(string) slog.Handler      { return h }
+
+// TestNewHandler_OtelSkipsServiceGroup: the OTel-bound record must not carry
+// the "service" group that stderr's JSON line does -- that information is
+// already on the LoggerProvider's Resource, and repeating it as a log
+// attribute produces a redundant JSON-string blob once SigNoz flattens it
+// (see Handle's comment).
+func TestNewHandler_OtelSkipsServiceGroup(t *testing.T) {
+	buf := &bytes.Buffer{}
+	otel := &recordingHandler{}
+
+	logger := slog.New(newHandler(buf, "production", "json", slog.LevelInfo, true, otel))
+	logger.Info("hello", "call_id", "c1")
+
+	assert.Contains(t, buf.String(), `"service"`, "stderr must still carry the service group")
+	assert.NotContains(t, otel.keys, "service", "the OTel-bound record must not duplicate it")
+	assert.Contains(t, otel.keys, "component", "the OTel-bound record must still carry the usual derived attrs")
 }

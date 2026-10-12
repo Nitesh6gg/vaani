@@ -363,45 +363,56 @@ func (e *enrichHandler) WithGroup(name string) slog.Handler {
 }
 
 func (e *enrichHandler) Handle(_ context.Context, r slog.Record) error {
-	out := slog.NewRecord(r.Time, r.Level, r.Message, r.PC)
-
-	out.AddAttrs(slog.Group("service",
-		slog.String("name", ServiceName),
-		slog.String("version", version.Version),
-		slog.String("environment", e.env),
-	))
+	shared := make([]slog.Attr, 0, len(e.presets)+8)
 
 	callID, hasComponent, hasRunID := scanAttrs(&r)
 
 	if callID != "" {
 		traceID, runID := lookupCall(callID)
 		if traceID != "" {
-			out.AddAttrs(slog.String("trace_id", traceID))
+			shared = append(shared, slog.String("trace_id", traceID))
 		}
 
 		if runID > 0 && !hasRunID {
-			out.AddAttrs(slog.Int64("run_id", runID))
+			shared = append(shared, slog.Int64("run_id", runID))
 		}
 	}
 
 	if !hasComponent {
-		out.AddAttrs(slog.String("component", componentForPC(r.PC)))
+		shared = append(shared, slog.String("component", componentForPC(r.PC)))
 	}
 
 	for _, a := range e.presets {
-		out.AddAttrs(e.maskAttr(a))
+		shared = append(shared, e.maskAttr(a))
 	}
 
 	r.Attrs(func(a slog.Attr) bool {
-		out.AddAttrs(e.maskAttr(a))
+		shared = append(shared, e.maskAttr(a))
 
 		return true
 	})
 
+	// The stderr line also carries a "service" group: documented, stable
+	// shape other tooling may parse. The OTel-bound record skips it -- that
+	// information is already on the LoggerProvider's Resource (service.name/
+	// version/deployment.environment), so repeating it as a log attribute
+	// there would just be a redundant JSON-string blob (SigNoz flattens a
+	// group attribute's value, it doesn't keep it as a nested map).
+	out := slog.NewRecord(r.Time, r.Level, r.Message, r.PC)
+	out.AddAttrs(slog.Group("service",
+		slog.String("name", ServiceName),
+		slog.String("version", version.Version),
+		slog.String("environment", e.env),
+	))
+	out.AddAttrs(shared...)
+
 	err := e.inner.Handle(context.Background(), out)
 
 	if e.otel != nil {
-		if oerr := e.otel.Handle(context.Background(), out); oerr != nil && err == nil {
+		otelOut := slog.NewRecord(r.Time, r.Level, r.Message, r.PC)
+		otelOut.AddAttrs(shared...)
+
+		if oerr := e.otel.Handle(context.Background(), otelOut); oerr != nil && err == nil {
 			err = oerr
 		}
 	}
