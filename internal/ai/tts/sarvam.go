@@ -167,6 +167,13 @@ func (c *sarvamClient) sendConfig(conn *websocket.Conn) error {
 		"model":                c.cfg.Model,
 	}
 
+	// Bulbul v4 Flash always preprocesses text and can't switch it off, so
+	// the setting is left out for it (the pipecat and LiveKit integrations
+	// drop it the same way); v3 and v2 get it as before.
+	if strings.HasPrefix(c.cfg.Model, "bulbul:v4") {
+		delete(cfg, "enable_preprocessing")
+	}
+
 	return c.writeJSON(conn, map[string]any{"type": "config", "data": cfg})
 }
 

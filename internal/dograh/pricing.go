@@ -100,8 +100,12 @@ var llmPrices = map[string]map[string]tokenPrice{
 
 // ttsPrices is Dograh's TTS_PRICING: USD per character.
 var ttsPrices = map[string]map[string]float64{
-	"openai":     {"gpt-4o-mini-tts": 0.6 / 1e6, "default": 0.6 / 1e6},
-	"sarvam":     {"bulbul:v3": 30 / inrPerUSD / 10_000, "bulbul:v2": 15 / inrPerUSD / 10_000, "default": 30 / inrPerUSD / 10_000},
+	"openai": {"gpt-4o-mini-tts": 0.6 / 1e6, "default": 0.6 / 1e6},
+	// Sarvam's rate card (Oct 2026): Bulbul v3 Rs2.7 and v4 Flash Rs1.7 per
+	// 1K characters, whichever API is used. Dograh's table still has v3 at
+	// Rs3 per 1K and no v4 Flash, which would then be charged the v3 rate.
+	"sarvam": {"bulbul:v3": 2.7 / 1000 / inrPerUSD, "bulbul:v4-flash": 1.7 / 1000 / inrPerUSD,
+		"bulbul:v2": 15 / inrPerUSD / 10_000, "default": 2.7 / 1000 / inrPerUSD},
 	"deepgram":   {"aura-2": 0.030 / 1000, "aura-1": 0.015 / 1000, "default": 0.030 / 1000},
 	"elevenlabs": {"default": 0.0256 / 1000},
 	"default":    {"default": 0.030 / 1000},

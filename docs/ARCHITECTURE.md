@@ -422,9 +422,11 @@ call: failures are logged (`dograh run: ...`) and the call carries on.
   quota period rules. Log: `dograh run cost total_usd=... dograh_tokens=...`.
   - Prices are Dograh's tables (`api/services/pricing/*.py`, Sarvam's INR
     rates at Rs96.5/USD), provider inferred from the model name as Dograh
-    does. Two differences: Sarvam's LLM rates follow Sarvam's rate card
+    does. Differences: Sarvam's LLM rates follow Sarvam's rate card
     (Oct 2026: 105B and 105B Conversations Rs15/5/60 per 1M input/cached/
-    output; Gemma 4 Rs35/10/90; GLM 5.3 Rs126/20/390), and a model not found
+    output; Gemma 4 Rs35/10/90; GLM 5.3 Rs126/20/390), as do its TTS rates
+    (Bulbul v3 Rs2.7 and v4 Flash Rs1.7 per 1K characters -- Dograh has v3
+    at Rs3 and no v4 Flash), and a model not found
     as written is retried without a gateway prefix
     (`sarvam/sarvam-105b-conversations`) -- Dograh's exact lookup misses
     those and falls back to the provider's default rate.

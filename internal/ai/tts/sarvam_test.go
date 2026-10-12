@@ -74,6 +74,44 @@ func TestSarvamClient_DialRequestsCompletionEventAndModel(t *testing.T) {
 	assert.Equal(t, "test-key", <-gotKey)
 }
 
+// TestSarvamClient_ConfigPreprocessingPerModel: v3 is told not to preprocess
+// the text; Bulbul v4 Flash always does and gets no such setting.
+func TestSarvamClient_ConfigPreprocessingPerModel(t *testing.T) {
+	for model, wantKey := range map[string]bool{"bulbul:v3": true, "bulbul:v2": true, "bulbul:v4-flash": false} {
+		got := make(chan map[string]any, 1)
+
+		srv := ttsServer(t, func(conn *websocket.Conn, r *http.Request) {
+			_, data, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+
+			var m struct {
+				Data map[string]any `json:"data"`
+			}
+
+			require.NoError(t, json.Unmarshal(data, &m))
+			got <- m.Data
+		})
+
+		c, err := NewSarvamClient(context.Background(), "call1", Config{
+			WSURL: wsURL(srv.URL), APIKey: "k", Model: model, Voice: "v", SampleRate: 16000,
+		})
+		require.NoError(t, err)
+
+		select {
+		case cfg := <-got:
+			_, has := cfg["enable_preprocessing"]
+			assert.Equal(t, wantKey, has, model)
+			assert.Equal(t, model, cfg["model"])
+		case <-time.After(time.Second):
+			t.Fatal("no config message for " + model)
+		}
+
+		_ = c.Close()
+	}
+}
+
 func TestSarvamClient_SendsConfigOnConnect(t *testing.T) {
 	type configMsg struct {
 		Type string `json:"type"`

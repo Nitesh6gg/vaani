@@ -165,6 +165,23 @@ logs what it resolved to, never the keys:
   -- closing the WebSocket alone isn't enough if frames already queued for the
   writer would still play out after the caller starts talking; the outbound
   queue must be drained too.
+- **Bulbul v4 Flash** (`bulbul:v4-flash`, Rs1.7 per 1K characters against
+  v3's Rs2.7; 200+ voices; pitch and loudness supported) uses the same
+  WebSocket contract, and streaming accepts 8000/16000/22050/24000 Hz, so
+  the 16kHz Vaani requests is fine (Sarvam's model page). The model name is
+  passed through unchanged, with two things to know:
+  - **Voice names change format.** v4 Flash IDs are
+    `<name>_<language>_<style>`, lowercase and case-sensitive, and v3's short
+    names (`simran`, `shubh`) don't work on it. Hindi examples:
+    `simran_hi_conversation`, `simran_hi_assistant`, `simran_hi_sales`,
+    `shubh_hi_customer`, `shubh_hi_ecomm` (full list: Sarvam's voices page).
+  - **It always preprocesses text**, so Vaani leaves `enable_preprocessing`
+    out of its config for `bulbul:v4*` (v3 gets `false` as before). That's
+    from the pipecat integration; Sarvam's model page doesn't mention the
+    setting, so check `tts.provider error` on the first call.
+
+  Dograh's model list only offers v2/v3: enter the name in the stored
+  configuration directly.
 
 ### How the LLM's text becomes audio
 

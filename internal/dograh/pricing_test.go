@@ -61,13 +61,24 @@ func TestCalculateCost(t *testing.T) {
 
 	sarvam := (6000.0*15 + 4000*5 + 1000*60) / 1e6 / 96.5
 	gemini := 5000*0.25/1e6 + 500*1.50/1e6
-	tts := 1000 * 30 / 96.5 / 10_000 // Rs30 per 10k characters
-	stt := 60 * 30 / 96.5 / 3600     // Rs30 per hour
+	tts := 1000 * 2.7 / 1000 / 96.5 // Rs2.7 per 1K characters
+	stt := 60 * 30 / 96.5 / 3600    // Rs30 per hour
 
 	assert.InDelta(t, sarvam+gemini, c.LLM, 1e-12)
 	assert.InDelta(t, tts, c.TTS, 1e-12)
 	assert.InDelta(t, stt, c.STT, 1e-12)
 	assert.InDelta(t, sarvam+gemini+tts+stt, c.Total, 1e-12)
+}
+
+// TestSarvamTTSPrices: Sarvam's rate card, per 1K characters -- v3 Rs2.7,
+// v4 Flash Rs1.7 -- converted at Rs96.5/USD.
+func TestSarvamTTSPrices(t *testing.T) {
+	for model, rupeesPer1K := range map[string]float64{"bulbul:v3": 2.7, "bulbul:v4-flash": 1.7} {
+		c := calculateCost(usageInfo{TTS: map[string]int{usageKeyTTS + model: 1000}})
+		assert.InDelta(t, rupeesPer1K/96.5, c.TTS, 1e-12, model)
+	}
+
+	assert.Equal(t, "sarvam", inferProvider("bulbul:v4-flash", "tts"))
 }
 
 func TestBuildUsageInfo(t *testing.T) {
