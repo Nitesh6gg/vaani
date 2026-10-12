@@ -271,6 +271,33 @@ func TestClient_Stream_SendsToolsWithDefaultParameters(t *testing.T) {
 		"a no-argument tool still needs a parameters object for some providers")
 }
 
+// TestClient_Stream_ReportsUsage: include_usage is requested, and the
+// usage chunk (empty choices, OpenAI's shape, cached tokens nested) reaches
+// OnUsage once, after the reply.
+func TestClient_Stream_ReportsUsage(t *testing.T) {
+	var body map[string]any
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		_, _ = fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"hi"}}]}`)
+		_, _ = fmt.Fprintln(w, `data: {"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120,"prompt_tokens_details":{"cached_tokens":40}}}`)
+		_, _ = fmt.Fprintln(w, `data: [DONE]`)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "k", "m")
+
+	var got []Usage
+
+	c.OnUsage = func(u Usage) { got = append(got, u) }
+
+	_, err := c.Stream(context.Background(), nil, nil, func(string) {})
+	require.NoError(t, err)
+
+	assert.Equal(t, map[string]any{"include_usage": true}, body["stream_options"])
+	assert.Equal(t, []Usage{{PromptTokens: 100, CompletionTokens: 20, TotalTokens: 120, CachedTokens: 40}}, got)
+}
+
 func TestClient_Stream_TrimsTrailingSlashFromBaseURL(t *testing.T) {
 	var gotPath string
 

@@ -1759,7 +1759,9 @@ func (h *Handler) sendToTTS(ctx context.Context, ttsClient tts.Client, text stri
 		return
 	}
 
-	slog.Debug("tts speak", "call_id", h.callID, "gen", gen, "event", "tts.speak", "chars", len([]rune(text)))
+	chars := utf8.RuneCountInString(text)
+	h.cfg.Log.TTSChars(chars)
+	slog.Debug("tts speak", "call_id", h.callID, "gen", gen, "event", "tts.speak", "chars", chars)
 	// The Thinking -> Speaking transition happens in handleTTSAudio, once real
 	// audio for gen actually arrives -- not here, when text is merely sent.
 	// Flipping here left a silence gap exactly as long as Sarvam's

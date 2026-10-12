@@ -1,9 +1,12 @@
 package agent
 
 import (
+	"maps"
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/nitesh/vaani/internal/ai/llm"
 )
 
 // Dograh's end-of-call reasons (pipecat EndTaskReason) Vaani can produce:
@@ -67,6 +70,10 @@ type CallLog struct {
 	heldSpeech, heldDelivered                     int
 	errors                                        map[string]int
 	replyLatencies                                []int64
+
+	// What the call used, for Dograh's usage_info and its cost (see LLMUsage).
+	llmUsage map[string]llm.Usage
+	ttsChars int
 }
 
 // CallSummary is everything a CallLog recorded.
@@ -92,6 +99,11 @@ type CallSummary struct {
 	HeldSpeech, HeldDelivered int
 	Errors                    map[string]int
 	ReplyLatenciesMS          []int64
+
+	// LLMUsage is token counts by Dograh's usage_info key ("<processor>|||
+	// <model>"); TTSChars the characters sent to TTS.
+	LLMUsage map[string]llm.Usage
+	TTSChars int
 }
 
 // Sink: a CallLog counts what the handler reports, for the call's summary.
@@ -138,6 +150,21 @@ func (l *CallLog) ReplyLatency(d time.Duration) {
 func (l *CallLog) TTFBMeasured(service string, d time.Duration) {
 	l.count(func() { l.add(eventTTFBMetric, map[string]any{"ttfb_seconds": d.Seconds(), "service": service}) })
 }
+
+// LLMUsage adds one LLM request's tokens under key, Dograh's usage_info key
+// ("<processor>|||<model>"), which its cost job prices by model.
+func (l *CallLog) LLMUsage(key string, u llm.Usage) {
+	l.count(func() {
+		if l.llmUsage == nil {
+			l.llmUsage = map[string]llm.Usage{}
+		}
+
+		l.llmUsage[key] = l.llmUsage[key].Add(u)
+	})
+}
+
+// TTSChars adds n characters sent to TTS (Dograh bills TTS per character).
+func (l *CallLog) TTSChars(n int) { l.count(func() { l.ttsChars += n }) }
 
 func (l *CallLog) count(f func()) {
 	if l == nil {
@@ -384,6 +411,8 @@ func (l *CallLog) Summary() CallSummary {
 		HeldSpeech:         l.heldSpeech,
 		HeldDelivered:      l.heldDelivered,
 		ReplyLatenciesMS:   append([]int64(nil), l.replyLatencies...),
+		LLMUsage:           maps.Clone(l.llmUsage),
+		TTSChars:           l.ttsChars,
 	}
 
 	if l.errors != nil {

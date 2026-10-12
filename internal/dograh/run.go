@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -107,14 +106,12 @@ func (s *Store) FinishRun(ctx context.Context, wf *Workflow, runID int64, end Ru
 
 	gathered, _ := json.Marshal(g)
 
-	// pipeline_metrics_aggregator: whole seconds; Dograh's cost job copies it
-	// into cost_info, which is where its call list reads the duration.
-	seconds := int(math.Round(end.Duration.Seconds()))
-	usage, _ := json.Marshal(map[string]any{
-		"llm": map[string]any{}, "tts": map[string]any{}, "stt": map[string]any{},
-		"call_duration_seconds": seconds,
-	})
-	cost, _ := json.Marshal(map[string]any{"call_duration_seconds": seconds})
+	// The call's own usage now (RecordCost adds QA's and prices it later), so
+	// it's there even if pricing never runs. call_duration_seconds goes into
+	// cost_info too: that's where Dograh's call list reads the duration.
+	u := buildUsageInfo(wf, sum, nil, end.Duration)
+	usage, _ := json.Marshal(u)
+	cost, _ := json.Marshal(map[string]any{"call_duration_seconds": u.CallDurationSeconds})
 
 	logs := []byte("{}") // Dograh leaves it empty when nothing was logged
 	if len(sum.Events) > 0 {

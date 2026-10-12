@@ -91,6 +91,23 @@ type FunctionDef struct {
 // providers reject a function without a parameters object.
 var noParams = json.RawMessage(`{"type":"object","properties":{}}`)
 
+// Usage is one request's token counts, from the stream's usage chunk
+// (requested with stream_options.include_usage). CachedTokens are part of
+// PromptTokens, as in OpenAI's format.
+type Usage struct {
+	PromptTokens, CompletionTokens, TotalTokens, CachedTokens int
+}
+
+// Add returns u and o summed.
+func (u Usage) Add(o Usage) Usage {
+	return Usage{
+		PromptTokens:     u.PromptTokens + o.PromptTokens,
+		CompletionTokens: u.CompletionTokens + o.CompletionTokens,
+		TotalTokens:      u.TotalTokens + o.TotalTokens,
+		CachedTokens:     u.CachedTokens + o.CachedTokens,
+	}
+}
+
 // Client streams chat completions from an OpenAI-compatible /chat/completions
 // endpoint (baseURL should NOT include the /chat/completions suffix).
 type Client struct {
@@ -98,6 +115,11 @@ type Client struct {
 	apiKey      string
 	model       string
 	idleTimeout time.Duration
+
+	// OnUsage, if set, gets each completed request's token counts. A stream
+	// cut short (barge-in, error) never reaches the usage chunk, so its tokens
+	// go uncounted.
+	OnUsage func(Usage)
 }
 
 // NewClient creates a Client. baseURL is trimmed of a trailing slash.
@@ -134,9 +156,10 @@ func (c *Client) Stream(ctx context.Context, messages []Message, tools []Tool, o
 
 func (c *Client) stream(ctx context.Context, messages []Message, tools []Tool, onToken func(string), alive func()) ([]ToolCall, error) {
 	body := map[string]any{
-		"model":    c.model,
-		"messages": messages,
-		"stream":   true,
+		"model":          c.model,
+		"messages":       messages,
+		"stream":         true,
+		"stream_options": map[string]any{"include_usage": true},
 	}
 
 	if len(tools) > 0 {
@@ -187,7 +210,15 @@ func (c *Client) stream(ctx context.Context, messages []Message, tools []Tool, o
 	var (
 		calls toolCallAssembler
 		got   bool // any content or tool call
+		usage *Usage
 	)
+
+	// Some providers repeat usage on several chunks; the last one is final.
+	report := func() {
+		if usage != nil && c.OnUsage != nil {
+			c.OnUsage(*usage)
+		}
+	}
 
 	for scanner.Scan() {
 		alive()
@@ -201,6 +232,7 @@ func (c *Client) stream(ctx context.Context, messages []Message, tools []Tool, o
 		data = strings.TrimPrefix(data, " ")
 
 		if data == "[DONE]" {
+			report()
 			return calls.done(), nil
 		}
 
@@ -211,6 +243,13 @@ func (c *Client) stream(ctx context.Context, messages []Message, tools []Tool, o
 
 		if len(chunk.Error) > 0 && string(chunk.Error) != "null" {
 			return nil, fmt.Errorf("llm: provider error in stream: %s", truncateBytes(chunk.Error, 500))
+		}
+
+		if u := chunk.Usage; u != nil {
+			usage = &Usage{PromptTokens: u.PromptTokens, CompletionTokens: u.CompletionTokens, TotalTokens: u.TotalTokens}
+			if u.PromptTokensDetails != nil {
+				usage.CachedTokens = u.PromptTokensDetails.CachedTokens
+			}
 		}
 
 		for _, choice := range chunk.Choices {
@@ -237,6 +276,8 @@ func (c *Client) stream(ctx context.Context, messages []Message, tools []Tool, o
 		return nil, errors.New("llm: stream ended without any reply")
 	}
 
+	report()
+
 	return calls.done(), nil
 }
 
@@ -251,7 +292,15 @@ func truncateBytes(b []byte, n int) string {
 type chatCompletionChunk struct {
 	// Error is an error object some OpenAI-compatible providers send inside
 	// a 200 stream instead of a non-2xx status.
-	Error   json.RawMessage `json:"error"`
+	Error json.RawMessage `json:"error"`
+	Usage *struct {
+		PromptTokens        int `json:"prompt_tokens"`
+		CompletionTokens    int `json:"completion_tokens"`
+		TotalTokens         int `json:"total_tokens"`
+		PromptTokensDetails *struct {
+			CachedTokens int `json:"cached_tokens"`
+		} `json:"prompt_tokens_details"`
+	} `json:"usage"`
 	Choices []struct {
 		Delta struct {
 			Content   string          `json:"content"`

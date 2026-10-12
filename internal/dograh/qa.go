@@ -335,17 +335,20 @@ type qaRunResult struct {
 // merged into run runID's annotations; nothing here can fail the call,
 // already over by the time this runs. ctx is bounded internally
 // (qaOverallTimeout); the caller's ctx only decides whether RunQA can start
-// at all.
-func (s *Store) RunQA(ctx context.Context, wf *Workflow, callID string, runID int64, sum agent.CallSummary, duration time.Duration) {
+// at all. It returns the tokens QA's LLM calls used, by usage_info key, for
+// RecordCost.
+func (s *Store) RunQA(ctx context.Context, wf *Workflow, callID string, runID int64, sum agent.CallSummary, duration time.Duration) map[string]llm.Usage {
+	usage := map[string]llm.Usage{}
+
 	if len(wf.QA.Nodes) == 0 {
-		return
+		return usage
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, qaOverallTimeout)
 	defer cancel()
 
 	disposition := callDisposition(sum)
-	summaries := s.ensureNodeSummariesIfNeeded(ctx, wf, callID)
+	summaries := s.ensureNodeSummariesIfNeeded(ctx, wf, callID, usage)
 
 	results := map[string]json.RawMessage{}
 	var allTags []string
@@ -363,7 +366,7 @@ func (s *Store) RunQA(ctx context.Context, wf *Workflow, callID string, runID in
 			continue
 		}
 
-		res, err := s.runQANode(ctx, n, wf, sum, duration, summaries)
+		res, err := s.runQANode(ctx, n, wf, sum, duration, summaries, usage)
 		if err != nil {
 			slog.Warn("qa node failed", "call_id", callID, "component", "dograh", "event", "qa.failed",
 				"node", n.Name, "error", err)
@@ -386,7 +389,7 @@ func (s *Store) RunQA(ctx context.Context, wf *Workflow, callID string, runID in
 	}
 
 	if len(results) == 0 {
-		return
+		return usage
 	}
 
 	if len(allTags) > 0 {
@@ -397,6 +400,20 @@ func (s *Store) RunQA(ctx context.Context, wf *Workflow, callID string, runID in
 	if err := s.updateAnnotations(ctx, runID, results); err != nil {
 		slog.Warn("qa: saving results failed", "call_id", callID, "component", "dograh", "event", "qa.save_failed", "error", err)
 	}
+
+	return usage
+}
+
+// newQAClient is cfg's LLM client, its tokens added to usage under Dograh's
+// QAAnalysis key. QA's calls run one at a time, so usage needs no lock.
+func newQAClient(cfg LLMConfig, usage map[string]llm.Usage) *llm.Client {
+	c := llm.NewClient(cfg.BaseURL, cfg.APIKey, cfg.Model)
+	c.OnUsage = func(u llm.Usage) {
+		k := usageKeyQA + cfg.Model
+		usage[k] = usage[k].Add(u)
+	}
+
+	return c
 }
 
 // ensureNodeSummariesIfNeeded generates and persists any node summaries
@@ -407,7 +424,7 @@ func (s *Store) RunQA(ctx context.Context, wf *Workflow, callID string, runID in
 // each call an LLM for it); doing this once per call, before the per-node
 // loop, produces the same cached text with fewer calls -- a deliberate,
 // behavior-preserving simplification.
-func (s *Store) ensureNodeSummariesIfNeeded(ctx context.Context, wf *Workflow, callID string) map[string]string {
+func (s *Store) ensureNodeSummariesIfNeeded(ctx context.Context, wf *Workflow, callID string, usage map[string]llm.Usage) map[string]string {
 	needed := false
 
 	for id := range wf.QA.NodeScripts {
@@ -427,7 +444,7 @@ func (s *Store) ensureNodeSummariesIfNeeded(ctx context.Context, wf *Workflow, c
 			continue
 		}
 
-		return s.ensureNodeSummaries(ctx, wf, callID, llm.NewClient(cfg.BaseURL, cfg.APIKey, cfg.Model))
+		return s.ensureNodeSummaries(ctx, wf, callID, newQAClient(cfg, usage))
 	}
 
 	return wf.QA.NodeSummaries // no QA node has a usable LLM: summaries stay empty for this call
@@ -475,7 +492,7 @@ func (s *Store) ensureNodeSummaries(ctx context.Context, wf *Workflow, callID st
 // falling back to runWholeCallQA if the call's events carry no node_id
 // (shouldn't happen for Vaani calls -- every event is tagged from the
 // first, see agent.CallLog.NodeEntered).
-func (s *Store) runQANode(ctx context.Context, n QANode, wf *Workflow, sum agent.CallSummary, duration time.Duration, summaries map[string]string) (qaRunResult, error) {
+func (s *Store) runQANode(ctx context.Context, n QANode, wf *Workflow, sum agent.CallSummary, duration time.Duration, summaries map[string]string, usage map[string]llm.Usage) (qaRunResult, error) {
 	if n.SystemPrompt == "" {
 		return qaRunResult{}, errors.New("no system prompt defined for QA node")
 	}
@@ -489,7 +506,7 @@ func (s *Store) runQANode(ctx context.Context, n QANode, wf *Workflow, sum agent
 		return qaRunResult{}, errors.New("no LLM API key configured for QA analysis")
 	}
 
-	client := llm.NewClient(cfg.BaseURL, cfg.APIKey, cfg.Model)
+	client := newQAClient(cfg, usage)
 
 	splits, ok := splitEventsByNode(sum.Events)
 	if !ok {

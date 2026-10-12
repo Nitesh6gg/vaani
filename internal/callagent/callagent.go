@@ -280,6 +280,10 @@ func (b *Builder) newAgentHandler(ctx context.Context, c Call, hooks Hooks) medi
 	bargeIn := b.newBargeInDetector(callID)
 	callLog := &agent.CallLog{}
 
+	// Conversation turns and variable extraction share this client.
+	llmClient := llm.NewClient(svc.LLM.BaseURL, svc.LLM.APIKey, svc.LLM.Model)
+	llmClient.OnUsage = func(u llm.Usage) { callLog.LLMUsage(dograh.UsageKeyLLM+svc.LLM.Model, u) }
+
 	h := agent.NewHandler(ctx, callID, agent.Config{
 		STT: sttClient,
 		NewTTS: func() (tts.Client, error) {
@@ -292,7 +296,7 @@ func (b *Builder) newAgentHandler(ctx context.Context, c Call, hooks Hooks) medi
 				})
 			})
 		},
-		LLM:         llm.NewClient(svc.LLM.BaseURL, svc.LLM.APIKey, svc.LLM.Model),
+		LLM:         llmClient,
 		Start:       wf.Start,
 		IdleTimeout: wf.IdleTimeout,
 		MaxDuration: wf.MaxDuration,
@@ -404,9 +408,14 @@ func (b *Builder) recordRun(c Call, wf *dograh.Workflow, callLog *agent.CallLog,
 	// RunQA runs it here instead. Skipped if Vaani is already shutting down
 	// -- a slow QA pass must not hold up the shutdown drain any more than
 	// necessary (RunQA bounds itself regardless, see qaOverallTimeout).
+	var qaUsage map[string]llm.Usage
 	if b.procCtx.Err() == nil {
-		b.store.RunQA(context.Background(), wf, c.ID, runID, summary, duration)
+		qaUsage = b.store.RunQA(context.Background(), wf, c.ID, runID, summary, duration)
 	}
+
+	// Dograh's cost job, likewise never triggered for Vaani's calls: after QA,
+	// so QA's tokens are priced too, as Dograh orders it.
+	b.store.RecordCost(context.Background(), wf, c.ID, runID, summary, qaUsage, duration)
 }
 
 // logCallSummary writes the call's one summary line: what to chart and alert

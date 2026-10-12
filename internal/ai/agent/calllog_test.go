@@ -6,6 +6,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/nitesh/vaani/internal/ai/llm"
 )
 
 func TestCallLogMatchesDograhEvents(t *testing.T) {
@@ -126,4 +128,23 @@ func TestCallLogTimesTurnsByTheirStart(t *testing.T) {
 	logged, err := time.Parse(time.RFC3339Nano, user.Timestamp)
 	require.NoError(t, err)
 	assert.WithinDuration(t, now, logged, time.Second, "the event itself is stamped when logged")
+}
+
+// TestCallLogUsage: LLM tokens sum per usage key, TTS characters in total;
+// a nil CallLog records nothing.
+func TestCallLogUsage(t *testing.T) {
+	var l CallLog
+
+	l.LLMUsage("LLM|||m", llm.Usage{PromptTokens: 100, CompletionTokens: 10, TotalTokens: 110, CachedTokens: 40})
+	l.LLMUsage("LLM|||m", llm.Usage{PromptTokens: 50, CompletionTokens: 5, TotalTokens: 55})
+	l.TTSChars(30)
+	l.TTSChars(12)
+
+	s := l.Summary()
+	assert.Equal(t, map[string]llm.Usage{"LLM|||m": {PromptTokens: 150, CompletionTokens: 15, TotalTokens: 165, CachedTokens: 40}}, s.LLMUsage)
+	assert.Equal(t, 42, s.TTSChars)
+
+	var none *CallLog
+	none.LLMUsage("LLM|||m", llm.Usage{PromptTokens: 1})
+	none.TTSChars(1)
 }

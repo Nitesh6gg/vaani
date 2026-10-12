@@ -340,8 +340,14 @@ call: failures are logged (`dograh run: ...`) and the call carries on.
     above, as `extracted_call_disposition`), `mapped_call_disposition`,
     `call_tags` (the disposition, `user_speech` if the caller said anything,
     then every extracted `tag_*` variable's value).
-  - `call_duration_seconds` in `usage_info` and `cost_info` (where the call
-    list reads the duration), whole seconds from when the agent started.
+  - `usage_info` in Dograh's shape: LLM tokens per `"<processor>|||<model>"`
+    (`LLM|||<model>` for conversation turns and variable extraction, from
+    each streamed reply's usage chunk -- `stream_options.include_usage`; a
+    reply cut short never gets one, so its tokens go uncounted), TTS
+    characters sent (`SarvamTTSService|||<model>`), STT seconds = the whole
+    call (`SarvamSTTService|||<model>`, as Dograh bills streaming STT), and
+    `call_duration_seconds` -- also copied to `cost_info`, where the call list
+    reads the duration. Whole seconds from when the agent started.
   - `logs.realtime_feedback_events`, `is_completed`, state `completed`.
   - **Then** the recording and transcript, uploaded to Dograh's MinIO
     (`MINIO_*`, `internal/dograh/storage.go`, S3 Signature V4 as the MinIO
@@ -399,6 +405,29 @@ call: failures are logged (`dograh run: ...`) and the call carries on.
     same parser variable extraction uses) is merged into the run's
     `annotations` as `qa_<node id>`, plus a top-level `tags` list across every
     QA node (Dograh's run list filters by this).
+  - QA's own LLM tokens (reviews, conversation and node summaries) are
+    counted under `QAAnalysis|||<model>`. Dograh means to do this
+    (`_update_usage_info_with_qa_tokens`) but its QA results never carry
+    `token_usage`, so its QA calls go unpriced; Vaani's don't.
+- **Then the cost** (`internal/dograh/cost.go`, `pricing.go`): Dograh's
+  `calculate_workflow_run_cost` job, also never triggered for Vaani's calls,
+  run after QA as Dograh orders it. `usage_info` is rewritten with QA's
+  tokens added and priced into `cost_info` -- `cost_breakdown` (llm/tts/stt
+  /total, USD), `total_cost_usd`, `dograh_token_usage` (1 cent = 1 token),
+  `calculated_at`, and `charge_usd`/`price_per_second_usd` when the workflow
+  owner's selected organization has a per-second price. That's what Dograh's
+  live monitor and run pages show. The call is then added to that
+  organization's current `organization_usage_cycles` row (tokens, seconds,
+  charge); a missing cycle row is logged, not created -- Dograh owns the
+  quota period rules. Log: `dograh run cost total_usd=... dograh_tokens=...`.
+  - Prices are Dograh's tables (`api/services/pricing/*.py`, Sarvam's INR
+    rates at Rs96.5/USD), provider inferred from the model name as Dograh
+    does. Two differences: Sarvam's LLM rates follow Sarvam's rate card
+    (Oct 2026: 105B and 105B Conversations Rs15/5/60 per 1M input/cached/
+    output; Gemma 4 Rs35/10/90; GLM 5.3 Rs126/20/390), and a model not found
+    as written is retried without a gateway prefix
+    (`sarvam/sarvam-105b-conversations`) -- Dograh's exact lookup misses
+    those and falls back to the provider's default rate.
 - **Time budgets:** creating the run is tried twice, 10s each. Completing it
   comes first and gets its own 10s; each upload 20s, the file update 10s --
   so a slow MinIO costs only the files, never leaves a run at `running`
@@ -406,10 +435,8 @@ call: failures are logged (`dograh run: ...`) and the call carries on.
   a deploy), the end-of-call variable extraction is skipped so the
   completion is written inside the shutdown window; QA Analysis (above) is
   skipped outright rather than started.
-- **Not done** (Dograh's completion job, which Vaani can't run): cost
-  calculation, integrations/webhooks. LLM/TTS/STT usage in `usage_info` is
-  left empty (QA's own token usage isn't currently counted either -- Dograh's
-  job computes it, but never actually records a non-zero value either).
+- **Not done** (Dograh's completion job, which Vaani can't run):
+  integrations/webhooks.
 
 ### Variable extraction
 

@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/nitesh/vaani/internal/ai/agent"
+	"github.com/nitesh/vaani/internal/ai/llm"
 )
 
 // qaWorkflow is a workflow with one QA node (its default settings except
@@ -229,6 +230,7 @@ func qaLLMServer(t *testing.T, textFor func(systemPrompt string) string) *httpte
 		text := textFor(system)
 		b, _ := json.Marshal(map[string]any{"choices": []map[string]any{{"delta": map[string]any{"content": text}}}})
 		_, _ = w.Write([]byte("data: " + string(b) + "\n\n"))
+		_, _ = w.Write([]byte(`data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}` + "\n\n"))
 		_, _ = w.Write([]byte("data: [DONE]\n\n"))
 	}))
 }
@@ -275,8 +277,14 @@ func TestRunQANodePerNode(t *testing.T) {
 
 	var s Store
 
-	res, err := s.runQANode(t.Context(), wf.QA.Nodes[0], wf, sum, time.Minute, map[string]string{"a1": "cached, not regenerated"})
+	usage := map[string]llm.Usage{}
+
+	res, err := s.runQANode(t.Context(), wf.QA.Nodes[0], wf, sum, time.Minute, map[string]string{"a1": "cached, not regenerated"}, usage)
 	require.NoError(t, err)
+
+	// Two reviews + one conversation summary, each 10/2 tokens, under
+	// Dograh's QAAnalysis key.
+	assert.Equal(t, map[string]llm.Usage{"QAAnalysis|||gpt-test": {PromptTokens: 30, CompletionTokens: 6, TotalTokens: 36}}, usage)
 
 	assert.Equal(t, "gpt-test", res.Model)
 	require.Len(t, res.NodeResults, 2)
@@ -311,17 +319,17 @@ func TestRunQANodePerNode(t *testing.T) {
 func TestRunQANodeNoSystemPrompt(t *testing.T) {
 	var s Store
 
-	_, err := s.runQANode(t.Context(), QANode{}, &Workflow{}, agent.CallSummary{}, 0, nil)
+	_, err := s.runQANode(t.Context(), QANode{}, &Workflow{}, agent.CallSummary{}, 0, nil, nil)
 	assert.ErrorContains(t, err, "no system prompt")
 }
 
 func TestRunQANodeNoLLM(t *testing.T) {
 	var s Store
 
-	_, err := s.runQANode(t.Context(), QANode{SystemPrompt: "x"}, &Workflow{}, agent.CallSummary{}, 0, nil)
+	_, err := s.runQANode(t.Context(), QANode{SystemPrompt: "x"}, &Workflow{}, agent.CallSummary{}, 0, nil, nil)
 	assert.ErrorContains(t, err, "no LLM API key")
 
 	_, err = s.runQANode(t.Context(), QANode{SystemPrompt: "x", UseWorkflowLLM: false, Provider: "azure", APIKey: "k", Model: "m"},
-		&Workflow{}, agent.CallSummary{}, 0, nil)
+		&Workflow{}, agent.CallSummary{}, 0, nil, nil)
 	assert.ErrorContains(t, err, "azure")
 }
