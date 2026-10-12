@@ -182,7 +182,7 @@ func openDograh(ctx context.Context, cfg config.Config) (*dograh.Store, *dograh.
 
 	if cfg.DograhDBURL != "" {
 		pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		s, err := dograh.Open(pingCtx, cfg.DograhDBURL)
+		s, err := dograh.Open(pingCtx, cfg.DograhDBURL, cfg.DograhDBMaxConns)
 		cancel()
 
 		if err != nil {

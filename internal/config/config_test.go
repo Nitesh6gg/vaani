@@ -167,6 +167,34 @@ func TestLoad_AgentMode_SucceedsOnceAllRequiredSettingsAreSet(t *testing.T) {
 	assert.Equal(t, 19, cfg.DograhWorkflowID)
 }
 
+// TestLoad_DograhDBMaxConns: the Dograh database pool defaults to 50 and
+// DOGRAH_DB_MAX_CONNS changes it; zero or garbage is refused.
+func TestLoad_DograhDBMaxConns(t *testing.T) {
+	restoreWD := chdir(t, t.TempDir())
+	defer restoreWD()
+
+	t.Setenv("APP_MODE", "agent")
+	t.Setenv("DOGRAH_DB_URL", "postgresql://u:p@localhost/dograh")
+	t.Setenv("DOGRAH_WORKFLOW_ID", "19")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, 50, cfg.DograhDBMaxConns)
+
+	t.Setenv("DOGRAH_DB_MAX_CONNS", "80")
+
+	cfg, err = Load()
+	require.NoError(t, err)
+	assert.Equal(t, 80, cfg.DograhDBMaxConns)
+
+	for _, bad := range []string{"0", "-3", "many"} {
+		t.Setenv("DOGRAH_DB_MAX_CONNS", bad)
+
+		_, err = Load()
+		assert.ErrorContains(t, err, "DOGRAH_DB_MAX_CONNS", bad)
+	}
+}
+
 func chdir(t *testing.T, dir string) (restore func()) {
 	t.Helper()
 

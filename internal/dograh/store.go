@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -24,9 +25,32 @@ type Store struct {
 	clips *clipCache // nil until UseStorage: recordings can't be played
 }
 
+// poolConfig is url's pool configuration with maxConns applied, unless the
+// url sets pool_max_conns itself.
+func poolConfig(url string, maxConns int) (*pgxpool.Config, error) {
+	cfg, err := pgxpool.ParseConfig(url)
+	if err != nil {
+		return nil, err
+	}
+
+	if maxConns > 0 && !strings.Contains(url, "pool_max_conns") {
+		cfg.MaxConns = int32(maxConns)
+	}
+
+	return cfg, nil
+}
+
 // Open connects to Dograh's Postgres at url and verifies the connection.
-func Open(ctx context.Context, url string) (*Store, error) {
-	pool, err := pgxpool.New(ctx, url)
+// The pool holds up to maxConns connections, unless url sets pool_max_conns
+// itself; with neither, pgx's default applies (the larger of 4 and the CPU
+// count).
+func Open(ctx context.Context, url string, maxConns int) (*Store, error) {
+	cfg, err := poolConfig(url, maxConns)
+	if err != nil {
+		return nil, fmt.Errorf("dograh: connect: %w", err)
+	}
+
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("dograh: connect: %w", err)
 	}

@@ -1380,8 +1380,8 @@ func (h *Handler) runLLMTurn(ctx context.Context, history []llm.Message, ttsClie
 			}
 
 			speak, id := router.feed(tok)
-			if id != "" {
-				h.playRecording(ctx, ttsClient, roundNode, id, gen)
+			if id != "" && !h.playRecording(ctx, ttsClient, roundNode, id, gen) {
+				speak += router.speakRest()
 			}
 
 			return speak

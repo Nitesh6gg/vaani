@@ -460,9 +460,14 @@ no Sarvam characters billed (`internal/dograh/recordings.go`,
   transcript (that recording plays). `agent.clipRouter` is Dograh's
   `RecordingRouterProcessor`: the reply is held until its marker, the text
   after `▸` goes to TTS, a `●` reply plays as soon as a space ends the id.
-  No marker: spoken as-is. An unknown id: logged, nothing plays. One
-  difference: when both markers arrive in one chunk, the earlier one wins
-  (Dograh checks `●` first wherever it is).
+  No marker: spoken as-is. An unknown id (the LLM invented one, or the
+  recording was deleted -- seen live: an End Call that asked for a recording
+  that wasn't in the database, so the caller got no goodbye): logged
+  (`tts.clip_missing`), and the text the LLM wrote after the id -- the
+  recording's transcript -- is spoken instead (`clipRouter.speakRest`);
+  Dograh plays nothing. With no text after the id there's nothing to say.
+  Another difference: when both markers arrive in one chunk, the earlier one
+  wins (Dograh checks `●` first wherever it is).
 
 The greeting, transition and tool references are recordings' primary keys
 (numbers or numeric strings, read like Dograh's `int()`); the response mode

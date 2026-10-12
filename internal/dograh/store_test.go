@@ -159,3 +159,22 @@ func TestRenderTemplateMatchesDograh(t *testing.T) {
 		assert.Equal(t, want, renderTemplate(in, vars, now), in)
 	}
 }
+
+// TestPoolConfig: the pool takes DOGRAH_DB_MAX_CONNS; a pool_max_conns in
+// the URL itself wins; with neither, pgx's own default stays.
+func TestPoolConfig(t *testing.T) {
+	cfg, err := poolConfig("postgresql://u:p@h:5432/d", 50)
+	require.NoError(t, err)
+	assert.EqualValues(t, 50, cfg.MaxConns)
+
+	cfg, err = poolConfig("postgresql://u:p@h:5432/d?pool_max_conns=7", 50)
+	require.NoError(t, err)
+	assert.EqualValues(t, 7, cfg.MaxConns, "the URL's own setting wins")
+
+	def, err := poolConfig("postgresql://u:p@h:5432/d", 0)
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, def.MaxConns, int32(4), "pgx's default when nothing is set")
+
+	_, err = poolConfig("not a url ://", 50)
+	assert.Error(t, err)
+}

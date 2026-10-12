@@ -104,6 +104,13 @@ type Config struct {
 	// Both required when AppMode is "agent".
 	DograhDBURL      string
 	DograhWorkflowID int
+	// DograhDBMaxConns (DOGRAH_DB_MAX_CONNS, default 50) caps the connection
+	// pool to Dograh's Postgres. Every call reads its workflow, tools and
+	// recordings when it starts and writes its run, so a burst of calls
+	// queues on the pool: the library's own default (16 on a 16-CPU host)
+	// is too small for that. Dograh gives its Asterisk call manager, the
+	// same one-process funnel, 40+60. A pool_max_conns in DOGRAH_DB_URL wins.
+	DograhDBMaxConns int
 
 	// Dograh's MinIO, where each call's recording and transcript are
 	// uploaded for its call history -- the same MINIO_* settings (and
@@ -230,6 +237,14 @@ func Load() (Config, error) {
 
 	if cfg.DograhWorkflowID, err = getEnvInt("DOGRAH_WORKFLOW_ID", 0); err != nil {
 		return Config{}, err
+	}
+
+	if cfg.DograhDBMaxConns, err = getEnvInt("DOGRAH_DB_MAX_CONNS", 50); err != nil {
+		return Config{}, err
+	}
+
+	if cfg.DograhDBMaxConns < 1 {
+		return Config{}, fmt.Errorf("config: DOGRAH_DB_MAX_CONNS must be at least 1, got %d", cfg.DograhDBMaxConns)
 	}
 
 	if cfg.MediaPortCount <= 0 {

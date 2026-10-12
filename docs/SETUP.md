@@ -45,6 +45,13 @@ models and keys are all configured there (see "Configured in Dograh" in
   codes to `workflows.call_disposition_codes`), so the user needs INSERT and
   UPDATE on those two tables. Checked at startup (10s): unreachable = the
   server doesn't start.
+- `DOGRAH_DB_MAX_CONNS` (default 50) -- connections kept open to that
+  database. Each call reads its workflow, tools and recordings when it
+  starts and writes its run, so a burst of calls queues on this pool; the
+  library's own default is only the CPU count (16 on a 16-CPU host). Dograh
+  gives its Asterisk call manager 40+60. Keep it within what the database --
+  or Dograh's PgBouncer (1000 clients, 50 real connections in its compose
+  file) -- accepts; a `pool_max_conns` in `DOGRAH_DB_URL` overrides it.
 - `DOGRAH_WORKFLOW_ID` -- the workflow to run: the number in its editor URL
   (`/workflow/19` -> `19`).
 - `MINIO_ENDPOINT`, `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY`, `MINIO_BUCKET`

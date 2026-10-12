@@ -94,6 +94,29 @@ func (r *clipRouter) feed(tok string) (speak, recordingID string) {
 	return "", ""
 }
 
+// speakRest turns a "●" reply whose recording isn't available into a spoken
+// one: what the LLM had written after the id when it was picked is returned
+// for TTS, and the rest of the reply follows as ordinary speech. The LLM
+// writes the recording's transcript there, so the caller hears what the
+// recording would have said instead of silence (Dograh plays nothing).
+func (r *clipRouter) speakRest() string {
+	rest := strings.TrimLeft(r.buf, " \t\n")
+	if f := strings.Fields(rest); len(f) > 0 {
+		rest = strings.TrimLeft(strings.TrimPrefix(rest, f[0]), " \t\n")
+	}
+
+	// Modes never mix: a second "●" ends the speech (and anything after it
+	// that's still to come).
+	stopped := false
+	if i := strings.Index(rest, RecordingMarker); i >= 0 {
+		rest, stopped = rest[:i], true
+	}
+
+	r.mode, r.buf, r.stopped = modeTTS, "", stopped
+
+	return rest
+}
+
 // flush ends the reply: a recording whose id was never followed by a space
 // plays now; a reply that never had a marker is spoken as-is.
 func (r *clipRouter) flush() (speak, recordingID string) {
@@ -138,15 +161,19 @@ func (h *Handler) playClip(ctx context.Context, ttsClient tts.Client, clip *Clip
 
 // playRecording plays the recording the LLM asked for with "● <id>": what
 // the turn records is the marker, id and transcript, so the LLM's history
-// shows the reply format it's asked to keep, as Dograh's context does.
-func (h *Handler) playRecording(ctx context.Context, ttsClient tts.Client, node *Node, id string, gen uint64) {
+// shows the reply format it's asked to keep, as Dograh's context does. It
+// reports whether the recording exists; if not, nothing was played and the
+// caller falls back to speaking the text the LLM wrote (clipRouter.speakRest).
+func (h *Handler) playRecording(ctx context.Context, ttsClient tts.Client, node *Node, id string, gen uint64) bool {
 	clip := node.Clips[id]
 	if clip == nil {
-		slog.Warn("llm asked for a recording that isn't available; nothing plays", "call_id", h.callID, "gen", gen,
-			"event", "tts.clip_missing", "recording_id", id)
+		slog.Warn("llm asked for a recording that isn't available; speaking the text it wrote instead", "call_id", h.callID,
+			"gen", gen, "event", "tts.clip_missing", "recording_id", id)
 
-		return
+		return false
 	}
 
 	h.playClip(ctx, ttsClient, clip, RecordingMarker+" "+clip.ID+" "+clip.Transcript+" ", gen)
+
+	return true
 }

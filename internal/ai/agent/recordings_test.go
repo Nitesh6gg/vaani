@@ -49,6 +49,45 @@ func TestClipRouter(t *testing.T) {
 	}
 }
 
+// TestClipRouterSpeakRest: when the recording turns out not to exist, what
+// the LLM wrote after the id becomes ordinary speech, however the tokens
+// split.
+func TestClipRouterSpeakRest(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		tokens []string
+		want   string
+	}{
+		{"split across tokens", []string{"● miss", "ing_01", " Hi", " there."}, "Hi there."},
+		{"all in one token", []string{"● missing_01 Hi there."}, "Hi there."},
+		{"id and a space only", []string{"● missing_01 "}, ""},
+		{"second marker still ends it", []string{"● missing_01 Hi ● other"}, "Hi "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				r     clipRouter
+				spoke string
+			)
+
+			for _, tok := range tc.tokens {
+				s, id := r.feed(tok)
+				spoke += s
+
+				if id != "" {
+					assert.Equal(t, "missing_01", id)
+
+					spoke += r.speakRest()
+				}
+			}
+
+			s, id := r.flush()
+			assert.Empty(t, id)
+
+			assert.Equal(t, tc.want, spoke+s)
+		})
+	}
+}
+
 func (f *fakeTTS) callList() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -96,17 +135,32 @@ func TestHandler_RecordedTransitionAndReply(t *testing.T) {
 	assert.Equal(t, []string{"play:Ek second. ", "play:● offer_01 Our offer. "}, fTTS.callList())
 }
 
-func TestHandler_UnknownRecordingPlaysNothing(t *testing.T) {
-	fSTT := newFakeSTT()
-	fTTS := newFakeTTS()
+// TestHandler_UnknownRecordingSpeaksItsText: the LLM asked for a recording
+// that doesn't exist (it invented the id); the caller hears the text it
+// wrote after the id, not silence. With nothing written after the id there
+// is nothing to say.
+func TestHandler_UnknownRecordingSpeaksItsText(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		tokens []string
+		want   []string
+	}{
+		{"with its text", []string{"● ", "missing_01 ", "धन्यवाद, आपका दिन शुभ हो."}, []string{"speak:धन्यवाद, आपका दिन शुभ हो."}},
+		{"id only", []string{"● missing_01"}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fSTT := newFakeSTT()
+			fTTS := newFakeTTS()
 
-	cfg := testConfig(fSTT, fTTS, &fakeLLM{tokens: []string{"● missing_01 Hi."}}, 0, 0)
-	cfg.Start = &Node{AllowInterrupt: true, Clips: map[string]*Clip{}}
-	NewHandler(context.Background(), "call1", cfg)
+			cfg := testConfig(fSTT, fTTS, &fakeLLM{tokens: tc.tokens}, 0, 0)
+			cfg.Start = &Node{AllowInterrupt: true, Clips: map[string]*Clip{}}
+			NewHandler(context.Background(), "call1", cfg)
 
-	fSTT.sendFinal("haan")
-	require.Eventually(t, func() bool { return len(fTTS.endedGens()) == 1 }, time.Second, time.Millisecond)
-	assert.Empty(t, fTTS.callList())
+			fSTT.sendFinal("haan")
+			require.Eventually(t, func() bool { return len(fTTS.endedGens()) == 1 }, time.Second, time.Millisecond)
+			assert.Equal(t, tc.want, fTTS.callList())
+		})
+	}
 }
 
 func TestHandler_RecordedToolMessage(t *testing.T) {
