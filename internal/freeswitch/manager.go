@@ -343,6 +343,17 @@ func (m *Manager) runCall(c *call, ws *websocket.Conn, h http.Header) {
 	config.RegisterCallTrace(c.id, config.NewTraceID())
 	defer config.UnregisterCallTrace(c.id)
 
+	// The same two series the ARI manager keeps (internal/ari/handlers.go):
+	// the active-calls gauge and the call-duration histogram, from the call's
+	// start to when everything about it has been torn down.
+	answered := time.Now()
+
+	metrics.CallsActive.Inc()
+	defer func() {
+		metrics.CallsActive.Dec()
+		metrics.CallDurationSeconds.Observe(time.Since(answered).Seconds())
+	}()
+
 	var meta earshotMeta
 	_ = json.Unmarshal([]byte(h.Get("X-Earshot-Meta")), &meta)
 	from, to := phoneNumber(meta.From), phoneNumber(meta.To)

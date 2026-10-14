@@ -13,11 +13,13 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/nitesh/vaani/internal/callagent"
 	"github.com/nitesh/vaani/internal/config"
+	"github.com/nitesh/vaani/internal/metrics"
 )
 
 const testUUID = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
@@ -180,6 +182,38 @@ func TestCallerHangupEndsCall(t *testing.T) {
 	fs.hangupEvent(testUUID)
 	waitNoCalls(t, m)
 	assert.Empty(t, fs.apiCalls(), "no uuid_kill for a channel FreeSWITCH already hung up")
+}
+
+// A call is counted in vaani_calls_active while it's up and its length is
+// recorded in vaani_call_duration_seconds when it ends -- the same two series
+// the ARI manager keeps, so the dashboards work on FreeSWITCH too.
+func TestCallMetrics(t *testing.T) {
+	activeCalls := func() float64 {
+		var m dto.Metric
+		require.NoError(t, metrics.CallsActive.Write(&m))
+
+		return m.GetGauge().GetValue()
+	}
+	durations := func() uint64 {
+		var m dto.Metric
+		require.NoError(t, metrics.CallDurationSeconds.Write(&m))
+
+		return m.GetHistogram().GetSampleCount()
+	}
+	active, recorded := activeCalls(), durations()
+
+	fs := newFakeSwitch(t)
+	m, url := start(t, fs, "")
+	dialCall(t, url, callHeaders(""))
+
+	assert.Eventually(t, func() bool { return activeCalls() == active+1 },
+		2*time.Second, 10*time.Millisecond, "counted while the call is up")
+
+	fs.hangupEvent(testUUID)
+	waitNoCalls(t, m)
+
+	assert.Equal(t, active, activeCalls())
+	assert.Equal(t, recorded+1, durations(), "one call, one duration")
 }
 
 // Earshot drops the socket while the channel may still be up: Vaani hangs

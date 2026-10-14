@@ -161,9 +161,12 @@ the ARI WebSocket is connected, 503 otherwise. Neither endpoint requires
 authentication -- see "Operability endpoints" in `docs/ARCHITECTURE.md`.
 
 Metrics reach an observability backend (SigNoz etc.) by it scraping
-`/metrics` -- see `observability/dashboard.json` and
-`observability/performance.json` for ready-made panels. Logs are the
-opposite direction: set `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` (or
+`/metrics`. For SigNoz, add a `prometheus` receiver with a scrape job for
+`<vaani-host>:9091` to the collector's config **and** list `prometheus` in
+`service.pipelines.metrics.receivers` -- a receiver defined but not in a
+pipeline is silently ignored. A histogram such as `vaani_llm_ttft_ms` is
+stored as `vaani_llm_ttft_ms.bucket` (plus `.count`/`.sum`); query percentiles
+on the `.bucket` name. Logs are the opposite direction: set `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` (or
 `OTEL_EXPORTER_OTLP_ENDPOINT`, e.g. `http://<signoz-host>:4318`) to also push
 every log line there over OTLP/HTTP, alongside (not instead of) the normal
 stderr JSON/text output -- the same env var name and endpoint shape a Spring
