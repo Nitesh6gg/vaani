@@ -250,6 +250,12 @@ Done in F1:
   any other end (socket closed, media dead, max duration, shutdown) →
   `uuid_kill`. Lab logging: `call.ended` carries earshot message counts, odd
   sizes and close code; `earshot.status` logs `play_buffered` every 30 s.
+  `call.hangup_event` (INFO, once per call FreeSWITCH hangs up) carries the
+  event's `cause`, `sip_disposition` (`recv_bye`: the other end of the SIP
+  leg sent the BYE; `send_bye`: this switch did), `sip_term_status`,
+  `sip_term_cause` and `proto_cause`. A call that ends with no
+  `call.hangup_event` was ended by Vaani (see `hung up channel`). An empty
+  field means FreeSWITCH hadn't set it yet when the event fired.
 
 Done in F2:
 

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -81,8 +82,11 @@ func (fs *fakeSwitch) send(s string) {
 	_, _ = fs.conn.Write([]byte(s))
 }
 
-func (fs *fakeSwitch) hangupEvent(uuid string) {
-	body := fmt.Sprintf("Event-Name: CHANNEL_HANGUP\nUnique-ID: %s\nHangup-Cause: NORMAL_CLEARING\n\n", uuid)
+func (fs *fakeSwitch) hangupEvent(uuid string) { fs.hangupEventWith(uuid) }
+
+// hangupEventWith is a hangup event carrying extra "Name: value" headers.
+func (fs *fakeSwitch) hangupEventWith(uuid string, extra ...string) {
+	body := fmt.Sprintf("Event-Name: CHANNEL_HANGUP\nUnique-ID: %s\nHangup-Cause: NORMAL_CLEARING\n%s\n", uuid, strings.Join(append(extra, ""), "\n"))
 	fs.send(fmt.Sprintf("Content-Length: %d\nContent-Type: text/event-plain\n\n%s", len(body), body))
 }
 
@@ -182,6 +186,49 @@ func TestCallerHangupEndsCall(t *testing.T) {
 	fs.hangupEvent(testUUID)
 	waitNoCalls(t, m)
 	assert.Empty(t, fs.apiCalls(), "no uuid_kill for a channel FreeSWITCH already hung up")
+}
+
+// lockedBuf is a log sink the test can read while handlers still write to it.
+type lockedBuf struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (l *lockedBuf) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return l.b.Write(p)
+}
+
+func (l *lockedBuf) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return l.b.String()
+}
+
+// A dropped call explains itself: the hangup event's cause and SIP
+// disposition (who sent the BYE) are in the call's log.
+func TestHangupEventIsLogged(t *testing.T) {
+	var buf lockedBuf
+
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	fs := newFakeSwitch(t)
+	m, url := start(t, fs, "")
+	dialCall(t, url, callHeaders(""))
+
+	fs.hangupEventWith(testUUID, "variable_sip_hangup_disposition: recv_bye", "variable_sip_term_status: 200")
+	waitNoCalls(t, m)
+
+	log := buf.String()
+	assert.Contains(t, log, `"event":"call.hangup_event"`)
+	assert.Contains(t, log, `"cause":"NORMAL_CLEARING"`)
+	assert.Contains(t, log, `"sip_disposition":"recv_bye"`)
+	assert.Contains(t, log, `"sip_term_status":"200"`)
 }
 
 // A call is counted in vaani_calls_active while it's up and its length is

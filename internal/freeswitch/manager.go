@@ -219,6 +219,19 @@ func (m *Manager) onEvent(ev *esl.Message) {
 	switch ev.Name() {
 	case "CHANNEL_HANGUP":
 		if c != nil {
+			// Who ended it, as far as FreeSWITCH knows. "Hangup-Cause" alone
+			// (NORMAL_CLEARING) is the same whether the far end hung up or
+			// we did; sip_hangup_disposition says which side sent the BYE
+			// (recv_bye: the other end of the SIP leg; send_bye: this
+			// switch). A field missing here means FreeSWITCH hadn't set it
+			// yet when the event fired -- logged empty, so that shows too.
+			slog.Info("freeswitch hangup", "call_id", id, "cause", ev.Get("Hangup-Cause"),
+				"sip_disposition", ev.Get("variable_sip_hangup_disposition"),
+				"sip_term_status", ev.Get("variable_sip_term_status"),
+				"sip_term_cause", ev.Get("variable_sip_term_cause"),
+				"proto_cause", ev.Get("variable_proto_specific_hangup_cause"),
+				"component", "telephony", "event", "call.hangup_event")
+
 			c.cancel(fmt.Errorf("%w: %s", errHangup, ev.Get("Hangup-Cause")))
 		}
 	case "earshot::error":
