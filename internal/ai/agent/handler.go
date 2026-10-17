@@ -334,8 +334,10 @@ type Handler struct {
 	// speech (TEN VAD); then it also runs while listening, so the caller's
 	// last sound before each STT end-of-speech is known. Nil otherwise.
 	clock speechClock
-	// gate is non-nil when only speech goes to the STT (Config.STTGate).
-	gate *sttGate
+	// gate is non-nil when only speech goes to the STT (Config.STTGate);
+	// sttBytes counts what feedSTT sent when it isn't (the gate counts its own).
+	gate     *sttGate
+	sttBytes atomic.Int64
 
 	// node is the workflow node the conversation is at. Read by run() when a
 	// turn starts; moved by runLLMTurn's goroutine the moment the LLM takes
@@ -625,10 +627,23 @@ func (h *Handler) ProcessFrame(_ context.Context, _ string, pcm []byte) [][]byte
 	}
 }
 
+// STTAudio is the seconds of caller audio handed to the STT so far -- what
+// Sarvam bills -- and whether only speech was sent (Config.STTGate), as opposed
+// to every frame of the call.
+func (h *Handler) STTAudio() (seconds float64, gated bool) {
+	if h.gate != nil {
+		return h.gate.Sent(), true
+	}
+
+	return float64(h.sttBytes.Load()) / gateBytesPerSecond, false
+}
+
 // feedSTT hands the caller's frame to the STT: all of them, or with
 // Config.STTGate only the speech (the gate keeps the audio before it).
 func (h *Handler) feedSTT(pcm []byte) error {
 	if h.gate == nil {
+		h.sttBytes.Add(int64(len(pcm)))
+
 		return h.cfg.STT.Feed(pcm)
 	}
 

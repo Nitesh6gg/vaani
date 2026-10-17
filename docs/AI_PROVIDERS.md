@@ -84,8 +84,27 @@ logs what it resolved to, never the keys:
   syllable missing). Two consequences to watch: if the agent's own voice
   echoes back down the caller's line, Sarvam transcribes that too (discarded
   while the agent speaks, but able to confirm a pause at an interruptible
-  node -- Dograh has the same exposure); and Sarvam now receives the whole
-  call's audio, whose effect on Sarvam's billing hasn't been checked.
+  node -- Dograh has the same exposure); and Sarvam receives the whole
+  call's audio, which it bills by the second (checked 2026-10-13: a 100s
+  connection with 10s sent was billed 10s; silence sent is billed) -- see
+  `STT_SPEECH_ONLY` below.
+- **Speech-only sending (`STT_SPEECH_ONLY`, default off; needs `VAD_MODE=ten`).**
+  Instead of every frame, Sarvam gets the caller's speech: a 1s ring buffer
+  of recent frames (`STT_PREROLL_MS`) goes out ahead of the live audio when
+  TEN VAD hears speech (or a frame is louder than `STT_GATE_RMS_FLOOR`), so the
+  first syllable isn't lost to the VAD's lag; live frames follow until
+  `STT_HANGOVER_MS` (700, must exceed `STT_FLUSH_AFTER_MS`) after the last
+  speech; while closed, 100ms of silence goes out every 20s to keep the
+  connection (the legacy endpoint rejects a ping; pipecat's keepalive is the
+  same silent chunk). Probed against the legacy endpoint (2026-10,
+  `cmd/stt-billing-test`): identical transcripts, the same flush-to-final
+  latency, ~60% less audio on a clean clip; one control that dropped a second
+  of audio didn't change the text, so first-syllable safety must be checked on
+  real calls (listen to the recordings). pipecat's Sarvam services send every
+  frame; its segmented STT keeps a 1s pre-roll, which is where the default
+  comes from. `call.summary` carries `stt_audio_s` (the audio sent) and
+  `stt_speech_only`; `vaani_stt_audio_seconds_total` adds it up; and with the
+  gate on, Dograh's STT cost is the seconds sent, not the call's length.
 - **Early finalization (`STT_FLUSH_AFTER_MS`, default 400; `0` turns it
   off; only with `VAD_MODE=ten`).** Sarvam decides by itself when the caller has stopped
   (`END_SPEECH`), which took ~600-700ms in live calls (`end_detect_ms`) --

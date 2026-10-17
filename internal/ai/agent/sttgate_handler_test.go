@@ -44,7 +44,14 @@ func TestHandler_STTGate_SendsOnlySpeech(t *testing.T) {
 
 	tickFrame(h)
 	assert.Equal(t, 7, fSTT.fedCount(), "closed again")
-	assert.InDelta(t, 7*0.02, h.gate.Sent(), 0.001)
+	seconds, gated := h.STTAudio()
+	assert.InDelta(t, 7*0.02, seconds, 0.001, "what the gate sent, not what the call carried")
+	assert.True(t, gated)
+
+	log := &CallLog{}
+	log.STTAudio(seconds, gated)
+	assert.True(t, log.Summary().STTGated)
+	assert.InDelta(t, seconds, log.Summary().STTAudioSeconds, 1e-9)
 }
 
 // The default: every frame goes out, as before the gate existed.
@@ -57,6 +64,10 @@ func TestHandler_STTGate_OffSendsEverything(t *testing.T) {
 
 	assert.Equal(t, 10, fSTT.fedCount())
 	assert.Nil(t, h.gate)
+
+	seconds, gated := h.STTAudio()
+	assert.InDelta(t, 0.2, seconds, 1e-9, "10 frames of 20ms, counted without the gate")
+	assert.False(t, gated)
 }
 
 // A VAD that can't say when it last heard speech (the energy detector) can't

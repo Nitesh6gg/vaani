@@ -377,6 +377,10 @@ func (b *Builder) recordRun(c Call, wf *dograh.Workflow, callLog *agent.CallLog,
 	// its last node's variables.
 	h.FinishExtraction(b.procCtx)
 
+	sttSeconds, sttGated := h.STTAudio()
+	callLog.STTAudio(sttSeconds, sttGated)
+	metrics.STTAudioSecondsTotal.Add(sttSeconds)
+
 	summary := callLog.Summary()
 	recording := rec.WAV()
 
@@ -436,7 +440,9 @@ func logCallSummary(callID string, duration time.Duration, disposition string, s
 		"user_turns", s.UserTurns, "agent_replies", s.AgentReplies,
 		"bargeins", s.BargeIns, "pauses", s.Pauses, "false_interruptions", s.FalseInterruptions,
 		"held_speech", s.HeldSpeech, "held_delivered", s.HeldDelivered,
-		"nodes", s.NodesVisited, "variables", len(s.Extracted), "recording_bytes", recordingBytes}
+		"nodes", s.NodesVisited, "variables", len(s.Extracted), "recording_bytes", recordingBytes,
+		// What Sarvam billed for STT: the call's length, or the speech only.
+		"stt_audio_s", math.Round(s.STTAudioSeconds*10) / 10, "stt_speech_only", s.STTGated}
 
 	if p50, p95, ok := percentiles(s.ReplyLatenciesMS); ok {
 		args = append(args, "reply_latency_p50_ms", p50, "reply_latency_p95_ms", p95)
