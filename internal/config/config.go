@@ -148,6 +148,18 @@ type Config struct {
 	// replies ~0.2-0.3s sooner. Only with VAD_MODE=ten. See
 	// internal/ai/agent.Config.STTFlushAfter.
 	STTFlushAfter time.Duration
+	// STTSpeechOnly (STT_SPEECH_ONLY, default off): send the STT only the
+	// caller's speech -- STTPreroll (STT_PREROLL_MS, default 1000) of audio
+	// from before it was noticed, then live frames until STTHangover
+	// (STT_HANGOVER_MS, default 700; it must outlast STTFlushAfter plus the
+	// STT's reply) after the last speech -- instead of every frame of the call.
+	// Sarvam bills the audio sent. STTGateRMSFloor (STT_GATE_RMS_FLOOR, default
+	// 400, media.RMS units; 0 = off) also opens the gate for a loud frame TEN
+	// VAD missed. Only with VAD_MODE=ten. See internal/ai/agent.STTGateConfig.
+	STTSpeechOnly   bool
+	STTPreroll      time.Duration
+	STTHangover     time.Duration
+	STTGateRMSFloor float64
 	// PostCutSilence is how long after an interruption pauses the reply
 	// transcripts are ignored. See internal/ai/agent.Config.PostCutSilence.
 	PostCutSilence time.Duration
@@ -375,6 +387,47 @@ func Load() (Config, error) {
 	}
 
 	cfg.STTFlushAfter = time.Duration(sttFlushAfterMS) * time.Millisecond
+
+	cfg.STTSpeechOnly = getEnv("STT_SPEECH_ONLY", "0") == "1"
+
+	sttPrerollMS, err := getEnvInt("STT_PREROLL_MS", 1000)
+	if err != nil {
+		return Config{}, err
+	}
+
+	sttHangoverMS, err := getEnvInt("STT_HANGOVER_MS", 700)
+	if err != nil {
+		return Config{}, err
+	}
+
+	if sttPrerollMS < 0 || sttHangoverMS < 0 {
+		return Config{}, fmt.Errorf("config: STT_PREROLL_MS and STT_HANGOVER_MS must be >= 0, got %d and %d", sttPrerollMS, sttHangoverMS)
+	}
+
+	cfg.STTPreroll = time.Duration(sttPrerollMS) * time.Millisecond
+	cfg.STTHangover = time.Duration(sttHangoverMS) * time.Millisecond
+
+	if cfg.STTGateRMSFloor, err = getEnvFloat("STT_GATE_RMS_FLOOR", 400); err != nil {
+		return Config{}, err
+	}
+
+	if cfg.STTGateRMSFloor < 0 {
+		return Config{}, fmt.Errorf("config: STT_GATE_RMS_FLOOR must be >= 0 (0 = off), got %v", cfg.STTGateRMSFloor)
+	}
+
+	// The gate needs TEN VAD's last-speech time, and a hangover shorter than
+	// the flush wait would close it before the flush's reply: refuse both
+	// rather than run a feature that silently does something else.
+	if cfg.STTSpeechOnly {
+		if cfg.VadMode != "ten" {
+			return Config{}, fmt.Errorf("config: STT_SPEECH_ONLY=1 needs VAD_MODE=ten (got %q)", cfg.VadMode)
+		}
+
+		if cfg.STTFlushAfter > 0 && cfg.STTHangover <= cfg.STTFlushAfter {
+			return Config{}, fmt.Errorf("config: STT_HANGOVER_MS (%d) must exceed STT_FLUSH_AFTER_MS (%d), or the gate closes before the flush's reply",
+				sttHangoverMS, sttFlushAfterMS)
+		}
+	}
 
 	// 300ms: transcripts this soon after an interruption pauses the reply
 	// were already on their way (Sarvam needs ~0.7s after the caller stops
