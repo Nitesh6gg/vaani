@@ -540,7 +540,7 @@ func NewHandler(ctx context.Context, callID string, cfg Config) *Handler {
 
 	if cfg.STTGate.Enabled {
 		if h.clock != nil {
-			h.gate = newSTTGate(cfg.STTGate, cfg.STT.Feed, time.Now)
+			h.gate = newSTTGate(callID, cfg.STTGate, cfg.STT.Feed, time.Now)
 		} else {
 			slog.Warn("speech-only STT needs a VAD that tracks speech (VAD_MODE=ten); sending every frame",
 				"call_id", callID, "component", "stt", "event", "stt.gate_unavailable")
@@ -647,9 +647,9 @@ func (h *Handler) feedSTT(pcm []byte) error {
 		return h.cfg.STT.Feed(pcm)
 	}
 
-	now := time.Now()
+	why, level := h.cfg.STTGate.voiced(h.clock.LastSpeechAt(), time.Now(), pcm)
 
-	return h.gate.frame(pcm, h.cfg.STTGate.voiced(h.clock.LastSpeechAt(), now, pcm))
+	return h.gate.frame(pcm, why, level)
 }
 
 func (h *Handler) processSpeakingFrame(pcm []byte) [][]byte {

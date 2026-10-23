@@ -21,7 +21,7 @@ type gateRig struct {
 
 func newGateRig(preroll, hangover time.Duration) *gateRig {
 	r := &gateRig{now: time.Unix(1000, 0)}
-	r.g = newSTTGate(STTGateConfig{Enabled: true, Preroll: preroll, Hangover: hangover},
+	r.g = newSTTGate("call1", STTGateConfig{Enabled: true, Preroll: preroll, Hangover: hangover},
 		func(p []byte) error {
 			r.sent = append(r.sent, append([]byte(nil), p...))
 
@@ -40,7 +40,12 @@ func (r *gateRig) tick(id byte, voiced bool) error {
 		f[i] = id
 	}
 
-	return r.g.frame(f, voiced)
+	why := gateQuiet
+	if voiced {
+		why = gateVAD
+	}
+
+	return r.g.frame(f, why, 0)
 }
 
 func (r *gateRig) ids() []byte {
@@ -161,17 +166,23 @@ func TestSTTGate_Voiced(t *testing.T) {
 		cfg   STTGateConfig
 		last  time.Time
 		frame []byte
-		want  bool
+		want  gateWhy
 	}{
-		{"VAD heard speech a moment ago", STTGateConfig{}, now.Add(-50 * time.Millisecond), quiet, true},
-		{"VAD speech too long ago", STTGateConfig{}, now.Add(-time.Second), quiet, false},
-		{"VAD never heard any", STTGateConfig{}, time.Time{}, quiet, false},
-		{"quiet frame, floor set", STTGateConfig{RMSFloor: 400}, time.Time{}, quiet, false},
-		{"loud frame the VAD missed", STTGateConfig{RMSFloor: 400}, time.Time{}, loud, true},
-		{"loud frame, floor off", STTGateConfig{}, time.Time{}, loud, false},
+		{"VAD heard speech a moment ago", STTGateConfig{}, now.Add(-50 * time.Millisecond), quiet, gateVAD},
+		{"VAD speech too long ago", STTGateConfig{}, now.Add(-time.Second), quiet, gateQuiet},
+		{"VAD never heard any", STTGateConfig{}, time.Time{}, quiet, gateQuiet},
+		{"quiet frame, floor set", STTGateConfig{RMSFloor: 400}, time.Time{}, quiet, gateQuiet},
+		{"loud frame the VAD missed", STTGateConfig{RMSFloor: 400}, time.Time{}, loud, gateRMS},
+		{"loud frame, floor off", STTGateConfig{}, time.Time{}, loud, gateQuiet},
+		{"VAD and a loud frame: the VAD is the reason", STTGateConfig{RMSFloor: 400}, now.Add(-10 * time.Millisecond), loud, gateVAD},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, tc.cfg.voiced(tc.last, now, tc.frame))
+			why, level := tc.cfg.voiced(tc.last, now, tc.frame)
+			assert.Equal(t, tc.want, why)
+
+			if why == gateRMS {
+				assert.InDelta(t, 1000, level, 1, "the loudness that tripped the floor")
+			}
 		})
 	}
 }

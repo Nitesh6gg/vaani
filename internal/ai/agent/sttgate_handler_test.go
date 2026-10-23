@@ -54,8 +54,40 @@ func TestHandler_STTGate_SendsOnlySpeech(t *testing.T) {
 	assert.InDelta(t, seconds, log.Summary().STTAudioSeconds, 1e-9)
 }
 
+// Each time the gate opens its log line says why: the VAD, or the loud-frame
+// floor (with the level that tripped it).
+func TestHandler_STTGate_LogsWhyItOpened(t *testing.T) {
+	getLog := captureSlog(t)
+
+	vad := &fakeClockDetector{}
+	h, _ := gateHandler(t, vad, STTGateConfig{Enabled: true, Preroll: 100 * time.Millisecond, Hangover: 60 * time.Millisecond, RMSFloor: 400})
+
+	for i := 0; i < 20; i++ {
+		tickFrame(h) // quiet: stays shut, says nothing
+	}
+
+	assert.NotContains(t, getLog().String(), "stt.gate_open")
+
+	vad.set(time.Now())
+	tickFrame(h)
+	assert.Contains(t, getLog().String(), "event=stt.gate_open reason=vad preroll_ms=100")
+	assert.NotContains(t, getLog().String(), "rms=", "the level is only logged when the floor opened it")
+
+	time.Sleep(gateVoicedWindow + 30*time.Millisecond) // the VAD's window and the hangover pass: closed again
+	vad.set(time.Now().Add(-time.Hour))
+
+	for i := 0; i < 10; i++ {
+		tickFrame(h) // refills the pre-roll
+	}
+
+	h.ProcessFrame(context.Background(), "call1", constFrame(2000)) // loud, and the VAD heard nothing
+	assert.Contains(t, getLog().String(), "reason=rms preroll_ms=100 rms=2000")
+}
+
 // The default: every frame goes out, as before the gate existed.
 func TestHandler_STTGate_OffSendsEverything(t *testing.T) {
+	getLog := captureSlog(t)
+
 	h, fSTT := gateHandler(t, &fakeClockDetector{}, STTGateConfig{})
 
 	for i := 0; i < 10; i++ {
@@ -63,6 +95,7 @@ func TestHandler_STTGate_OffSendsEverything(t *testing.T) {
 	}
 
 	assert.Equal(t, 10, fSTT.fedCount())
+	assert.NotContains(t, getLog().String(), "stt.gate_open")
 	assert.Nil(t, h.gate)
 
 	seconds, gated := h.STTAudio()

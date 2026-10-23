@@ -104,7 +104,12 @@ logs what it resolved to, never the keys:
   frame; its segmented STT keeps a 1s pre-roll, which is where the default
   comes from. `call.summary` carries `stt_audio_s` (the audio sent) and
   `stt_speech_only`; `vaani_stt_audio_seconds_total` adds it up; and with the
-  gate on, Dograh's STT cost is the seconds sent, not the call's length.
+  gate on, Dograh's STT cost is the seconds sent, not the call's length. Each
+  time the gate opens it logs (DEBUG) `stt.gate_open` with `reason=vad` (TEN
+  VAD heard speech) or `reason=rms` (a frame louder than `STT_GATE_RMS_FLOOR`,
+  with its level as `rms=`, to tune the floor by) and the `preroll_ms` sent
+  with it; `stt.flush_skipped why=vad_missed_onset` followed by Sarvam
+  transcribing anyway is the floor catching speech the VAD missed.
 - **Early finalization (`STT_FLUSH_AFTER_MS`, default 400; `0` turns it
   off; only with `VAD_MODE=ten`).** Sarvam decides by itself when the caller has stopped
   (`END_SPEECH`), which took ~600-700ms in live calls (`end_detect_ms`) --

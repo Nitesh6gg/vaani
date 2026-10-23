@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"log/slog"
 	"sync/atomic"
 	"time"
 
@@ -57,6 +58,7 @@ type STTGateConfig struct {
 //
 // One goroutine (ProcessFrame's) calls frame. sent may be read from any.
 type sttGate struct {
+	callID   string // for the log only
 	feed     func([]byte) error
 	now      func() time.Time
 	hangover time.Duration
@@ -75,10 +77,11 @@ type sttGate struct {
 
 // newSTTGate builds a gate that sends through feed. now is time.Now outside
 // tests.
-func newSTTGate(cfg STTGateConfig, feed func([]byte) error, now func() time.Time) *sttGate {
+func newSTTGate(callID string, cfg STTGateConfig, feed func([]byte) error, now func() time.Time) *sttGate {
 	frames := max(1, int(cfg.Preroll/gateFrameDur))
 
 	g := &sttGate{
+		callID:   callID,
 		feed:     feed,
 		now:      now,
 		hangover: cfg.Hangover,
@@ -97,9 +100,10 @@ func newSTTGate(cfg STTGateConfig, feed func([]byte) error, now func() time.Time
 // frame takes one 20ms frame and whether it counts as speech, and sends what
 // the STT should get: nothing, the frame, or the buffered pre-roll and the
 // frame. Errors are feed's (the frame or pre-roll frames it refused).
-func (g *sttGate) frame(pcm []byte, voiced bool) error {
+func (g *sttGate) frame(pcm []byte, why gateWhy, rms float64) error {
 	now := g.now()
 
+	voiced := why != gateQuiet
 	if voiced {
 		g.lastVoiced = now
 	}
@@ -114,6 +118,7 @@ func (g *sttGate) frame(pcm []byte, voiced bool) error {
 
 	if voiced {
 		g.open = true
+		g.logOpen(why, rms)
 
 		err := g.sendPreroll(now)
 		if e := g.send(pcm, now); err == nil {
@@ -130,6 +135,19 @@ func (g *sttGate) frame(pcm []byte, voiced bool) error {
 	}
 
 	return nil
+}
+
+// logOpen notes why the gate just opened and how much pre-roll goes out with
+// it, so a call's log shows what let audio through: the VAD, or the loud-frame
+// floor (with the level that tripped it, to tune STT_GATE_RMS_FLOOR by).
+func (g *sttGate) logOpen(why gateWhy, rms float64) {
+	args := []any{"call_id", g.callID, "component", "stt", "event", "stt.gate_open",
+		"reason", string(why), "preroll_ms", g.count * int(gateFrameDur/time.Millisecond)}
+	if why == gateRMS {
+		args = append(args, "rms", int(rms))
+	}
+
+	slog.Debug("stt gate open", args...)
 }
 
 // Sent is the audio handed to the STT so far, in seconds.
@@ -165,12 +183,28 @@ func (g *sttGate) sendPreroll(now time.Time) error {
 	return first
 }
 
-// voiced reports whether a frame counts as speech for the gate: the VAD heard
-// speech a moment ago, or the frame is loud enough on its own.
-func (c STTGateConfig) voiced(lastSpeech, now time.Time, pcm []byte) bool {
+// gateWhy is why a frame counts as speech for the gate: the VAD heard speech
+// a moment ago, or the frame is loud enough on its own, or neither.
+type gateWhy string
+
+const (
+	gateQuiet gateWhy = ""
+	gateVAD   gateWhy = "vad"
+	gateRMS   gateWhy = "rms"
+)
+
+// voiced says why a frame counts as speech, if it does -- the VAD wins when
+// both would -- and, for gateRMS, how loud the frame was.
+func (c STTGateConfig) voiced(lastSpeech, now time.Time, pcm []byte) (gateWhy, float64) {
 	if !lastSpeech.IsZero() && now.Sub(lastSpeech) < gateVoicedWindow {
-		return true
+		return gateVAD, 0
 	}
 
-	return c.RMSFloor > 0 && media.RMS(pcm) >= c.RMSFloor
+	if c.RMSFloor > 0 {
+		if level := media.RMS(pcm); level >= c.RMSFloor {
+			return gateRMS, level
+		}
+	}
+
+	return gateQuiet, 0
 }
