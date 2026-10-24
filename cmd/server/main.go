@@ -17,6 +17,7 @@ import (
 	_ "time/tzdata"
 
 	"github.com/CyCoreSystems/ari/v5"
+	"github.com/redis/go-redis/v9"
 
 	vaaniari "github.com/nitesh/vaani/internal/ari"
 	"github.com/nitesh/vaani/internal/callagent"
@@ -119,6 +120,15 @@ func run() error {
 
 	if cfg.OutboundTestCall != "" {
 		go runOutboundTestCall(ctx, cfg, store, mgr)
+	}
+
+	if cfg.CampaignsEnabled {
+		runner, err := newCampaignRunner(ctx, cfg, store, mgr)
+		if err != nil {
+			return err
+		}
+
+		go runner.Run(ctx)
 	}
 
 	select {
@@ -236,4 +246,35 @@ func runOutboundTestCall(ctx context.Context, cfg config.Config, store *dograh.S
 	if err := campaign.RunTestCall(ctx, store, mgr, tc, cfg.OutboundRingTimeout); err != nil {
 		slog.Error("outbound test call not placed", "event", "outbound.test_failed", "error", err)
 	}
+}
+
+// newCampaignRunner connects to Redis, where the organizations' rate and
+// concurrency counters live (Dograh's own, so limits hold across both
+// engines), and returns the runner that dials the campaigns Dograh's
+// MEDIA_ENGINE setting hands to Vaani.
+func newCampaignRunner(ctx context.Context, cfg config.Config, store *dograh.Store, mgr *vaaniari.Manager) (*campaign.Runner, error) {
+	if store == nil {
+		return nil, fmt.Errorf("CAMPAIGNS_ENABLED=1 needs the Dograh database (DOGRAH_DB_URL, APP_MODE=agent)")
+	}
+
+	opts, err := redis.ParseURL(cfg.RedisURL)
+	if err != nil {
+		return nil, fmt.Errorf("REDIS_URL: %w", err)
+	}
+
+	rdb := redis.NewClient(opts)
+
+	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	if err := rdb.Ping(pingCtx).Err(); err != nil {
+		return nil, fmt.Errorf("redis ping: %w", err)
+	}
+
+	slog.Info("campaign dialer enabled", "event", "campaign.enabled", "max_calls", cfg.OutboundMaxCalls,
+		"default_org_limit", cfg.OutboundDefaultOrgLimit, "poll_s", int(cfg.CampaignPoll.Seconds()))
+
+	return campaign.NewRunner(store, campaign.NewLimiter(rdb, cfg.OutboundMaxCalls), mgr, campaign.RunnerConfig{
+		Poll: cfg.CampaignPoll, DefaultOrgLimit: cfg.OutboundDefaultOrgLimit, RingTimeout: cfg.OutboundRingTimeout,
+	}), nil
 }

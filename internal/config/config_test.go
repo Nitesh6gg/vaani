@@ -383,3 +383,37 @@ func TestLoad_OutboundSettings(t *testing.T) {
 		assert.ErrorContains(t, err, "OUTBOUND_RING_TIMEOUT_SECONDS", bad)
 	}
 }
+
+func TestLoad_Campaigns(t *testing.T) {
+	restoreWD := chdir(t, t.TempDir())
+	defer restoreWD()
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.False(t, cfg.CampaignsEnabled, "off by default")
+	assert.Equal(t, 20, cfg.OutboundMaxCalls)
+	assert.Equal(t, 2, cfg.OutboundDefaultOrgLimit)
+	assert.Equal(t, 5*time.Second, cfg.CampaignPoll)
+
+	t.Setenv("CAMPAIGNS_ENABLED", "1")
+
+	_, err = Load()
+	assert.ErrorContains(t, err, "needs REDIS_URL and DOGRAH_DB_URL")
+
+	t.Setenv("REDIS_URL", "redis://:pw@localhost:6379/0")
+	t.Setenv("DOGRAH_DB_URL", "postgres://x@localhost/x")
+	t.Setenv("DOGRAH_WORKFLOW_ID", "19")
+
+	cfg, err = Load()
+	require.NoError(t, err)
+	assert.True(t, cfg.CampaignsEnabled)
+
+	for k, v := range map[string]string{"OUTBOUND_MAX_CALLS": "-1", "OUTBOUND_DEFAULT_ORG_CONCURRENCY": "0", "CAMPAIGN_POLL_SECONDS": "0"} {
+		t.Setenv(k, v)
+
+		_, err = Load()
+		assert.Error(t, err, k)
+
+		t.Setenv(k, map[string]string{"OUTBOUND_MAX_CALLS": "20", "OUTBOUND_DEFAULT_ORG_CONCURRENCY": "2", "CAMPAIGN_POLL_SECONDS": "5"}[k])
+	}
+}

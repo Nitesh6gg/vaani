@@ -41,8 +41,8 @@ func ParseTestCall(spec string) (TestCall, error) {
 	return TestCall{Number: number, OrgID: org, WorkflowID: wf}, nil
 }
 
-// Dialer places a call; *ari.Manager is one.
-type Dialer interface {
+// CallPlacer places a call; *ari.Manager is one.
+type CallPlacer interface {
 	Dial(ctx context.Context, req ari.DialRequest) (string, error)
 }
 
@@ -57,7 +57,7 @@ type runStore interface {
 // dial settings, a Dograh run created first, the agent on answer, and a call
 // that never connects completed in Dograh with its status. It returns once the
 // call is placed; the outcome is logged when it arrives.
-func RunTestCall(ctx context.Context, store runStore, d Dialer, tc TestCall, ring time.Duration) error {
+func RunTestCall(ctx context.Context, store runStore, d CallPlacer, tc TestCall, ring time.Duration) error {
 	settings, err := store.DialSettings(ctx, tc.OrgID)
 	if err != nil {
 		return err

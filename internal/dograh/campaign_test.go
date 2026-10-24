@@ -170,6 +170,8 @@ func campaignDB(t *testing.T) (*Store, *pgxpool.Pool) {
 			processed_at timestamptz, retry_count int NOT NULL DEFAULT 0,
 			parent_queued_run_id int REFERENCES queued_runs(id), scheduled_for timestamptz,
 			retry_reason text, UNIQUE (campaign_id, source_uuid, retry_count));
+		CREATE TABLE organizations (id int PRIMARY KEY, billing_mode varchar(10), billing_rate_per_min_inr numeric(10,4),
+			credit_limit_inr numeric(14,2), wallet_balance_inr numeric(14,2) NOT NULL DEFAULT 0);
 		CREATE TABLE workflows (id serial PRIMARY KEY, organization_id int, released_definition_id int);
 		CREATE TABLE workflow_definitions (id serial PRIMARY KEY, workflow_id int NOT NULL, is_current bool DEFAULT false);
 		CREATE TABLE workflow_runs (
@@ -488,4 +490,54 @@ func TestOutboundRun_Lifecycle(t *testing.T) {
 	assert.True(t, completed)
 	assert.JSONEq(t, `{"call_tags": ["retry", "not_connected", "telephony_busy"], "provider": "ari",
 		"call_disposition": "BUSY", "mapped_call_disposition": "B1"}`, gathered)
+}
+
+func TestCampaignState(t *testing.T) {
+	s, pool := campaignDB(t)
+	ctx := context.Background()
+
+	sqlExec(t, pool, `INSERT INTO campaigns (organization_id, state) VALUES (1, 'running')`)
+
+	running, err := s.CampaignRunning(ctx, 1)
+	require.NoError(t, err)
+	assert.True(t, running)
+
+	running, err = s.CampaignRunning(ctx, 99)
+	require.NoError(t, err)
+	assert.False(t, running, "no such campaign")
+
+	moved, err := s.SetCampaignState(ctx, 1, "paused", "completed")
+	require.NoError(t, err)
+	assert.False(t, moved, "it is not paused: a state changed meanwhile wins")
+
+	moved, err = s.SetCampaignState(ctx, 1, "running", "paused")
+	require.NoError(t, err)
+	assert.True(t, moved)
+
+	running, _ = s.CampaignRunning(ctx, 1)
+	assert.False(t, running)
+
+	require.NoError(t, s.AddFailedRow(ctx, 1))
+	require.NoError(t, s.AddFailedRow(ctx, 1))
+
+	var failed int
+	require.NoError(t, pool.QueryRow(ctx, `SELECT failed_rows FROM campaigns WHERE id = 1`).Scan(&failed))
+	assert.Equal(t, 2, failed)
+}
+
+func TestWalletBlocks(t *testing.T) {
+	s, pool := campaignDB(t)
+	ctx := context.Background()
+
+	sqlExec(t, pool, `INSERT INTO organizations (id, billing_mode, billing_rate_per_min_inr, credit_limit_inr, wallet_balance_inr) VALUES
+		(1, NULL, NULL, NULL, 0),            -- billing off
+		(2, 'prepaid', 1.5, NULL, 1.4),      -- less than a minute left
+		(3, 'prepaid', 1.5, NULL, 1.5),      -- exactly a minute
+		(4, 'postpaid', 1.5, 100, -100),     -- at the credit limit
+		(5, 'postpaid', 1.5, 100, -99.99),
+		(6, 'postpaid', 1.5, NULL, -5000)    -- no limit`)
+
+	for org, want := range map[int]bool{1: false, 2: true, 3: false, 4: true, 5: false, 6: false, 99: false} {
+		assert.Equal(t, want, s.WalletBlocks(ctx, org), "org %d", org)
+	}
 }

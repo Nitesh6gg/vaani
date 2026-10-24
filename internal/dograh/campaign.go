@@ -40,10 +40,10 @@ type RetryConfig struct {
 	OnVoicemail bool
 }
 
-// Retries says whether a call that ended for reason ("busy", "no_answer",
-// "voicemail") is tried again after attempts earlier tries.
-func (r RetryConfig) Retries(reason string, attempts int) bool {
-	if !r.Enabled || attempts >= r.MaxRetries {
+// Eligible says whether a call that ended for reason ("busy", "no_answer",
+// "voicemail") is one the campaign retries at all.
+func (r RetryConfig) Eligible(reason string) bool {
+	if !r.Enabled {
 		return false
 	}
 
@@ -57,6 +57,11 @@ func (r RetryConfig) Retries(reason string, attempts int) bool {
 	}
 
 	return false
+}
+
+// Retries says whether it is retried once more, after attempts earlier tries.
+func (r RetryConfig) Retries(reason string, attempts int) bool {
+	return r.Eligible(reason) && attempts < r.MaxRetries
 }
 
 // BreakerConfig is orchestrator_metadata.circuit_breaker.
@@ -419,4 +424,84 @@ func (s *Store) ScheduleRetry(ctx context.Context, run QueuedRun, reason string,
 	}
 
 	return nil
+}
+
+// CampaignRunning says whether campaign id is still in the 'running' state: a
+// Pause in Dograh's UI takes effect at the next call to be placed.
+func (s *Store) CampaignRunning(ctx context.Context, id int) (bool, error) {
+	var running bool
+
+	if err := s.pool.QueryRow(ctx, `SELECT state = 'running' FROM campaigns WHERE id = $1`, id).Scan(&running); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+
+		return false, fmt.Errorf("dograh: campaign %d state: %w", id, err)
+	}
+
+	return running, nil
+}
+
+// SetCampaignState moves campaign id from one state to another, only if it is
+// still in from (a Pause or Resume made meanwhile in Dograh's UI wins). It
+// says whether it moved.
+func (s *Store) SetCampaignState(ctx context.Context, id int, from, to string) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE campaigns SET state = $3::campaign_state WHERE id = $1 AND state = $2::campaign_state`, id, from, to)
+	if err != nil {
+		return false, fmt.Errorf("dograh: campaign %d %s -> %s: %w", id, from, to, err)
+	}
+
+	return tag.RowsAffected() == 1, nil
+}
+
+// AddFailedRow counts a contact that failed for good (retries used up).
+func (s *Store) AddFailedRow(ctx context.Context, campaignID int) error {
+	if _, err := s.pool.Exec(ctx, `UPDATE campaigns SET failed_rows = failed_rows + 1 WHERE id = $1`, campaignID); err != nil {
+		return fmt.Errorf("dograh: campaign %d failed_rows: %w", campaignID, err)
+	}
+
+	return nil
+}
+
+// WalletBlocks says whether the organization's wallet forbids new calls:
+// Dograh's wallet_blocks_calls / can_start_call. Billing off, or a lookup that
+// fails, never blocks.
+func (s *Store) WalletBlocks(ctx context.Context, orgID int) bool {
+	var (
+		mode                  *string
+		rate, balance, credit *float64
+	)
+
+	err := s.pool.QueryRow(ctx, `
+		SELECT billing_mode, billing_rate_per_min_inr::float8, wallet_balance_inr::float8, credit_limit_inr::float8
+		FROM organizations WHERE id = $1`, orgID).Scan(&mode, &rate, &balance, &credit)
+	if err != nil {
+		return false
+	}
+
+	return walletBlocks(mode, rate, balance, credit)
+}
+
+// walletBlocks is Dograh's can_start_call, inverted: prepaid needs at least a
+// minute of balance; postpaid needs to be above its credit limit, if it has one.
+func walletBlocks(mode *string, rate, balance, credit *float64) bool {
+	if mode == nil || *mode == "" || rate == nil || *rate == 0 {
+		return false
+	}
+
+	bal := 0.0
+	if balance != nil {
+		bal = *balance
+	}
+
+	if *mode == "prepaid" {
+		return bal < *rate
+	}
+
+	if credit == nil {
+		return false
+	}
+
+	return bal <= -*credit
 }

@@ -106,6 +106,25 @@ type Config struct {
 	// campaign dialer exists. Empty = off.
 	OutboundTestCall string
 
+	// CampaignsEnabled (CAMPAIGNS_ENABLED=1) makes Vaani dial the campaigns of
+	// organizations whose media engine is "vaani" (see internal/campaign). Off
+	// by default. It needs RedisURL (REDIS_URL), where the organization rate
+	// and concurrency counters live -- Dograh's own Redis, so limits hold
+	// across both engines -- and the Dograh database.
+	CampaignsEnabled bool
+	RedisURL         string
+	// OutboundMaxCalls (OUTBOUND_MAX_CALLS, default 20) caps the campaign
+	// calls this Vaani has up at once, whatever the organizations' limits
+	// allow; 0 = no cap of its own.
+	OutboundMaxCalls int
+	// OutboundDefaultOrgLimit (OUTBOUND_DEFAULT_ORG_CONCURRENCY, default 2, as
+	// Dograh's DEFAULT_ORG_CONCURRENCY_LIMIT) is the concurrent-call limit of
+	// an organization that has none set.
+	OutboundDefaultOrgLimit int
+	// CampaignPoll (CAMPAIGN_POLL_SECONDS, default 5) is how often Dograh's
+	// database is scanned for campaigns to dial.
+	CampaignPoll time.Duration
+
 	// DograhDBURL is the Postgres connection string of a self-hosted Dograh
 	// deployment (DOGRAH_DB_URL), and DograhWorkflowID the Dograh workflow
 	// (workflows.id) the agent runs (DOGRAH_WORKFLOW_ID): its prompts,
@@ -325,6 +344,32 @@ func Load() (Config, error) {
 
 	cfg.OutboundRingTimeout = time.Duration(ringSeconds) * time.Second
 	cfg.OutboundTestCall = os.Getenv("OUTBOUND_TEST_CALL")
+
+	cfg.CampaignsEnabled = getEnv("CAMPAIGNS_ENABLED", "0") == "1"
+	cfg.RedisURL = os.Getenv("REDIS_URL")
+
+	if cfg.OutboundMaxCalls, err = getEnvInt("OUTBOUND_MAX_CALLS", 20); err != nil {
+		return Config{}, err
+	}
+
+	if cfg.OutboundDefaultOrgLimit, err = getEnvInt("OUTBOUND_DEFAULT_ORG_CONCURRENCY", 2); err != nil {
+		return Config{}, err
+	}
+
+	pollSeconds, err := getEnvInt("CAMPAIGN_POLL_SECONDS", 5)
+	if err != nil {
+		return Config{}, err
+	}
+
+	if cfg.OutboundMaxCalls < 0 || cfg.OutboundDefaultOrgLimit < 1 || pollSeconds < 1 {
+		return Config{}, fmt.Errorf("config: OUTBOUND_MAX_CALLS must be >= 0, OUTBOUND_DEFAULT_ORG_CONCURRENCY and CAMPAIGN_POLL_SECONDS >= 1")
+	}
+
+	cfg.CampaignPoll = time.Duration(pollSeconds) * time.Second
+
+	if cfg.CampaignsEnabled && (cfg.RedisURL == "" || cfg.DograhDBURL == "") {
+		return Config{}, fmt.Errorf("config: CAMPAIGNS_ENABLED=1 needs REDIS_URL and DOGRAH_DB_URL")
+	}
 
 	if _, err := media.ParseEndianness(cfg.AudioL16Endianness); err != nil {
 		return Config{}, err
