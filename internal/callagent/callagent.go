@@ -76,6 +76,23 @@ type Call struct {
 	ID           string
 	CallerNumber string
 	CalledNumber string
+
+	// Set for an outbound campaign call, which has its own workflow and a
+	// Dograh run the dialer created before dialing; zero values are an inbound
+	// call (DOGRAH_WORKFLOW_ID, a run created here).
+	WorkflowID int
+	RunID      int64
+	// Variables are the contact's own template variables ({{name}}...).
+	Variables map[string]any
+}
+
+// workflowID is the Dograh workflow the call runs.
+func (b *Builder) workflowID(c Call) int {
+	if c.WorkflowID > 0 {
+		return c.WorkflowID
+	}
+
+	return b.cfg.DograhWorkflowID
 }
 
 // Hooks are what the agent can do to the call on the switch.
@@ -175,16 +192,21 @@ func (b *Builder) loadWorkflow(ctx context.Context, c Call) (*dograh.Workflow, e
 	qctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
-	wf, warnings, err := b.store.Workflow(qctx, b.cfg.DograhWorkflowID, map[string]any{
-		"caller_number": c.CallerNumber,
-		"called_number": c.CalledNumber,
-	})
+	vars := map[string]any{}
+	for k, v := range c.Variables {
+		vars[k] = v
+	}
+
+	vars["caller_number"] = c.CallerNumber
+	vars["called_number"] = c.CalledNumber
+
+	wf, warnings, err := b.store.Workflow(qctx, b.workflowID(c), vars)
 	if err != nil {
 		return nil, err
 	}
 
 	for _, w := range warnings {
-		slog.Warn("agent: workflow: "+w, "call_id", c.ID, "component", "dograh", "event", "workflow.warning", "workflow_id", b.cfg.DograhWorkflowID)
+		slog.Warn("agent: workflow: "+w, "call_id", c.ID, "component", "dograh", "event", "workflow.warning", "workflow_id", b.workflowID(c))
 	}
 
 	opening := "llm"
@@ -196,7 +218,7 @@ func (b *Builder) loadWorkflow(ctx context.Context, c Call) (*dograh.Workflow, e
 		opening = "greeting"
 	}
 
-	slog.Info("agent workflow loaded", "call_id", c.ID, "component", "dograh", "event", "workflow.loaded", "workflow_id", b.cfg.DograhWorkflowID,
+	slog.Info("agent workflow loaded", "call_id", c.ID, "component", "dograh", "event", "workflow.loaded", "workflow_id", b.workflowID(c),
 		"start_node", wf.Start.Name, "opening", opening, "start_tools", toolNames(wf.Start),
 		"start_allow_interrupt", wf.Start.AllowInterrupt,
 		"start_interrupt", agent.InterruptMode(b.cfg.BargeInEnabled, wf.Start),
@@ -252,7 +274,7 @@ func (b *Builder) newAgentHandler(ctx context.Context, c Call, hooks Hooks) medi
 	wf, err := b.loadWorkflow(ctx, c)
 	if err != nil {
 		slog.Error("agent: loading the dograh workflow failed; hanging up", "call_id", callID, "component", "dograh", "event", "workflow.load_failed",
-			"workflow_id", b.cfg.DograhWorkflowID, "error", err)
+			"workflow_id", b.workflowID(c), "error", err)
 
 		go hooks.Hangup()
 
@@ -322,10 +344,10 @@ func (b *Builder) newAgentHandler(ctx context.Context, c Call, hooks Hooks) medi
 			RMSFloor: b.cfg.STTGateRMSFloor,
 		},
 		PostCutSilence: b.cfg.PostCutSilence,
-		AckFilter:          b.cfg.BargeInAckFilter,
-		AckEndMargin:       b.cfg.AckEndMargin,
-		Sink:               sinks(callLog, hooks),
-		Log:                callLog,
+		AckFilter:      b.cfg.BargeInAckFilter,
+		AckEndMargin:   b.cfg.AckEndMargin,
+		Sink:           sinks(callLog, hooks),
+		Log:            callLog,
 	})
 
 	rec := media.NewMixRecorder(h)
@@ -353,10 +375,19 @@ func (b *Builder) recordRun(c Call, wf *dograh.Workflow, callLog *agent.CallLog,
 
 	// Not the call's context: the record is completed after the call ends.
 	// StartRun bounds (and retries) itself.
-	runID, err := b.store.StartRun(b.procCtx, wf, dograh.RunCall{
+	runID, err := c.RunID, error(nil)
+	if runID != 0 {
+		// An outbound call's run exists already (the dialer made it before
+		// dialing, so even an unanswered call is recorded): it starts now.
+		if err = b.store.MarkRunRunning(b.procCtx, runID); err != nil {
+			slog.Warn("dograh run: not marked running", "call_id", c.ID, "component", "dograh", "event", "run.running_failed", "error", err)
+		}
+
+		config.SetCallRunID(c.ID, runID)
+		slog.Info("dograh run started", "call_id", c.ID, "component", "dograh", "event", "run.created", "workflow_id", wf.ID, "direction", "outbound")
+	} else if runID, err = b.store.StartRun(b.procCtx, wf, dograh.RunCall{
 		CallID: c.ID, CallerNumber: c.CallerNumber, CalledNumber: c.CalledNumber,
-	})
-	if err != nil {
+	}); err != nil {
 		slog.Error("dograh run: not created; this call won't appear in Dograh", "call_id", c.ID,
 			"component", "dograh", "event", "run.create_failed", "error", err)
 	} else {

@@ -97,6 +97,15 @@ type Config struct {
 	// just round up to one tick.
 	MediaDeadTimeout time.Duration
 
+	// OutboundRingTimeout (OUTBOUND_RING_TIMEOUT_SECONDS, default 30 -- what
+	// Asterisk applies when none is given) is how long an outbound call may
+	// ring before it counts as unanswered.
+	OutboundRingTimeout time.Duration
+	// OutboundTestCall (OUTBOUND_TEST_CALL="<number>,<org id>,<workflow id>")
+	// dials that number once at startup, for trying outbound out before the
+	// campaign dialer exists. Empty = off.
+	OutboundTestCall string
+
 	// DograhDBURL is the Postgres connection string of a self-hosted Dograh
 	// deployment (DOGRAH_DB_URL), and DograhWorkflowID the Dograh workflow
 	// (workflows.id) the agent runs (DOGRAH_WORKFLOW_ID): its prompts,
@@ -304,6 +313,18 @@ func Load() (Config, error) {
 	}
 
 	cfg.MediaDeadTimeout = time.Duration(mediaDeadSeconds) * time.Second
+
+	ringSeconds, err := getEnvInt("OUTBOUND_RING_TIMEOUT_SECONDS", 30)
+	if err != nil {
+		return Config{}, err
+	}
+
+	if ringSeconds < 5 || ringSeconds > 300 {
+		return Config{}, fmt.Errorf("config: OUTBOUND_RING_TIMEOUT_SECONDS must be 5-300, got %d", ringSeconds)
+	}
+
+	cfg.OutboundRingTimeout = time.Duration(ringSeconds) * time.Second
+	cfg.OutboundTestCall = os.Getenv("OUTBOUND_TEST_CALL")
 
 	if _, err := media.ParseEndianness(cfg.AudioL16Endianness); err != nil {
 		return Config{}, err

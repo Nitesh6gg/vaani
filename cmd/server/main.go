@@ -20,6 +20,7 @@ import (
 
 	vaaniari "github.com/nitesh/vaani/internal/ari"
 	"github.com/nitesh/vaani/internal/callagent"
+	"github.com/nitesh/vaani/internal/campaign"
 	"github.com/nitesh/vaani/internal/config"
 	"github.com/nitesh/vaani/internal/dograh"
 	"github.com/nitesh/vaani/internal/freeswitch"
@@ -116,6 +117,10 @@ func run() error {
 		mgr.Run(ctx) // blocks until ctx is cancelled (SIGTERM/SIGINT), then drains calls
 	}()
 
+	if cfg.OutboundTestCall != "" {
+		go runOutboundTestCall(ctx, cfg, store, mgr)
+	}
+
 	select {
 	case <-runDone:
 		if ctx.Err() == nil {
@@ -206,4 +211,29 @@ func openDograh(ctx context.Context, cfg config.Config) (*dograh.Store, *dograh.
 	}
 
 	return store, storage, nil
+}
+
+// runOutboundTestCall places the one call OUTBOUND_TEST_CALL asks for, once the
+// manager is listening for its events.
+func runOutboundTestCall(ctx context.Context, cfg config.Config, store *dograh.Store, mgr *vaaniari.Manager) {
+	tc, err := campaign.ParseTestCall(cfg.OutboundTestCall)
+	if err != nil {
+		slog.Error("outbound test call not placed", "event", "outbound.test_failed", "error", err)
+		return
+	}
+
+	if store == nil {
+		slog.Error("outbound test call not placed: no dograh database (DOGRAH_DB_URL)", "event", "outbound.test_failed")
+		return
+	}
+
+	select {
+	case <-time.After(2 * time.Second): // Run subscribes to the ARI events first
+	case <-ctx.Done():
+		return
+	}
+
+	if err := campaign.RunTestCall(ctx, store, mgr, tc, cfg.OutboundRingTimeout); err != nil {
+		slog.Error("outbound test call not placed", "event", "outbound.test_failed", "error", err)
+	}
 }

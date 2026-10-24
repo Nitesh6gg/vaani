@@ -358,3 +358,28 @@ func TestLoad_Telephony(t *testing.T) {
 		})
 	}
 }
+
+func TestLoad_OutboundSettings(t *testing.T) {
+	restoreWD := chdir(t, t.TempDir())
+	defer restoreWD()
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, 30*time.Second, cfg.OutboundRingTimeout, "Asterisk's own default")
+	assert.Empty(t, cfg.OutboundTestCall)
+
+	t.Setenv("OUTBOUND_RING_TIMEOUT_SECONDS", "45")
+	t.Setenv("OUTBOUND_TEST_CALL", "9876543210,1,19")
+
+	cfg, err = Load()
+	require.NoError(t, err)
+	assert.Equal(t, 45*time.Second, cfg.OutboundRingTimeout)
+	assert.Equal(t, "9876543210,1,19", cfg.OutboundTestCall)
+
+	for _, bad := range []string{"4", "301", "0", "-1"} {
+		t.Setenv("OUTBOUND_RING_TIMEOUT_SECONDS", bad)
+
+		_, err = Load()
+		assert.ErrorContains(t, err, "OUTBOUND_RING_TIMEOUT_SECONDS", bad)
+	}
+}

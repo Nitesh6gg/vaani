@@ -169,7 +169,14 @@ func campaignDB(t *testing.T) (*Store, *pgxpool.Pool) {
 			state queued_run_state NOT NULL DEFAULT 'queued', created_at timestamptz DEFAULT now(),
 			processed_at timestamptz, retry_count int NOT NULL DEFAULT 0,
 			parent_queued_run_id int REFERENCES queued_runs(id), scheduled_for timestamptz,
-			retry_reason text, UNIQUE (campaign_id, source_uuid, retry_count))`)
+			retry_reason text, UNIQUE (campaign_id, source_uuid, retry_count));
+		CREATE TABLE workflows (id serial PRIMARY KEY, organization_id int, released_definition_id int);
+		CREATE TABLE workflow_definitions (id serial PRIMARY KEY, workflow_id int NOT NULL, is_current bool DEFAULT false);
+		CREATE TABLE workflow_runs (
+			id serial PRIMARY KEY, name text, workflow_id int, definition_id int, mode text, call_type text,
+			state text, is_completed bool, usage_info json, cost_info json, initial_context json,
+			gathered_context json, logs json, annotations json, created_at timestamptz,
+			campaign_id int, queued_run_id int)`)
 	require.NoError(t, err)
 
 	return &Store{pool: pool}, pool
@@ -369,4 +376,116 @@ func TestScheduleRetry(t *testing.T) {
 	assert.Equal(t, true, got[0].Variables["is_retry"])
 	assert.EqualValues(t, 1, got[0].Variables["retry_attempt"])
 	assert.Equal(t, "+911234567890", got[0].Variables["phone_number"])
+}
+
+func TestDialSettings_EndpointAndCallerID(t *testing.T) {
+	d := DialSettings{Technology: "PJSIP", Trunk: "voice_agent_241", StripPrefix: "+91",
+		FromNumbers: []string{"7317185732", "7000000000"}, WorkflowCLI: map[int]string{19: "7317185799"}}
+
+	for number, want := range map[string]string{
+		"+919876543210":    "PJSIP/9876543210@voice_agent_241",
+		"9876543210":       "PJSIP/9876543210@voice_agent_241",
+		"PJSIP/100@pbx":    "PJSIP/100@pbx",
+		"SIP/200":          "SIP/200",
+		"+91+919876543210": "PJSIP/+919876543210@voice_agent_241",
+	} {
+		assert.Equal(t, want, d.Endpoint(number), number)
+	}
+
+	assert.Equal(t, "SIP/12345", DialSettings{Technology: "SIP"}.Endpoint("12345"), "no trunk")
+	assert.Equal(t, "PJSIP/12345", DialSettings{}.Endpoint("12345"), "technology defaults to PJSIP")
+
+	assert.Equal(t, "7317185799", d.CallerID(19), "the number mapped to the workflow")
+	assert.Equal(t, "7317185732", d.CallerID(20), "else the first from-number")
+	assert.Empty(t, DialSettings{}.CallerID(19))
+}
+
+func TestStatusForCause(t *testing.T) {
+	for cause, want := range map[int]string{
+		17: StatusBusy, 19: StatusNoAnswer, 21: StatusRejected,
+		16: StatusFailed, 18: StatusFailed, 34: StatusFailed, 0: StatusFailed,
+	} {
+		assert.Equal(t, want, StatusForCause(cause), "cause %d", cause)
+	}
+}
+
+func TestNotConnectedDisposition(t *testing.T) {
+	for status, want := range map[string]string{
+		"busy": "BUSY", "no-answer": "NO_ANSWER", "rejected": "REJECTED", "failed": "FAILED",
+		"error": "FAILED", "canceled": "CANCELED", "some-new-one": "SOME_NEW_ONE",
+	} {
+		assert.Equal(t, want, notConnectedDisposition(status), status)
+	}
+}
+
+func TestOutboundRun_Lifecycle(t *testing.T) {
+	s, pool := campaignDB(t)
+	ctx := context.Background()
+
+	sqlExec(t, pool, `
+		INSERT INTO workflows (id, organization_id, released_definition_id) VALUES (5, 1, 77);
+		INSERT INTO workflow_definitions (workflow_id, is_current) VALUES (5, true);
+		INSERT INTO campaigns (organization_id, workflow_id, state) VALUES (1, 5, 'running');
+		INSERT INTO queued_runs (campaign_id, source_uuid) VALUES (1, 'row1');
+		INSERT INTO organization_configurations (organization_id, key, value) VALUES
+			(1, 'DISPOSITION_CODE_MAPPING', '{"BUSY": "B1"}'),
+			(1, 'TELEPHONY_CONFIGURATION', '{"provider": "ari", "ari_endpoint": "http://x", "app_password": "secret",
+				"outbound_trunk": "trunkA", "strip_number_prefix": "0", "from_numbers": "7317185732",
+				"number_workflow_map": {"7317185799": "5"}}')`)
+
+	ds, err := s.DialSettings(ctx, 1)
+	require.NoError(t, err)
+	assert.Equal(t, DialSettings{Provider: "ari", Technology: "PJSIP", Trunk: "trunkA", StripPrefix: "0",
+		FromNumbers: []string{"7317185732"}, WorkflowCLI: map[int]string{5: "7317185799"}}, ds)
+
+	_, err = s.DialSettings(ctx, 2)
+	assert.Error(t, err, "no telephony configuration")
+
+	camp := Campaign{ID: 1, OrganizationID: 1, WorkflowID: 5}
+	q := QueuedRun{ID: 1, CampaignID: 1, SourceUUID: "row1", Variables: map[string]any{"name": "Asha"}}
+
+	id, err := s.CreateOutboundRun(ctx, camp, q, "9876543210", "7317185799")
+	require.NoError(t, err)
+
+	var (
+		name, mode, callType, state string
+		def, campaignID, queuedID   int
+		completed                   bool
+		initial                     string
+	)
+
+	row := func() {
+		require.NoError(t, pool.QueryRow(ctx, `SELECT name, mode, call_type, state, definition_id, campaign_id,
+			queued_run_id, is_completed, initial_context::text FROM workflow_runs WHERE id = $1`, id).
+			Scan(&name, &mode, &callType, &state, &def, &campaignID, &queuedID, &completed, &initial))
+	}
+	row()
+
+	assert.Equal(t, "WR-CAMPAIGN-1-1", name)
+	assert.Equal(t, []string{"ari", "outbound", "initialized"}, []string{mode, callType, state})
+	assert.Equal(t, 77, def, "the published definition")
+	assert.Equal(t, [3]int{1, 1, 0}, [3]int{campaignID, queuedID, 0})
+	assert.False(t, completed)
+	assert.JSONEq(t, `{"name": "Asha", "campaign_id": 1, "provider": "ari", "source_uuid": "row1",
+		"caller_number": "7317185799", "called_number": "9876543210"}`, initial)
+
+	_, err = s.CreateOutboundRun(ctx, Campaign{ID: 1, WorkflowID: 99}, q, "1", "2")
+	assert.Error(t, err, "unknown workflow")
+
+	require.NoError(t, s.MarkRunRunning(ctx, id))
+	row()
+	assert.Equal(t, "running", state)
+
+	// A call nobody answered: completed, tagged, disposition mapped by the org.
+	sqlExec(t, pool, `UPDATE workflow_runs SET gathered_context = '{"call_tags": ["retry"], "provider": "ari"}' WHERE id = $1`, id)
+	require.NoError(t, s.MarkNotConnected(ctx, id, 1, StatusBusy))
+
+	var gathered string
+	require.NoError(t, pool.QueryRow(ctx, `SELECT gathered_context::text, state, is_completed FROM workflow_runs WHERE id = $1`, id).
+		Scan(&gathered, &state, &completed))
+
+	assert.Equal(t, "completed", state)
+	assert.True(t, completed)
+	assert.JSONEq(t, `{"call_tags": ["retry", "not_connected", "telephony_busy"], "provider": "ari",
+		"call_disposition": "BUSY", "mapped_call_disposition": "B1"}`, gathered)
 }

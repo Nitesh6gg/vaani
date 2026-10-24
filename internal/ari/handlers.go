@@ -40,6 +40,9 @@ type call struct {
 	udpConn  *net.UDPConn
 	listener net.Listener
 
+	// out is set for a call Vaani dialed (see outbound.go).
+	out *outboundCall
+
 	bridge *ari.BridgeHandle
 	cm     *media.CallMedia            // set once the RTP media plane starts
 	asm    *media.AudioSocketCallMedia // set once the AudioSocket media plane starts
@@ -114,6 +117,7 @@ type Manager struct {
 	pending   map[string]*call            // keyed by the externalMedia channel ID, awaiting its StasisStart
 	active    map[string]*call            // keyed by callerID and externalID once bridged (plus transferChannel after a transfer)
 	transfers map[string]*pendingTransfer // keyed by the ringing transfer destination's channel ID
+	outbound  map[string]*outboundCall    // calls Vaani dialed, by channel ID, from dialing until over
 }
 
 // NewManager creates a call Manager bound to cl. store and storage may be nil.
@@ -126,6 +130,7 @@ func NewManager(cl ari.Client, cfg config.Config, ports *media.PortAllocator, st
 		pending:   make(map[string]*call),
 		active:    make(map[string]*call),
 		transfers: make(map[string]*pendingTransfer),
+		outbound:  make(map[string]*outboundCall),
 	}
 
 	return m
@@ -175,6 +180,7 @@ func (m *Manager) Run(ctx context.Context) {
 				slog.Info("channel destroyed", "call_id", m.callIDFor(e.Channel.ID), "channel_id", e.Channel.ID,
 					"cause", e.Cause, "cause_txt", e.CauseTxt, "event", "channel.destroyed")
 				m.onTransferLegDestroyed(e)
+				m.onOutboundDestroyed(e)
 			}
 		}
 	}
@@ -246,6 +252,12 @@ func (m *Manager) onStasisStart(ctx context.Context, e *ari.StasisStart) {
 		return
 	}
 
+	// A call we dialed has been answered.
+	if len(e.Args) > 0 && e.Args[0] == outboundAppArg {
+		m.onOutboundAnswered(ctx, e)
+		return
+	}
+
 	m.mu.Lock()
 	pc, found := m.pending[id]
 	// pending is keyed by both IDs (so a hangup during setup can find the call by
@@ -273,19 +285,25 @@ func (m *Manager) startCall(ctx context.Context, e *ari.StasisStart) {
 	id := e.Channel.ID
 	channel := m.cl.Channel().Get(e.Key(ari.ChannelKey, id))
 
-	if err := channel.Answer(); err != nil {
-		slog.Error("failed to answer channel", "call_id", id, "event", "call.setup_failed", "step", "answer", "error", err)
-		// A channel we failed to answer is still live in Stasis; leaving it
-		// without hanging it up would strand it in the dialplan.
-		hangupChannel(m.cl, id, id)
+	// A call we dialed is already answered (it only enters Stasis on answer).
+	out := m.outboundFor(id)
 
-		return
+	if out == nil {
+		if err := channel.Answer(); err != nil {
+			slog.Error("failed to answer channel", "call_id", id, "event", "call.setup_failed", "step", "answer", "error", err)
+			// A channel we failed to answer is still live in Stasis; leaving it
+			// without hanging it up would strand it in the dialplan.
+			hangupChannel(m.cl, id, id)
+
+			return
+		}
 	}
 
 	port, err := m.ports.Alloc()
 	if err != nil {
 		slog.Error("failed to allocate media port", "call_id", id, "event", "call.setup_failed", "step", "port", "error", err)
 		_ = channel.Hangup()
+		m.outboundSetupFailed(id)
 
 		return
 	}
@@ -322,6 +340,7 @@ func (m *Manager) startCall(ctx context.Context, e *ari.StasisStart) {
 		m.ports.Free(port)
 		metrics.MediaPortsInUse.Set(float64(m.ports.InUse()))
 		_ = channel.Hangup()
+		m.outboundSetupFailed(id)
 
 		return
 	}
@@ -330,13 +349,18 @@ func (m *Manager) startCall(ctx context.Context, e *ari.StasisStart) {
 	info := session.Info{
 		CallerNumber: callerNumber(e.Channel),
 		CalledNumber: calledNumber(e.Channel),
-		// Every channel that reaches this Stasis app got here by someone dialing
-		// in -- there's no outbound-origination code path yet, so this is a
-		// constant rather than derived from channel/endpoint naming that would
-		// vary per deployment's trunk conventions.
+		// Either someone dialed in, or Vaani dialed out (Manager.Dial): a
+		// constant for each, not derived from channel/endpoint naming that
+		// would vary per deployment's trunk conventions.
 		Direction: "inbound",
 	}
-	c := &call{Call: session.New(id, externalID, port, info, ctx), udpConn: udpConn, listener: listener}
+
+	if out != nil {
+		// The caller ID we showed, and the number we dialed.
+		info.CallerNumber, info.CalledNumber, info.Direction = out.req.CallerID, out.req.Called, "outbound"
+	}
+
+	c := &call{Call: session.New(id, externalID, port, info, ctx), udpConn: udpConn, listener: listener, out: out}
 
 	// Every log line carrying call_id=id is now stamped with this call's
 	// W3C trace_id by the logging handler (see internal/config/logging.go);
@@ -396,6 +420,7 @@ func (m *Manager) startCall(ctx context.Context, e *ari.StasisStart) {
 		m.ports.Free(port)
 		metrics.MediaPortsInUse.Set(float64(m.ports.InUse()))
 		_ = channel.Hangup()
+		m.outboundSetupFailed(id)
 
 		return
 	}
@@ -477,9 +502,17 @@ func (m *Manager) completeBridge(c *call) {
 // connections all stop when that's cancelled -- at hangup, or when a
 // transfer hands the caller over -- so there is nothing further to close here.
 func (m *Manager) mediaHandler(c *call) media.Handler {
-	return m.agents.Handler(c.mediaCtx, callagent.Call{
-		ID: c.ID, CallerNumber: c.Info.CallerNumber, CalledNumber: c.Info.CalledNumber,
-	}, callagent.Hooks{
+	ac := callagent.Call{ID: c.ID, CallerNumber: c.Info.CallerNumber, CalledNumber: c.Info.CalledNumber}
+
+	if c.out != nil {
+		ac.WorkflowID, ac.RunID, ac.Variables = c.out.req.WorkflowID, c.out.req.RunID, c.out.req.Variables
+
+		m.mu.Lock()
+		c.out.agentStarted = true // from here the agent's record completes the run
+		m.mu.Unlock()
+	}
+
+	return m.agents.Handler(c.mediaCtx, ac, callagent.Hooks{
 		// Hanging up the caller's channel fires StasisEnd, which runs the
 		// normal teardown (media plane, bridge, externalMedia channel).
 		Hangup: func() { hangupChannel(m.cl, c.ID, c.ID) },
@@ -632,6 +665,8 @@ func (m *Manager) abort(c *call) {
 
 		hangupChannel(m.cl, c.ID, c.ID)
 		hangupChannel(m.cl, c.ID, c.ExternalID)
+
+		m.finishOutbound(c)
 	})
 }
 
@@ -758,6 +793,8 @@ func (m *Manager) teardown(c *call) {
 			"event", "call.teardown")
 
 		config.UnregisterCallTrace(c.ID)
+
+		m.finishOutbound(c)
 	})
 }
 
@@ -783,6 +820,8 @@ func nearSilentRMS(cm *media.CallMedia, asm *media.AudioSocketCallMedia) (avgRMS
 // surviving call is a potential zombie: a billable channel and a leaked media
 // port). Teardown's once-guard makes this safe for calls already mid-teardown.
 func (m *Manager) teardownAll() {
+	m.hangupRingingOutbound()
+
 	m.mu.Lock()
 	seen := make(map[*call]struct{})
 
