@@ -74,6 +74,9 @@ type CallLog struct {
 	// What the call used, for Dograh's usage_info and its cost (see LLMUsage).
 	llmUsage map[string]llm.Usage
 	ttsChars int
+
+	sttSeconds float64
+	sttGated   bool
 }
 
 // CallSummary is everything a CallLog recorded.
@@ -104,6 +107,11 @@ type CallSummary struct {
 	// <model>"); TTSChars the characters sent to TTS.
 	LLMUsage map[string]llm.Usage
 	TTSChars int
+	// STTAudioSeconds is the caller audio sent to the STT (what Sarvam bills);
+	// STTGated that it was only the speech (STT_SPEECH_ONLY) rather than every
+	// frame of the call. Set by STTAudio.
+	STTAudioSeconds float64
+	STTGated        bool
 }
 
 // Sink: a CallLog counts what the handler reports, for the call's summary.
@@ -165,6 +173,12 @@ func (l *CallLog) LLMUsage(key string, u llm.Usage) {
 
 // TTSChars adds n characters sent to TTS (Dograh bills TTS per character).
 func (l *CallLog) TTSChars(n int) { l.count(func() { l.ttsChars += n }) }
+
+// STTAudio records the caller audio sent to the STT: seconds of it, and
+// whether it was only the speech (see CallSummary.STTAudioSeconds).
+func (l *CallLog) STTAudio(seconds float64, gated bool) {
+	l.count(func() { l.sttSeconds, l.sttGated = seconds, gated })
+}
 
 func (l *CallLog) count(f func()) {
 	if l == nil {
@@ -413,6 +427,8 @@ func (l *CallLog) Summary() CallSummary {
 		ReplyLatenciesMS:   append([]int64(nil), l.replyLatencies...),
 		LLMUsage:           maps.Clone(l.llmUsage),
 		TTSChars:           l.ttsChars,
+		STTAudioSeconds:    l.sttSeconds,
+		STTGated:           l.sttGated,
 	}
 
 	if l.errors != nil {

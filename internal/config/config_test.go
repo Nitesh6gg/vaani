@@ -107,6 +107,51 @@ func TestLoad_BargeIn_Defaults(t *testing.T) {
 	assert.Equal(t, 300*time.Millisecond, cfg.PostCutSilence)
 }
 
+func TestLoad_STTSpeechOnly(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		env     map[string]string
+		wantErr string // "" = loads fine
+	}{
+		{"off by default", nil, ""},
+		{"on with TEN VAD", map[string]string{"STT_SPEECH_ONLY": "1", "VAD_MODE": "ten"}, ""},
+		{"needs TEN VAD", map[string]string{"STT_SPEECH_ONLY": "1"}, "needs VAD_MODE=ten"},
+		{"hangover must outlast the flush wait", map[string]string{"STT_SPEECH_ONLY": "1", "VAD_MODE": "ten", "STT_HANGOVER_MS": "400"}, "must exceed STT_FLUSH_AFTER_MS"},
+		{"hangover free when flush is off", map[string]string{"STT_SPEECH_ONLY": "1", "VAD_MODE": "ten", "STT_FLUSH_AFTER_MS": "0", "STT_HANGOVER_MS": "100"}, ""},
+		{"negative pre-roll", map[string]string{"STT_PREROLL_MS": "-1"}, "STT_PREROLL_MS"},
+		{"negative RMS floor", map[string]string{"STT_GATE_RMS_FLOOR": "-1"}, "STT_GATE_RMS_FLOOR"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			restoreWD := chdir(t, t.TempDir())
+			defer restoreWD()
+
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+
+			cfg, err := Load()
+			if tc.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.wantErr)
+
+				return
+			}
+
+			require.NoError(t, err)
+			assert.Equal(t, tc.env["STT_SPEECH_ONLY"] == "1", cfg.STTSpeechOnly)
+		})
+	}
+
+	restoreWD := chdir(t, t.TempDir())
+	defer restoreWD()
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, time.Second, cfg.STTPreroll)
+	assert.Equal(t, 700*time.Millisecond, cfg.STTHangover)
+	assert.Equal(t, 400.0, cfg.STTGateRMSFloor)
+}
+
 func TestLoad_BargeIn_ReadsFromEnv(t *testing.T) {
 	restoreWD := chdir(t, t.TempDir())
 	defer restoreWD()

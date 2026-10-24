@@ -15,14 +15,21 @@ import (
 // buildUsageInfo is the call's usage_info in Dograh's shape: LLM tokens by
 // key (the call's own plus extra, e.g. QA's), TTS characters, and STT billed
 // as the whole call, as Dograh bills streaming STT (pipeline_metrics_
-// aggregator.py's set_stt_service).
+// aggregator.py's set_stt_service) -- unless only the speech was sent to the
+// STT (STT_SPEECH_ONLY): then the seconds actually sent, rounded up as Sarvam
+// bills them, so the cost shown is the cost incurred.
 func buildUsageInfo(wf *Workflow, sum agent.CallSummary, extra map[string]llm.Usage, duration time.Duration) usageInfo {
 	seconds := int(math.Round(duration.Seconds()))
+
+	sttSeconds := seconds
+	if sum.STTGated {
+		sttSeconds = int(math.Ceil(sum.STTAudioSeconds))
+	}
 
 	u := usageInfo{
 		LLM:                 map[string]tokenUsage{},
 		TTS:                 map[string]int{},
-		STT:                 map[string]float64{usageKeySTT + wf.Services.STT.Model: float64(seconds)},
+		STT:                 map[string]float64{usageKeySTT + wf.Services.STT.Model: float64(sttSeconds)},
 		CallDurationSeconds: seconds,
 	}
 

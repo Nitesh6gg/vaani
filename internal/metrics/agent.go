@@ -30,6 +30,11 @@ var (
 		Help: "Calls whose recording hit its size cap (100MB, ~54 minutes) and is missing the rest of the call.",
 	})
 
+	STTAudioSecondsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "vaani_stt_audio_seconds_total",
+		Help: "Seconds of caller audio sent to the STT -- what Sarvam bills. The call's length, or with STT_SPEECH_ONLY only the speech (plus pre-roll, hangover and keepalives). Added when a call ends.",
+	})
+
 	AgentTurnsTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "vaani_agent_turns_total",
 		Help: "Total agent turns started: one per accepted caller transcript, plus the LLM opening a call and caller-silence prompts.",

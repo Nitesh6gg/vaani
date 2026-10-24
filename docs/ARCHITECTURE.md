@@ -114,7 +114,9 @@ finished playing or been cut, so the two read in conversation order. If the
 call ends during a reply (usually the caller hanging up), what they heard of
 it is logged with `cut=true` as the call closes. Each call ends with one
 `event=call.summary` line: duration, turns, interruptions, reply latency
-p50/p95, errors by stage, disposition and nodes. Every line about a call
+p50/p95, errors by stage, disposition, nodes and `stt_audio_s` (the caller
+audio Sarvam was sent and bills; the call's length unless `STT_SPEECH_ONLY`).
+Every line about a call
 carries `call_id`, `trace_id` and (once Dograh's run exists) `run_id`.
 `LOG_PII=0` (the default outside development) masks phone numbers and
 replaces text with its length.

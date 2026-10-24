@@ -106,3 +106,20 @@ func TestBuildUsageInfo(t *testing.T) {
 	b, _ = json.Marshal(buildUsageInfo(wf, agent.CallSummary{}, nil, time.Second))
 	assert.JSONEq(t, `{"llm": {}, "tts": {}, "stt": {"SarvamSTTService|||saaras:v4": 1}, "call_duration_seconds": 1}`, string(b))
 }
+
+// With STT_SPEECH_ONLY the STT is billed what was sent (rounded up, as Sarvam
+// bills), not the call; without it the call's length, as Dograh bills it --
+// whatever the audio counter says.
+func TestBuildUsageInfo_STTBilledByAudioSent(t *testing.T) {
+	wf := &Workflow{Services: Services{STT: STTConfig{Model: "saaras:v4"}}}
+	key := usageKeySTT + "saaras:v4"
+
+	gated := buildUsageInfo(wf, agent.CallSummary{STTAudioSeconds: 20.2, STTGated: true}, nil, 71*time.Second)
+	assert.Equal(t, 21.0, gated.STT[key], "20.2s sent, rounded up")
+	assert.Equal(t, 71, gated.CallDurationSeconds, "the call's own length is unchanged")
+
+	continuous := buildUsageInfo(wf, agent.CallSummary{STTAudioSeconds: 70.6}, nil, 71*time.Second)
+	assert.Equal(t, 71.0, continuous.STT[key], "not gated: the whole call")
+
+	assert.Less(t, calculateCost(gated).STT, calculateCost(continuous).STT)
+}

@@ -172,6 +172,11 @@ type Config struct {
 	// same on its Silero VAD's 0.2s stop. Needs a VAD that tracks its last
 	// speech (TEN VAD) and an STT opened with stt.Config.FlushSignal. 0 = off.
 	STTFlushAfter time.Duration
+	// STTGate, when Enabled (STT_SPEECH_ONLY), sends the STT only the caller's
+	// speech (plus pre-roll and hangover) instead of every frame: Sarvam bills
+	// the audio it is sent. Needs a VAD that tracks its last speech (TEN VAD);
+	// without one the frames all go out as before. See sttGate.
+	STTGate STTGateConfig
 	// PostCutSilence: transcripts arriving this soon after an interruption
 	// pauses the reply are ignored -- they were already on their way, not
 	// what the caller is saying now. Junk later on is caught by content
@@ -329,6 +334,10 @@ type Handler struct {
 	// speech (TEN VAD); then it also runs while listening, so the caller's
 	// last sound before each STT end-of-speech is known. Nil otherwise.
 	clock speechClock
+	// gate is non-nil when only speech goes to the STT (Config.STTGate);
+	// sttBytes counts what feedSTT sent when it isn't (the gate counts its own).
+	gate     *sttGate
+	sttBytes atomic.Int64
 
 	// node is the workflow node the conversation is at. Read by run() when a
 	// turn starts; moved by runLLMTurn's goroutine the moment the LLM takes
@@ -529,6 +538,15 @@ func NewHandler(ctx context.Context, callID string, cfg Config) *Handler {
 	cfg.Log.NodeEntered(cfg.Start)
 	h.clock, _ = cfg.BargeIn.(speechClock)
 
+	if cfg.STTGate.Enabled {
+		if h.clock != nil {
+			h.gate = newSTTGate(callID, cfg.STTGate, cfg.STT.Feed, time.Now)
+		} else {
+			slog.Warn("speech-only STT needs a VAD that tracks speech (VAD_MODE=ten); sending every frame",
+				"call_id", callID, "component", "stt", "event", "stt.gate_unavailable")
+		}
+	}
+
 	go h.readSTT()
 	go h.run()
 
@@ -581,7 +599,7 @@ func (h *Handler) ProcessFrame(_ context.Context, _ string, pcm []byte) [][]byte
 	// (handleFinalTranscript). Feeding only while listening clipped the start
 	// of answers given over the agent: observed live, "महंगाई" transcribed as
 	// "हाँ जी" and "नहीं" with its first syllable missing.
-	if err := h.cfg.STT.Feed(pcm); err != nil {
+	if err := h.feedSTT(pcm); err != nil {
 		h.cfg.Sink.Error("stt")
 	}
 
@@ -607,6 +625,31 @@ func (h *Handler) ProcessFrame(_ context.Context, _ string, pcm []byte) [][]byte
 	default:
 		return nil
 	}
+}
+
+// STTAudio is the seconds of caller audio handed to the STT so far -- what
+// Sarvam bills -- and whether only speech was sent (Config.STTGate), as opposed
+// to every frame of the call.
+func (h *Handler) STTAudio() (seconds float64, gated bool) {
+	if h.gate != nil {
+		return h.gate.Sent(), true
+	}
+
+	return float64(h.sttBytes.Load()) / gateBytesPerSecond, false
+}
+
+// feedSTT hands the caller's frame to the STT: all of them, or with
+// Config.STTGate only the speech (the gate keeps the audio before it).
+func (h *Handler) feedSTT(pcm []byte) error {
+	if h.gate == nil {
+		h.sttBytes.Add(int64(len(pcm)))
+
+		return h.cfg.STT.Feed(pcm)
+	}
+
+	why, level := h.cfg.STTGate.voiced(h.clock.LastSpeechAt(), time.Now(), pcm)
+
+	return h.gate.frame(pcm, why, level)
 }
 
 func (h *Handler) processSpeakingFrame(pcm []byte) [][]byte {
