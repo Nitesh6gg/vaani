@@ -37,6 +37,10 @@ Real-time voice agent: Asterisk ARI (telephony) + Go media plane + Sarvam STT/TT
   transfer yet; `docs/FREESWITCH.md`): mod_earshot WebSocket per call
   (`internal/media/earshot.go`), control over the Event Socket;
   `internal/esl/` — the ESL client: ordered events, one command at a time
+- `internal/campaign/` — outbound campaigns for orgs whose Dograh media engine is
+  `vaani` (`docs/OUTBOUND.md`): `runner.go` the dialer, `limiter.go` Redis counters
+  (Dograh's keys and Lua scripts), `testcall.go`; `internal/ari/outbound.go` is
+  `Manager.Dial` (ARI only); `internal/dograh/campaign.go`/`outbound.go` its tables
 - `internal/session/` — per-call state machine, barge-in orchestration
 - `assets/` — embedded transfer sounds (hold ring, beep)
 
@@ -115,6 +119,7 @@ Real-time voice agent: Asterisk ARI (telephony) + Go media plane + Sarvam STT/TT
 - Asterisk setup: `docs/SETUP.md`
 - AI provider specs: `docs/AI_PROVIDERS.md`
 - Media pipeline: `docs/AUDIO_PIPELINE.md`
+- Outbound campaigns: `docs/OUTBOUND.md`
 - Build phases: `PLAN.md`
 
 ## Testing

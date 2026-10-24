@@ -7,11 +7,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/nitesh/vaani/internal/ari"
 	"github.com/nitesh/vaani/internal/dograh"
+	"github.com/nitesh/vaani/internal/metrics"
 )
 
 // memStore is Dograh's database in memory: one campaign's contacts and what
@@ -619,4 +622,41 @@ func TestRunner_RecoveryAndSweep(t *testing.T) {
 
 	assert.Equal(t, []bool{true, false}, rr.store.staleArgs)
 	assert.Equal(t, []int64{101}, rr.store.staleLive[1], "the call in flight is not stale")
+}
+
+func counterValue(t *testing.T, c prometheus.Collector) float64 {
+	t.Helper()
+
+	ch := make(chan prometheus.Metric, 1)
+	c.Collect(ch)
+
+	var m dto.Metric
+	require.NoError(t, (<-ch).Write(&m))
+
+	if m.Counter != nil {
+		return m.Counter.GetValue()
+	}
+
+	return m.Gauge.GetValue()
+}
+
+func TestRunner_CountsDialsOutcomesAndRetries(t *testing.T) {
+	rr := newRunnerRig(t, 1)
+
+	dials := counterValue(t, metrics.CampaignDialsTotal)
+	busy := counterValue(t, metrics.CampaignOutcomesTotal.WithLabelValues("busy"))
+	retries := counterValue(t, metrics.CampaignRetriesTotal)
+	inflight := counterValue(t, metrics.CampaignCallsInFlight)
+
+	rr.dialAll(t)
+
+	assert.Equal(t, dials+1, counterValue(t, metrics.CampaignDialsTotal))
+	assert.Equal(t, inflight+1, counterValue(t, metrics.CampaignCallsInFlight))
+
+	rr.placer.dialed()[0].Done(ari.Outcome{Status: dograh.StatusBusy, Cause: 17})
+	require.Eventually(t, func() bool { return rr.r.InFlight(1) == 0 }, time.Second, 5*time.Millisecond)
+
+	assert.Equal(t, busy+1, counterValue(t, metrics.CampaignOutcomesTotal.WithLabelValues("busy")))
+	assert.Equal(t, retries+1, counterValue(t, metrics.CampaignRetriesTotal))
+	assert.Equal(t, inflight, counterValue(t, metrics.CampaignCallsInFlight))
 }

@@ -10,6 +10,7 @@ import (
 
 	"github.com/nitesh/vaani/internal/ari"
 	"github.com/nitesh/vaani/internal/dograh"
+	"github.com/nitesh/vaani/internal/metrics"
 )
 
 // Store is the part of Dograh's database the dialer uses (*dograh.Store).
@@ -176,7 +177,7 @@ func (r *Runner) log(c dograh.Campaign, msg, event string, args ...any) {
 }
 
 // pause moves a running campaign to paused (unless someone changed it meanwhile).
-func (r *Runner) pause(ctx context.Context, c dograh.Campaign, why string) {
+func (r *Runner) pause(ctx context.Context, c dograh.Campaign, kind, why string) {
 	moved, err := r.store.SetCampaignState(ctx, c.ID, "running", "paused")
 	if err != nil {
 		slog.Error("campaign: pausing failed", "component", "campaign", "event", "campaign.pause_failed", "campaign_id", c.ID, "error", err)
@@ -184,6 +185,7 @@ func (r *Runner) pause(ctx context.Context, c dograh.Campaign, why string) {
 	}
 
 	if moved {
+		metrics.CampaignPausesTotal.WithLabelValues(kind).Inc()
 		slog.Warn("campaign paused", "component", "campaign", "event", "campaign.paused", "campaign_id", c.ID, "org_id", c.OrganizationID, "reason", why)
 	}
 }
@@ -222,12 +224,12 @@ func (r *Runner) dialOne(ctx context.Context, c dograh.Campaign) (step, time.Dur
 	}
 
 	if open, stats, err := r.lim.BreakerOpen(ctx, c.ID, c.Breaker); err == nil && open {
-		r.pause(ctx, c, fmt.Sprintf("circuit breaker: %d of %d calls failed", stats.Failures, stats.Total()))
+		r.pause(ctx, c, "breaker", fmt.Sprintf("circuit breaker: %d of %d calls failed", stats.Failures, stats.Total()))
 		return stepStop, 0
 	}
 
 	if r.store.WalletBlocks(ctx, c.OrganizationID) {
-		r.pause(ctx, c, "the organization's wallet is out of credit")
+		r.pause(ctx, c, "wallet", "the organization's wallet is out of credit")
 		return stepStop, 0
 	}
 
@@ -323,7 +325,7 @@ func (r *Runner) place(ctx context.Context, c dograh.Campaign, q dograh.QueuedRu
 	}
 
 	if settings.Provider != "ari" {
-		r.pause(ctx, c, fmt.Sprintf("the organization's telephony provider is %q, not ari", settings.Provider))
+		r.pause(ctx, c, "provider", fmt.Sprintf("the organization's telephony provider is %q, not ari", settings.Provider))
 		return giveBack("cannot dial over ARI", fmt.Errorf("provider %q", settings.Provider))
 	}
 
@@ -349,6 +351,7 @@ func (r *Runner) place(ctx context.Context, c dograh.Campaign, q dograh.QueuedRu
 		r.addInflight(c.ID, -1)
 		r.track(runID, false)
 		r.release(slot)
+		metrics.CampaignOutcomesTotal.WithLabelValues(dograh.StatusFailed).Inc()
 		r.recordOutcome(c, true)
 		r.markNotConnected(c, runID, dograh.StatusFailed)
 		r.setRunState(ctx, q, dograh.RunFailed)
@@ -356,6 +359,7 @@ func (r *Runner) place(ctx context.Context, c dograh.Campaign, q dograh.QueuedRu
 		return stepDialed
 	}
 
+	metrics.CampaignDialsTotal.Inc()
 	r.setRunState(ctx, q, dograh.RunProcessed)
 	r.log(c, "campaign call placed", "campaign.dialed", "queued_run_id", q.ID, "run_id", runID, "called_number", phone,
 		"retry_count", q.RetryCount)
@@ -389,13 +393,15 @@ func (r *Runner) recordOutcome(c dograh.Campaign, failure bool) {
 	}
 
 	if tripped {
-		r.pause(ctx, c, fmt.Sprintf("circuit breaker: %d of %d calls failed", stats.Failures, stats.Total()))
+		r.pause(ctx, c, "breaker", fmt.Sprintf("circuit breaker: %d of %d calls failed", stats.Failures, stats.Total()))
 	}
 }
 
 func (r *Runner) addInflight(campaignID, n int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	metrics.CampaignCallsInFlight.Add(float64(n))
 
 	if r.inflight[campaignID] += n; r.inflight[campaignID] <= 0 {
 		delete(r.inflight, campaignID)
@@ -425,12 +431,14 @@ func (r *Runner) finished(c dograh.Campaign, q dograh.QueuedRun, runID int64, sl
 	r.release(slot)
 
 	if out.Connected {
+		metrics.CampaignOutcomesTotal.WithLabelValues("connected").Inc()
 		r.log(c, "campaign call finished", "campaign.finished", "queued_run_id", q.ID, "run_id", runID)
 		r.recordOutcome(c, false)
 
 		return
 	}
 
+	metrics.CampaignOutcomesTotal.WithLabelValues(out.Status).Inc()
 	r.log(c, "campaign call did not connect", "campaign.not_connected", "queued_run_id", q.ID, "run_id", runID,
 		"status", out.Status, "cause", out.Cause)
 
@@ -446,6 +454,9 @@ func (r *Runner) finished(c dograh.Campaign, q dograh.QueuedRun, runID int64, sl
 			err = r.store.AddFailedRow(ctx, c.ID) // retries used up
 		} else {
 			err = r.store.ScheduleRetry(ctx, q, reason, c.Retry.Delay, r.now())
+			if err == nil {
+				metrics.CampaignRetriesTotal.Inc()
+			}
 		}
 
 		if err != nil {
@@ -502,6 +513,7 @@ func (r *Runner) maybeComplete(ctx context.Context, c dograh.Campaign) {
 	}
 
 	if done {
+		metrics.CampaignsCompletedTotal.Inc()
 		r.log(c, "campaign completed", "campaign.completed")
 	}
 }

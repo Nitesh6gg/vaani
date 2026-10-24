@@ -1,4 +1,9 @@
-# Outbound campaigns — plan (draft, awaiting approval)
+# Outbound campaigns — plan
+
+**Status:** M0–M6 built and tested with fakes, an in-memory Redis and a throwaway
+Postgres. Not yet run against the real Asterisk/Dograh/Redis: the real-phone
+call (M3) and a CSV campaign from the Dograh UI (M4), kill/restart (M5) and
+the SigNoz panels (M6). How it works now: `OUTBOUND.md`.
 
 Vaani becomes the dialer for organizations whose media engine is `vaani`.
 Dograh stays the control panel (create / upload / Start / Pause / reports).
