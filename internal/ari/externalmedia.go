@@ -11,7 +11,7 @@ import (
 	"github.com/nitesh/vaani/internal/config"
 )
 
-// externalMediaHTTPClient is dedicated to the one raw REST call in this file, with
+// externalMediaHTTPClient is dedicated to the raw REST calls in this package (this one and outbound.go's originate), with
 // a bounded timeout so a hung ARI server can't block call setup forever. This
 // isn't the "shared http.Client for hot-path provider calls" invariant from
 // CLAUDE.md -- that's about high-frequency AI provider traffic; this fires once
@@ -60,7 +60,7 @@ func createAudioSocketExternalMedia(cfg config.Config, channelID, app, externalH
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("externalMedia: non-2xx response: %s", resp.Status)
+		return responseError("externalMedia", resp)
 	}
 
 	return nil

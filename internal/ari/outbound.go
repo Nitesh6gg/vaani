@@ -3,14 +3,19 @@ package ari
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/CyCoreSystems/ari/v5"
-
 	"github.com/CyCoreSystems/ari/v5/rid"
+
+	"github.com/nitesh/vaani/internal/config"
 	"github.com/nitesh/vaani/internal/dograh"
 )
 
@@ -86,15 +91,18 @@ func (m *Manager) Dial(ctx context.Context, req DialRequest) (string, error) {
 	m.outbound[id] = oc
 	m.mu.Unlock()
 
-	_, err := m.cl.Channel().Originate(ari.NewKey(ari.ChannelKey, id), ari.OriginateRequest{
-		Endpoint:  req.Endpoint,
-		App:       m.cfg.AriApp,
-		AppArgs:   outboundAppArg + "," + strconv.FormatInt(req.RunID, 10),
-		Timeout:   int(req.RingTimeout.Seconds()),
-		ChannelID: id,
-		CallerID:  req.CallerID,
-	})
-	if err != nil {
+	q := url.Values{
+		"endpoint":  {req.Endpoint},
+		"app":       {m.cfg.AriApp},
+		"appArgs":   {outboundAppArg + "," + strconv.FormatInt(req.RunID, 10)},
+		"timeout":   {strconv.Itoa(int(req.RingTimeout.Seconds()))},
+		"channelId": {id},
+	}
+	if req.CallerID != "" {
+		q.Set("callerId", req.CallerID)
+	}
+
+	if err := originate(ctx, m.cfg, q); err != nil {
 		m.mu.Lock()
 		delete(m.outbound, id)
 		m.mu.Unlock()
@@ -113,6 +121,44 @@ func (m *Manager) Dial(ctx context.Context, req DialRequest) (string, error) {
 		"ring_timeout_s", int(req.RingTimeout.Seconds()))
 
 	return id, nil
+}
+
+// originate starts the channel with the query-parameter form of POST
+// /channels, the one Dograh's ARI provider uses. The vendored ARI library's
+// Originate posts a JSON body instead, which Asterisk 20 rejected with a bare
+// "400 Bad Request" for the same values that work as query parameters -- and
+// the library discards Asterisk's explanation. Here a failure carries it.
+func originate(ctx context.Context, cfg config.Config, q url.Values) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.AriURL+"/channels?"+q.Encode(), nil)
+	if err != nil {
+		return fmt.Errorf("build originate request: %w", err)
+	}
+
+	req.SetBasicAuth(cfg.AriUser, cfg.AriPass)
+
+	resp, err := externalMediaHTTPClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("originate request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return responseError("originate", resp)
+	}
+
+	return nil
+}
+
+// responseError is a non-2xx ARI response as an error, with the start of
+// Asterisk's explanation (its JSON {"message": ...}).
+func responseError(what string, resp *http.Response) error {
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+
+	if msg := strings.TrimSpace(string(body)); msg != "" {
+		return fmt.Errorf("%s: %s: %s", what, resp.Status, msg)
+	}
+
+	return fmt.Errorf("%s: %s", what, resp.Status)
 }
 
 // outboundFor is the dialed call on channel id, or nil.

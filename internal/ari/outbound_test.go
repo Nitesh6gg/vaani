@@ -2,6 +2,9 @@ package ari
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"sync"
 	"testing"
 	"time"
@@ -23,7 +26,10 @@ type outboundRig struct {
 	ports    *media.PortAllocator
 
 	mu       sync.Mutex
-	req      ari.OriginateRequest
+	query    url.Values // of the last originate request
+	user     string
+	status   int    // what the fake Asterisk answers originate with
+	reply    string // and its body
 	hungUp   []string
 	outcomes chan Outcome
 }
@@ -33,11 +39,19 @@ func newOutboundRig(t *testing.T) *outboundRig {
 
 	r := &outboundRig{channels: &arimocks.Channel{}, outcomes: make(chan Outcome, 4)}
 
-	r.channels.On("Originate", mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
+	r.status = http.StatusOK
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		r.mu.Lock()
-		r.req = args.Get(1).(ari.OriginateRequest)
-		r.mu.Unlock()
-	}).Return(nil, nil)
+		defer r.mu.Unlock()
+
+		r.query = req.URL.Query()
+		r.user, _, _ = req.BasicAuth()
+
+		w.WriteHeader(r.status)
+		_, _ = w.Write([]byte(r.reply))
+	}))
+	t.Cleanup(srv.Close)
 	r.channels.On("Hangup", mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
 		r.mu.Lock()
 		r.hungUp = append(r.hungUp, args.Get(0).(*ari.Key).ID)
@@ -48,7 +62,7 @@ func newOutboundRig(t *testing.T) *outboundRig {
 	cl.On("Channel").Return(r.channels)
 
 	r.ports = media.NewPortAllocator(21000, 4)
-	r.m = NewManager(cl, config.Config{AriApp: "vaani", MediaIP: "127.0.0.1"}, r.ports, nil, nil)
+	r.m = NewManager(cl, config.Config{AriApp: "vaani", MediaIP: "127.0.0.1", AriURL: srv.URL, AriUser: "vaani", AriPass: "pw"}, r.ports, nil, nil)
 
 	return r
 }
@@ -100,10 +114,36 @@ func TestDial_OriginatesIntoStasisWithTheRun(t *testing.T) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	assert.Equal(t, ari.OriginateRequest{
-		Endpoint: "PJSIP/9876543210@trunk", App: "vaani", AppArgs: "outbound,931",
-		Timeout: 30, ChannelID: id, CallerID: "7317185732",
-	}, r.req)
+	assert.Equal(t, url.Values{
+		"endpoint": {"PJSIP/9876543210@trunk"}, "app": {"vaani"}, "appArgs": {"outbound,931"},
+		"timeout": {"30"}, "channelId": {id}, "callerId": {"7317185732"},
+	}, r.query, "as query parameters, the form Asterisk 20 accepts")
+	assert.Equal(t, "vaani", r.user, "with the ARI credentials")
+}
+
+func TestDial_FailureCarriesAsterisksExplanation(t *testing.T) {
+	r := newOutboundRig(t)
+	r.status, r.reply = http.StatusBadRequest, `{"message":"Invalid parameters for originating a channel"}`
+
+	id, err := r.m.Dial(context.Background(), DialRequest{Endpoint: "SIP/1@x", RingTimeout: time.Second, Done: func(Outcome) { t.Error("Done must not be called") }})
+
+	require.Error(t, err)
+	assert.Empty(t, id)
+	assert.ErrorContains(t, err, "400 Bad Request")
+	assert.ErrorContains(t, err, "Invalid parameters for originating a channel")
+	assert.Empty(t, r.m.outbound, "nothing is waiting for a call that was never placed")
+}
+
+func TestDial_NoCallerIDIsNotSent(t *testing.T) {
+	r := newOutboundRig(t)
+
+	_, err := r.m.Dial(context.Background(), DialRequest{Endpoint: "SIP/1@x", RingTimeout: time.Second})
+	require.NoError(t, err)
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	assert.NotContains(t, r.query, "callerId")
 }
 
 func TestDial_UnansweredStatusFromHangupCause(t *testing.T) {
