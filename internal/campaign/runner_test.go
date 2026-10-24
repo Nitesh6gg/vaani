@@ -30,11 +30,18 @@ type memStore struct {
 	settings   dograh.DialSettings
 	paused     []string
 	nextRun    int64
+
+	future      map[int]bool // retry rows not due yet: ClaimRuns skips them
+	recovered   int
+	staleRuns   []dograh.StaleRun
+	staleArgs   []bool // includeRunning of each StaleRuns call
+	staleLive   [][]int64
+	interrupted []int64
 }
 
 func newMemStore(contacts int) *memStore {
 	s := &memStore{
-		state: "running", rowState: map[int]string{}, nextRun: 100,
+		state: "running", rowState: map[int]string{}, nextRun: 100, future: map[int]bool{},
 		settings: dograh.DialSettings{Provider: "ari", Technology: "PJSIP", Trunk: "trunk", FromNumbers: []string{"7317185732"}},
 	}
 
@@ -84,7 +91,7 @@ func (s *memStore) ClaimRuns(_ context.Context, _ int, _ int, _ time.Time) ([]do
 	defer s.mu.Unlock()
 
 	for _, r := range s.rows {
-		if s.rowState[r.ID] == "queued" {
+		if s.rowState[r.ID] == "queued" && !s.future[r.ID] {
 			s.rowState[r.ID] = "processing"
 			return []dograh.QueuedRun{r}, nil
 		}
@@ -107,6 +114,67 @@ func (s *memStore) ScheduleRetry(_ context.Context, _ dograh.QueuedRun, reason s
 	defer s.mu.Unlock()
 
 	s.retries = append(s.retries, reason)
+
+	id := len(s.rows) + 1
+	s.rows = append(s.rows, dograh.QueuedRun{ID: id, CampaignID: 1, SourceUUID: "row_retry", RetryCount: 1, Variables: map[string]any{"phone_number": "9000000099"}})
+	s.rowState[id], s.future[id] = "queued", true
+
+	return nil
+}
+
+func (s *memStore) OpenWork(context.Context, int) (queued, processing int, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, st := range s.rowState {
+		switch st {
+		case "queued":
+			queued++
+		case "processing":
+			processing++
+		}
+	}
+
+	return queued, processing, nil
+}
+
+func (s *memStore) CompleteCampaign(context.Context, int) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.state != "running" {
+		return false, nil
+	}
+
+	s.state = "completed"
+
+	return true, nil
+}
+
+func (s *memStore) RecoverContacts(context.Context) (int, int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.recovered++
+
+	return 1, 2, nil
+}
+
+func (s *memStore) StaleRuns(_ context.Context, _ time.Time, includeRunning bool, live []int64) ([]dograh.StaleRun, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.staleArgs = append(s.staleArgs, includeRunning)
+	s.staleLive = append(s.staleLive, live)
+
+	return s.staleRuns, nil
+}
+
+func (s *memStore) MarkInterrupted(_ context.Context, runID int64, _ int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.interrupted = append(s.interrupted, runID)
 
 	return nil
 }
@@ -502,4 +570,53 @@ type scanStore struct {
 
 func (s *scanStore) VaaniCampaigns(context.Context) ([]dograh.Campaign, error) {
 	return s.campaigns, nil
+}
+
+func TestRunner_CompletesOnlyWhenNothingIsLeft(t *testing.T) {
+	rr := newRunnerRig(t, 1)
+	ctx := context.Background()
+
+	rr.dialAll(t)
+	require.Len(t, rr.placer.dialed(), 1)
+	assert.Equal(t, "running", rr.store.state, "the one call is still ringing")
+
+	rr.placer.dialed()[0].Done(ari.Outcome{Connected: true})
+	require.Eventually(t, func() bool { return rr.r.InFlight(1) == 0 }, time.Second, 5*time.Millisecond)
+
+	res, _ := rr.r.dialOne(ctx, rr.camp)
+	assert.Equal(t, stepStop, res)
+	assert.Equal(t, "completed", rr.store.state)
+}
+
+func TestRunner_WaitsForARetryBeforeCompleting(t *testing.T) {
+	rr := newRunnerRig(t, 1)
+
+	rr.dialAll(t)
+	rr.placer.dialed()[0].Done(ari.Outcome{Status: dograh.StatusBusy, Cause: 17})
+	require.Eventually(t, func() bool { return rr.r.InFlight(1) == 0 }, time.Second, 5*time.Millisecond)
+
+	rr.dialAll(t)
+	assert.Equal(t, "running", rr.store.state, "the busy contact's retry is queued for later")
+	assert.Len(t, rr.placer.dialed(), 1, "and not due yet")
+}
+
+func TestRunner_RecoveryAndSweep(t *testing.T) {
+	rr := newRunnerRig(t, 1)
+	ctx := context.Background()
+
+	rr.store.staleRuns = []dograh.StaleRun{{ID: 5, OrgID: 7, State: "initialized"}, {ID: 6, OrgID: 7, State: "running"}}
+
+	rr.r.recover(ctx)
+
+	assert.Equal(t, 1, rr.store.recovered)
+	assert.Equal(t, []bool{true}, rr.store.staleArgs, "right after a restart 'running' runs are stale too")
+	assert.Equal(t, []string{"failed"}, rr.store.notConn, "a call that never reached the agent")
+	assert.Equal(t, []int64{6}, rr.store.interrupted, "a call the restart cut off")
+
+	// Later sweeps leave 'running' runs alone, and skip the calls in flight.
+	rr.dialAll(t)
+	rr.r.sweep(ctx, false)
+
+	assert.Equal(t, []bool{true, false}, rr.store.staleArgs)
+	assert.Equal(t, []int64{101}, rr.store.staleLive[1], "the call in flight is not stale")
 }

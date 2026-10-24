@@ -25,6 +25,12 @@ type Store interface {
 	SetRunState(ctx context.Context, runID int, state string) error
 	ScheduleRetry(ctx context.Context, run dograh.QueuedRun, reason string, delay time.Duration, now time.Time) error
 	AddFailedRow(ctx context.Context, campaignID int) error
+
+	OpenWork(ctx context.Context, campaignID int) (queued, processing int, err error)
+	CompleteCampaign(ctx context.Context, id int) (bool, error)
+	RecoverContacts(ctx context.Context) (requeued, processed int, err error)
+	StaleRuns(ctx context.Context, initializedBefore time.Time, includeRunning bool, live []int64) ([]dograh.StaleRun, error)
+	MarkInterrupted(ctx context.Context, runID int64, orgID int) error
 }
 
 // RunnerConfig tunes the Runner.
@@ -56,6 +62,7 @@ type Runner struct {
 	mu       sync.Mutex
 	draining map[int]bool // campaigns a drain goroutine is working on
 	inflight map[int]int  // calls placed and not yet over, per campaign
+	liveRuns map[int64]bool
 	wakeCh   chan struct{}
 	wg       sync.WaitGroup
 }
@@ -64,7 +71,7 @@ type Runner struct {
 func NewRunner(store Store, lim *Limiter, placer CallPlacer, cfg RunnerConfig) *Runner {
 	return &Runner{
 		store: store, lim: lim, placer: placer, cfg: cfg, now: time.Now, ctx: context.Background(),
-		draining: map[int]bool{}, inflight: map[int]int{}, wakeCh: make(chan struct{}, 1),
+		draining: map[int]bool{}, inflight: map[int]int{}, liveRuns: map[int64]bool{}, wakeCh: make(chan struct{}, 1),
 	}
 }
 
@@ -74,8 +81,13 @@ func NewRunner(store Store, lim *Limiter, placer CallPlacer, cfg RunnerConfig) *
 func (r *Runner) Run(ctx context.Context) {
 	r.ctx = ctx
 
+	r.recover(ctx)
+
 	ticker := time.NewTicker(r.cfg.Poll)
 	defer ticker.Stop()
+
+	sweepTicker := time.NewTicker(time.Minute)
+	defer sweepTicker.Stop()
 
 	for {
 		r.scan(ctx)
@@ -86,6 +98,8 @@ func (r *Runner) Run(ctx context.Context) {
 			return
 		case <-ticker.C:
 		case <-r.wakeCh:
+		case <-sweepTicker.C:
+			r.sweep(ctx, false)
 		}
 	}
 }
@@ -250,6 +264,8 @@ func (r *Runner) dialOne(ctx context.Context, c dograh.Campaign) (step, time.Dur
 
 		if err != nil {
 			slog.Error("campaign: claiming a contact failed", "component", "campaign", "event", "campaign.claim_failed", "campaign_id", c.ID, "error", err)
+		} else {
+			r.maybeComplete(ctx, c)
 		}
 
 		return stepStop, 0
@@ -319,6 +335,7 @@ func (r *Runner) place(ctx context.Context, c dograh.Campaign, q dograh.QueuedRu
 	}
 
 	r.addInflight(c.ID, 1)
+	r.track(runID, true)
 
 	_, err = r.placer.Dial(ctx, ari.DialRequest{
 		Endpoint: settings.Endpoint(phone), CallerID: caller, Called: phone, RingTimeout: r.cfg.RingTimeout,
@@ -330,6 +347,7 @@ func (r *Runner) place(ctx context.Context, c dograh.Campaign, q dograh.QueuedRu
 		slog.Error("campaign: dialing failed", "component", "campaign", "event", "campaign.dial_failed",
 			"campaign_id", c.ID, "queued_run_id", q.ID, "run_id", runID, "error", err)
 		r.addInflight(c.ID, -1)
+		r.track(runID, false)
 		r.release(slot)
 		r.recordOutcome(c, true)
 		r.markNotConnected(c, runID, dograh.StatusFailed)
@@ -402,6 +420,7 @@ func retryReason(status string) string {
 func (r *Runner) finished(c dograh.Campaign, q dograh.QueuedRun, runID int64, slot Slot, out ari.Outcome) {
 	defer r.wake()
 	defer r.addInflight(c.ID, -1)
+	defer r.track(runID, false)
 
 	r.release(slot)
 
@@ -444,4 +463,95 @@ func (r *Runner) InFlight(id int) int {
 	defer r.mu.Unlock()
 
 	return r.inflight[id]
+}
+
+func (r *Runner) track(runID int64, live bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if live {
+		r.liveRuns[runID] = true
+	} else {
+		delete(r.liveRuns, runID)
+	}
+}
+
+// maybeComplete completes campaign c when nothing is left to do: no contact
+// queued (a retry due later counts), none being handled, no call in flight.
+// Dograh completes as soon as nothing is queued, even with calls still ringing,
+// whose busy or no-answer would then find no campaign to retry in.
+func (r *Runner) maybeComplete(ctx context.Context, c dograh.Campaign) {
+	if r.InFlight(c.ID) > 0 {
+		return
+	}
+
+	queued, processing, err := r.store.OpenWork(ctx, c.ID)
+	if err != nil || queued > 0 || processing > 0 {
+		return
+	}
+
+	// Re-checked: a call may have been placed since the count was taken.
+	if r.InFlight(c.ID) > 0 {
+		return
+	}
+
+	done, err := r.store.CompleteCampaign(ctx, c.ID)
+	if err != nil {
+		slog.Error("campaign: completing it failed", "component", "campaign", "event", "campaign.complete_failed", "campaign_id", c.ID, "error", err)
+		return
+	}
+
+	if done {
+		r.log(c, "campaign completed", "campaign.completed")
+	}
+}
+
+// recover settles what a previous Vaani left behind, once, before dialing:
+// contacts claimed but never dialed go back to the queue, contacts that were
+// dialed stay processed, and runs of calls that died with it are completed.
+// Assumes no other Vaani is dialing the same campaigns.
+func (r *Runner) recover(ctx context.Context) {
+	requeued, processed, err := r.store.RecoverContacts(ctx)
+	if err != nil {
+		slog.Error("campaign recovery: contacts", "component", "campaign", "event", "campaign.recover_failed", "error", err)
+	} else if requeued+processed > 0 {
+		slog.Warn("campaign recovery: contacts a previous run left in progress", "component", "campaign", "event", "campaign.recovered",
+			"requeued", requeued, "already_dialed", processed)
+	}
+
+	r.sweep(ctx, true)
+}
+
+// sweep completes the Dograh runs of calls nothing is running any more: a call
+// that never reached the agent after the ring timeout, and -- right after a
+// restart only -- calls the restart cut off.
+func (r *Runner) sweep(ctx context.Context, startup bool) {
+	r.mu.Lock()
+	live := make([]int64, 0, len(r.liveRuns))
+	for id := range r.liveRuns {
+		live = append(live, id)
+	}
+	r.mu.Unlock()
+
+	stale, err := r.store.StaleRuns(ctx, r.now().Add(-(r.cfg.RingTimeout + time.Minute)), startup, live)
+	if err != nil {
+		slog.Error("campaign sweep failed", "component", "campaign", "event", "campaign.sweep_failed", "error", err)
+		return
+	}
+
+	for _, run := range stale {
+		if run.State == "running" {
+			err = r.store.MarkInterrupted(ctx, run.ID, run.OrgID)
+		} else {
+			err = r.store.MarkNotConnected(ctx, run.ID, run.OrgID, dograh.StatusFailed)
+		}
+
+		if err != nil {
+			slog.Error("campaign sweep: completing a run failed", "component", "campaign", "event", "campaign.sweep_failed", "run_id", run.ID, "error", err)
+			continue
+		}
+
+		slog.Warn("campaign sweep: completed a run nothing is running", "component", "campaign", "event", "campaign.swept",
+			"run_id", run.ID, "was", run.State)
+	}
 }

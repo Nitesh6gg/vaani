@@ -238,16 +238,26 @@ func notConnectedDisposition(status string) string {
 // to any it has, call_disposition BUSY / NO_ANSWER / ..., and the
 // organization's mapping of it.
 func (s *Store) MarkNotConnected(ctx context.Context, runID int64, orgID int, status string) error {
+	return s.completeRun(ctx, runID, orgID,
+		[]string{"not_connected", "telephony_" + strings.ToLower(status)}, notConnectedDisposition(status))
+}
+
+// MarkInterrupted completes the run of a call Vaani lost (it was restarted, or
+// the agent never started), so it doesn't stay 'running' for ever.
+func (s *Store) MarkInterrupted(ctx context.Context, runID int64, orgID int) error {
+	return s.completeRun(ctx, runID, orgID, []string{"interrupted"}, "INTERRUPTED")
+}
+
+func (s *Store) completeRun(ctx context.Context, runID int64, orgID int, tagList []string, disposition string) error {
 	ctx = context.WithoutCancel(ctx)
 
 	mctx, cancel := context.WithTimeout(ctx, runDBTimeout)
 	oid := int64(orgID)
-	raw := notConnectedDisposition(status)
-	mapped := s.mapDisposition(mctx, &oid, raw)
+	mapped := s.mapDisposition(mctx, &oid, disposition)
 
 	cancel()
 
-	tags, _ := json.Marshal([]string{"not_connected", "telephony_" + strings.ToLower(status)})
+	tags, _ := json.Marshal(tagList)
 
 	ctx, cancel = context.WithTimeout(ctx, runDBTimeout)
 	defer cancel()
@@ -257,9 +267,9 @@ func (s *Store) MarkNotConnected(ctx context.Context, runID int64, orgID int, st
 			gathered_context = (COALESCE(gathered_context::jsonb, '{}'::jsonb) || jsonb_build_object(
 				'call_tags', COALESCE(gathered_context::jsonb->'call_tags', '[]'::jsonb) || $2::text::jsonb,
 				'call_disposition', $3::text, 'mapped_call_disposition', $4::text))::json
-		WHERE id = $1`, runID, string(tags), raw, mapped)
+		WHERE id = $1`, runID, string(tags), disposition, mapped)
 	if err != nil {
-		return fmt.Errorf("dograh: run %d not connected: %w", runID, err)
+		return fmt.Errorf("dograh: complete run %d: %w", runID, err)
 	}
 
 	return nil

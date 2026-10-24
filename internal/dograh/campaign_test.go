@@ -162,7 +162,7 @@ func campaignDB(t *testing.T) (*Store, *pgxpool.Pool) {
 			id serial PRIMARY KEY, organization_id int NOT NULL, workflow_id int NOT NULL DEFAULT 1,
 			created_by int NOT NULL DEFAULT 1, state campaign_state NOT NULL DEFAULT 'created',
 			rate_limit_per_second int NOT NULL DEFAULT 1, processed_rows int NOT NULL DEFAULT 0,
-			failed_rows int NOT NULL DEFAULT 0, retry_config json, orchestrator_metadata json);
+			failed_rows int NOT NULL DEFAULT 0, retry_config json, orchestrator_metadata json, completed_at timestamptz);
 		CREATE TABLE queued_runs (
 			id serial PRIMARY KEY, campaign_id int NOT NULL REFERENCES campaigns(id),
 			source_uuid text NOT NULL, context_variables json NOT NULL DEFAULT '{}',
@@ -540,4 +540,115 @@ func TestWalletBlocks(t *testing.T) {
 	for org, want := range map[int]bool{1: false, 2: true, 3: false, 4: true, 5: false, 6: false, 99: false} {
 		assert.Equal(t, want, s.WalletBlocks(ctx, org), "org %d", org)
 	}
+}
+
+func TestRecoverContacts_OnlyVaaniCampaigns(t *testing.T) {
+	s, pool := campaignDB(t)
+	ctx := context.Background()
+
+	sqlExec(t, pool, `
+		INSERT INTO organization_configurations (organization_id, key, value) VALUES
+			(1, 'MEDIA_ENGINE', '{"value": "vaani"}'), (2, 'MEDIA_ENGINE', '{"value": "pipecat"}');
+		INSERT INTO campaigns (organization_id, state) VALUES (1, 'running'), (2, 'running');
+		INSERT INTO queued_runs (campaign_id, source_uuid, state) VALUES
+			(1, 'never-dialed', 'processing'),   -- 1
+			(1, 'dialed', 'processing'),         -- 2: has a run
+			(1, 'fine', 'queued'),               -- 3
+			(2, 'dograhs-own', 'processing');    -- 4: a pipecat org's, in flight in Dograh
+		INSERT INTO workflow_runs (queued_run_id, campaign_id, call_type, state, is_completed) VALUES (2, 1, 'outbound', 'initialized', false)`)
+
+	requeued, processed, err := s.RecoverContacts(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, requeued)
+	assert.Equal(t, 1, processed)
+
+	states := map[int]string{}
+	rows, err := pool.Query(ctx, `SELECT id, state::text FROM queued_runs`)
+	require.NoError(t, err)
+
+	for rows.Next() {
+		var id int
+		var st string
+		require.NoError(t, rows.Scan(&id, &st))
+		states[id] = st
+	}
+
+	rows.Close()
+
+	assert.Equal(t, map[int]string{1: "queued", 2: "processed", 3: "queued", 4: "processing"}, states,
+		"a contact with a run is never redialed; Dograh's own campaign is untouched")
+}
+
+func TestOpenWorkAndComplete(t *testing.T) {
+	s, pool := campaignDB(t)
+	ctx := context.Background()
+
+	sqlExec(t, pool, `
+		INSERT INTO campaigns (organization_id, state) VALUES (1, 'running'), (1, 'paused');
+		INSERT INTO queued_runs (campaign_id, source_uuid, state, scheduled_for) VALUES
+			(1, 'a', 'queued', NULL), (1, 'b', 'queued', now() + interval '1 hour'),
+			(1, 'c', 'processing', NULL), (1, 'd', 'processed', NULL), (1, 'e', 'failed', NULL)`)
+
+	queued, processing, err := s.OpenWork(ctx, 1)
+	require.NoError(t, err)
+	assert.Equal(t, 2, queued, "a retry due in an hour still counts")
+	assert.Equal(t, 1, processing)
+
+	done, err := s.CompleteCampaign(ctx, 2)
+	require.NoError(t, err)
+	assert.False(t, done, "only a running campaign completes")
+
+	done, err = s.CompleteCampaign(ctx, 1)
+	require.NoError(t, err)
+	assert.True(t, done)
+
+	var state string
+	var completedAt *time.Time
+	require.NoError(t, pool.QueryRow(ctx, `SELECT state::text, completed_at FROM campaigns WHERE id = 1`).Scan(&state, &completedAt))
+	assert.Equal(t, "completed", state)
+	assert.NotNil(t, completedAt)
+}
+
+func TestStaleRuns(t *testing.T) {
+	s, pool := campaignDB(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	sqlExec(t, pool, `
+		INSERT INTO organization_configurations (organization_id, key, value) VALUES
+			(1, 'MEDIA_ENGINE', '{"value": "vaani"}'), (2, 'MEDIA_ENGINE', '{"value": "pipecat"}');
+		INSERT INTO campaigns (organization_id, state) VALUES (1, 'running'), (2, 'running');
+		INSERT INTO workflow_runs (campaign_id, call_type, state, is_completed, created_at, gathered_context) VALUES
+			(1, 'outbound', 'initialized', false, now() - interval '10 minutes', '{}'),  -- 1: never reached the agent
+			(1, 'outbound', 'initialized', false, now(), '{}'),                          -- 2: ringing now
+			(1, 'outbound', 'running',     false, now() - interval '10 minutes', '{}'),  -- 3: cut off, or still going
+			(1, 'outbound', 'initialized', false, now() - interval '10 minutes', '{}'),  -- 4: live in this process
+			(1, 'outbound', 'initialized', true,  now() - interval '10 minutes', '{}'),  -- 5: completed
+			(2, 'outbound', 'initialized', false, now() - interval '10 minutes', '{}'),  -- 6: a pipecat org's
+			(NULL, 'outbound', 'initialized', false, now() - interval '10 minutes', '{}') -- 7: no campaign`)
+
+	ids := func(runs []StaleRun) []int64 {
+		var out []int64
+		for _, r := range runs {
+			out = append(out, r.ID)
+		}
+
+		return out
+	}
+
+	got, err := s.StaleRuns(ctx, now.Add(-time.Minute), false, []int64{4})
+	require.NoError(t, err)
+	assert.Equal(t, []int64{1}, ids(got), "later sweeps: only a call that never reached the agent")
+
+	got, err = s.StaleRuns(ctx, now.Add(-time.Minute), true, nil)
+	require.NoError(t, err)
+	assert.Equal(t, []int64{1, 3, 4}, ids(got), "after a restart: a running run is stale too, and nothing is live")
+	assert.Equal(t, StaleRun{ID: 3, OrgID: 1, State: "running"}, got[1])
+
+	require.NoError(t, s.MarkInterrupted(ctx, 3, 1))
+
+	var gathered, state string
+	require.NoError(t, pool.QueryRow(ctx, `SELECT gathered_context::text, state FROM workflow_runs WHERE id = 3`).Scan(&gathered, &state))
+	assert.Equal(t, "completed", state)
+	assert.JSONEq(t, `{"call_tags": ["interrupted"], "call_disposition": "INTERRUPTED", "mapped_call_disposition": "INTERRUPTED"}`, gathered)
 }

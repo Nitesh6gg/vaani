@@ -505,3 +505,99 @@ func walletBlocks(mode *string, rate, balance, credit *float64) bool {
 
 	return bal <= -*credit
 }
+
+// vaaniCampaigns is the SQL condition for campaigns Vaani dials (alias c): an
+// organization whose MEDIA_ENGINE is "vaani". Dograh's own campaigns are never
+// touched by the recovery below.
+const vaaniOrgs = `EXISTS (SELECT 1 FROM organization_configurations oc
+	WHERE oc.organization_id = c.organization_id AND oc.key = 'MEDIA_ENGINE'
+		AND oc.value::text::jsonb ->> 'value' = 'vaani')`
+
+// OpenWork counts campaign id's contacts still to be called ('queued', retries
+// due later included) and those being handled right now ('processing').
+func (s *Store) OpenWork(ctx context.Context, campaignID int) (queued, processing int, err error) {
+	err = s.pool.QueryRow(ctx, `
+		SELECT count(*) FILTER (WHERE state = 'queued'), count(*) FILTER (WHERE state = 'processing')
+		FROM queued_runs WHERE campaign_id = $1`, campaignID).Scan(&queued, &processing)
+	if err != nil {
+		return 0, 0, fmt.Errorf("dograh: campaign %d work: %w", campaignID, err)
+	}
+
+	return queued, processing, nil
+}
+
+// CompleteCampaign marks a running campaign completed. It says whether it did
+// (a Pause or Resume made meanwhile wins).
+func (s *Store) CompleteCampaign(ctx context.Context, id int) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE campaigns SET state = 'completed', completed_at = now() WHERE id = $1 AND state = 'running'`, id)
+	if err != nil {
+		return false, fmt.Errorf("dograh: complete campaign %d: %w", id, err)
+	}
+
+	return tag.RowsAffected() == 1, nil
+}
+
+// RecoverContacts settles the contacts a stopped Vaani left 'processing' in
+// campaigns it dials: one with no Dograh run was never dialed and goes back to
+// the queue; one with a run may have been called, so it is marked processed
+// and never redialed. Run once at startup, with no other Vaani running.
+func (s *Store) RecoverContacts(ctx context.Context) (requeued, processed int, err error) {
+	err = s.pool.QueryRow(ctx, `
+		WITH moved AS (
+			UPDATE queued_runs q SET state = CASE WHEN EXISTS (SELECT 1 FROM workflow_runs r WHERE r.queued_run_id = q.id)
+					THEN 'processed' ELSE 'queued' END::queued_run_state
+			FROM campaigns c
+			WHERE c.id = q.campaign_id AND q.state = 'processing' AND `+vaaniOrgs+`
+			RETURNING q.state::text AS state)
+		SELECT count(*) FILTER (WHERE state = 'queued'), count(*) FILTER (WHERE state = 'processed') FROM moved`).
+		Scan(&requeued, &processed)
+	if err != nil {
+		return 0, 0, fmt.Errorf("dograh: recover contacts: %w", err)
+	}
+
+	return requeued, processed, nil
+}
+
+// StaleRun is a call of a Vaani campaign whose Dograh run was never completed.
+type StaleRun struct {
+	ID    int64
+	OrgID int
+	State string // "initialized" or "running"
+}
+
+// StaleRuns lists the unfinished outbound runs of campaigns Vaani dials that
+// no live call accounts for (live: their ids). An 'initialized' run is stale
+// once created before initializedBefore (the call never reached the agent). A
+// 'running' run is stale only when includeRunning: right after a restart,
+// when nothing of this Vaani's is alive -- later, a finished call's record is
+// still being written while its run reads 'running'.
+func (s *Store) StaleRuns(ctx context.Context, initializedBefore time.Time, includeRunning bool, live []int64) ([]StaleRun, error) {
+	if live == nil {
+		live = []int64{} // a nil slice is sent as NULL, and NOT (id = ANY(NULL)) matches nothing
+	}
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT r.id, c.organization_id, r.state::text
+		FROM workflow_runs r JOIN campaigns c ON c.id = r.campaign_id
+		WHERE r.call_type = 'outbound' AND NOT r.is_completed AND NOT (r.id = ANY($1)) AND `+vaaniOrgs+`
+			AND ((r.state = 'initialized' AND r.created_at < $2) OR ($3 AND r.state = 'running'))
+		ORDER BY r.id`, live, initializedBefore, includeRunning)
+	if err != nil {
+		return nil, fmt.Errorf("dograh: stale runs: %w", err)
+	}
+	defer rows.Close()
+
+	var out []StaleRun
+
+	for rows.Next() {
+		var r StaleRun
+		if err := rows.Scan(&r.ID, &r.OrgID, &r.State); err != nil {
+			return out, fmt.Errorf("dograh: read stale run: %w", err)
+		}
+
+		out = append(out, r)
+	}
+
+	return out, rows.Err()
+}
