@@ -45,6 +45,16 @@ var (
 		Help: "Total agent-pipeline errors by stage (stt, llm, tts_open, tts_speak, tts_cancel, tts_outbound_full).",
 	}, []string{"stage"})
 
+	LLMRetriesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "vaani_llm_retries_total",
+		Help: "LLM requests that needed retries, by how they ended (recovered, exhausted).",
+	}, []string{"result"})
+
+	LLMFallbackTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "vaani_llm_fallback_total",
+		Help: "Turns the LLM failed that Vaani covered by speaking a fixed line: apology (asks the caller to repeat) or hangup (goodbye, call ended).",
+	}, []string{"kind"})
+
 	// ttfbBuckets: 50ms..~25.6s, covering a fast TTS first-chunk through a
 	// slow LLM first-token on a cold connection.
 	ttfbBuckets = prometheus.ExponentialBuckets(50, 2, 10)
@@ -79,6 +89,25 @@ var (
 	}, []string{"tool"})
 )
 
+func init() {
+	// Created at 0 so panels show 0 rather than "No data", and the first
+	// increment of a series is a visible change.
+	for _, stage := range []string{"stt", "llm", "tts_open", "tts_speak", "tts_cancel", "tts_outbound_full", "tts_closed", "tts_drain_timeout"} {
+		AgentErrorsTotal.WithLabelValues(stage)
+	}
+
+	for _, r := range []string{"recovered", "exhausted"} {
+		LLMRetriesTotal.WithLabelValues(r)
+	}
+
+	for _, k := range []string{"apology", "hangup"} {
+		LLMFallbackTotal.WithLabelValues(k)
+	}
+}
+
+// LLMRetry is llm.Client.OnRetry.
+func LLMRetry(result string) { LLMRetriesTotal.WithLabelValues(result).Inc() }
+
 // AgentSink adapts the package-level agent counters to agent.Sink, keeping
 // internal/ai/agent free of a prometheus dependency (same pattern as Sink and
 // AudioSocketSink for the media package).
@@ -89,6 +118,7 @@ func (AgentSink) InterruptionPaused() { AgentInterruptionPausesTotal.Inc() }
 func (AgentSink) FalseInterruption()  { AgentFalseInterruptionsTotal.Inc() }
 func (AgentSink) TurnStarted()        { AgentTurnsTotal.Inc() }
 func (AgentSink) Error(stage string)  { AgentErrorsTotal.WithLabelValues(stage).Inc() }
+func (AgentSink) LLMFallback(kind string) { LLMFallbackTotal.WithLabelValues(kind).Inc() }
 
 func (AgentSink) TTFB(service string, d time.Duration) {
 	ms := float64(d.Milliseconds())

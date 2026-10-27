@@ -85,6 +85,17 @@ type Config struct {
 	// MAX_CALL_DURATION_SECONDS to enforce one.
 	MaxCallDuration time.Duration
 
+	// LLMRetries (LLM_RETRIES, default 2) is how many extra attempts an LLM
+	// request gets after a 429/502/503/504 or a failed connection, waiting
+	// at most LLMRetryMaxWait (LLM_RETRY_MAX_WAIT_MS, default 2000) before
+	// each. LLMMaxFailedTurns (LLM_MAX_FAILED_TURNS, default 3, 0 = never)
+	// consecutive turns with no reply end the call. LLMFallbackText
+	// (LLM_FALLBACK_TEXT) replaces the spoken apology after a failed turn.
+	LLMRetries        int
+	LLMRetryMaxWait   time.Duration
+	LLMMaxFailedTurns int
+	LLMFallbackText   string
+
 	// MediaDeadTimeout bounds how long a call's inbound media may stay
 	// completely silent before Vaani proactively hangs it up -- a second layer
 	// alongside Asterisk's own rtptimeout (deploy/asterisk/rtp.conf), which only
@@ -321,6 +332,31 @@ func Load() (Config, error) {
 	}
 
 	cfg.MaxCallDuration = time.Duration(maxCallSeconds) * time.Second
+
+	if cfg.LLMRetries, err = getEnvInt("LLM_RETRIES", 2); err != nil {
+		return Config{}, err
+	}
+
+	retryWaitMs, err := getEnvInt("LLM_RETRY_MAX_WAIT_MS", 2000)
+	if err != nil {
+		return Config{}, err
+	}
+
+	if cfg.LLMRetries < 0 || retryWaitMs < 0 {
+		return Config{}, fmt.Errorf("config: LLM_RETRIES and LLM_RETRY_MAX_WAIT_MS must be >= 0")
+	}
+
+	cfg.LLMRetryMaxWait = time.Duration(retryWaitMs) * time.Millisecond
+
+	if cfg.LLMMaxFailedTurns, err = getEnvInt("LLM_MAX_FAILED_TURNS", 3); err != nil {
+		return Config{}, err
+	}
+
+	if cfg.LLMMaxFailedTurns < 0 {
+		return Config{}, fmt.Errorf("config: LLM_MAX_FAILED_TURNS must be >= 0 (0 never ends the call), got %d", cfg.LLMMaxFailedTurns)
+	}
+
+	cfg.LLMFallbackText = getEnv("LLM_FALLBACK_TEXT", "")
 
 	mediaDeadSeconds, err := getEnvInt("MEDIA_DEAD_TIMEOUT_SECONDS", 30)
 	if err != nil {

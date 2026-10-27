@@ -9,8 +9,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -43,6 +45,47 @@ const streamIdleTimeout = 30 * time.Second
 
 // errStreamIdle is the cause of a Stream ended by streamIdleTimeout.
 var errStreamIdle = errors.New("llm: stream idle timeout")
+
+// StatusError is a non-2xx response from the provider.
+type StatusError struct {
+	Code       int
+	Status     string
+	Body       string
+	RetryAfter time.Duration // the Retry-After header, 0 when absent
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("llm: non-2xx response: %s: %s", e.Status, e.Body)
+}
+
+// requestError is a failure to get any response (connection reset, DNS...).
+type requestError struct{ err error }
+
+func (e *requestError) Error() string { return "llm: request: " + e.err.Error() }
+func (e *requestError) Unwrap() error { return e.err }
+
+// retryable reports whether err happened before the provider sent any reply,
+// and is the kind a second attempt can fix: rate limiting, a gateway or
+// overload error, or a failed connection.
+func retryable(ctx context.Context, err error) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+
+	var se *StatusError
+	if errors.As(err, &se) {
+		switch se.Code {
+		case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+			return true
+		}
+
+		return false
+	}
+
+	var re *requestError
+
+	return errors.As(err, &re)
+}
 
 // Message is one OpenAI-format chat message. An assistant message that
 // called tools carries ToolCalls (Content may be empty); each tool's result
@@ -120,11 +163,21 @@ type Client struct {
 	// cut short (barge-in, error) never reaches the usage chunk, so its tokens
 	// go uncounted.
 	OnUsage func(Usage)
+
+	// OnRetry, if set, is told how a Stream that needed retries ended:
+	// "recovered" (a later attempt worked) or "exhausted" (it still failed).
+	OnRetry func(result string)
+
+	// Retries is how many extra attempts a retryable failure gets (0 = none);
+	// RetryMaxWait caps the wait before each, including a Retry-After.
+	Retries      int
+	RetryMaxWait time.Duration
 }
 
-// NewClient creates a Client. baseURL is trimmed of a trailing slash.
+// NewClient creates a Client with 2 retries of at most 2s each. baseURL is
+// trimmed of a trailing slash.
 func NewClient(baseURL, apiKey, model string) *Client {
-	return &Client{baseURL: strings.TrimSuffix(baseURL, "/"), apiKey: apiKey, model: model, idleTimeout: streamIdleTimeout}
+	return &Client{baseURL: strings.TrimSuffix(baseURL, "/"), apiKey: apiKey, model: model, idleTimeout: streamIdleTimeout, Retries: 2, RetryMaxWait: 2 * time.Second}
 }
 
 // Stream sends messages (and tools, if any) with stream:true and calls
@@ -147,11 +200,57 @@ func (c *Client) Stream(ctx context.Context, messages []Message, tools []Tool, o
 	defer idle.Stop()
 
 	calls, err := c.stream(ctx, messages, tools, onToken, func() { idle.Reset(c.idleTimeout) })
+
+	retried := false
+
+	for attempt := 1; err != nil && attempt <= c.Retries && retryable(ctx, err); attempt++ {
+		if !sleepCtx(ctx, c.retryWait(attempt, err)) {
+			break
+		}
+
+		retried = true
+		calls, err = c.stream(ctx, messages, tools, onToken, func() { idle.Reset(c.idleTimeout) })
+	}
+
+	if retried && c.OnRetry != nil && ctx.Err() == nil {
+		if err == nil {
+			c.OnRetry("recovered")
+		} else {
+			c.OnRetry("exhausted")
+		}
+	}
+
 	if err != nil && errors.Is(context.Cause(ctx), errStreamIdle) {
 		return nil, fmt.Errorf("%w: nothing received for %s", errStreamIdle, c.idleTimeout)
 	}
 
 	return calls, err
+}
+
+// retryWait is 300ms x attempt plus jitter, or the provider's Retry-After
+// when it gave one, never more than RetryMaxWait.
+func (c *Client) retryWait(attempt int, err error) time.Duration {
+	wait := time.Duration(attempt)*300*time.Millisecond + rand.N(200*time.Millisecond)
+
+	var se *StatusError
+	if errors.As(err, &se) && se.RetryAfter > 0 {
+		wait = se.RetryAfter
+	}
+
+	return min(wait, c.RetryMaxWait)
+}
+
+// sleepCtx waits d, reporting false if ctx ended first.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 func (c *Client) stream(ctx context.Context, messages []Message, tools []Tool, onToken func(string), alive func()) ([]ToolCall, error) {
@@ -195,13 +294,18 @@ func (c *Client) stream(ctx context.Context, messages []Message, tools []Tool, o
 
 	resp, err := SharedHTTPClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("llm: request: %w", err)
+		return nil, &requestError{err}
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("llm: non-2xx response: %s: %s", resp.Status, body)
+		se := &StatusError{Code: resp.StatusCode, Status: resp.Status, Body: string(body)}
+		if secs, err := strconv.Atoi(resp.Header.Get("Retry-After")); err == nil && secs > 0 {
+			se.RetryAfter = time.Duration(secs) * time.Second
+		}
+
+		return nil, se
 	}
 
 	scanner := bufio.NewScanner(resp.Body)

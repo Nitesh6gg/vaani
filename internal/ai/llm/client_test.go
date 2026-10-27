@@ -314,3 +314,106 @@ func TestClient_Stream_TrimsTrailingSlashFromBaseURL(t *testing.T) {
 	assert.Equal(t, "/chat/completions", gotPath)
 	assert.False(t, strings.HasSuffix(c.baseURL, "/"))
 }
+
+// flakyServer answers the first len(codes) requests with those statuses (and
+// retryAfter, if set), then streams "ok". hits counts the requests.
+func flakyServer(codes []int, retryAfter string, hits *int) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		*hits++
+		if *hits <= len(codes) {
+			if retryAfter != "" {
+				w.Header().Set("Retry-After", retryAfter)
+			}
+
+			http.Error(w, "busy", codes[*hits-1])
+
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"ok"}}]}`)
+		_, _ = fmt.Fprintln(w, `data: [DONE]`)
+	}))
+}
+
+func TestClient_Stream_Retries(t *testing.T) {
+	cases := []struct {
+		name       string
+		codes      []int
+		retries    int
+		wantHits   int
+		wantResult string // OnRetry
+		wantErr    bool
+	}{
+		{"429 then ok recovers", []int{429}, 2, 2, "recovered", false},
+		{"two 503s then ok", []int{503, 503}, 2, 3, "recovered", false},
+		{"always 429 is exhausted", []int{429, 429, 429, 429}, 2, 3, "exhausted", true},
+		{"400 is not retried", []int{400}, 2, 1, "", true},
+		{"retries off", []int{429}, 0, 1, "", true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var hits int
+
+			srv := flakyServer(tc.codes, "", &hits)
+			defer srv.Close()
+
+			var result string
+
+			c := NewClient(srv.URL, "k", "m")
+			c.Retries, c.RetryMaxWait = tc.retries, 10*time.Millisecond
+			c.OnRetry = func(r string) { result = r }
+
+			var got []string
+			_, err := c.Stream(context.Background(), nil, nil, func(s string) { got = append(got, s) })
+
+			assert.Equal(t, tc.wantHits, hits)
+			assert.Equal(t, tc.wantResult, result)
+
+			if tc.wantErr {
+				var se *StatusError
+				require.ErrorAs(t, err, &se)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, []string{"ok"}, got)
+			}
+		})
+	}
+}
+
+func TestClient_Stream_RetryAfterIsCapped(t *testing.T) {
+	var hits int
+
+	srv := flakyServer([]int{429}, "30", &hits)
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "k", "m")
+	c.Retries, c.RetryMaxWait = 1, 50*time.Millisecond
+
+	start := time.Now()
+	_, err := c.Stream(context.Background(), nil, nil, func(string) {})
+
+	require.NoError(t, err)
+	assert.Less(t, time.Since(start), 2*time.Second)
+}
+
+func TestClient_Stream_CancelDuringRetryWait(t *testing.T) {
+	var hits int
+
+	srv := flakyServer([]int{429, 429}, "", &hits)
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "k", "m")
+	c.Retries, c.RetryMaxWait = 2, time.Minute
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err := c.Stream(ctx, nil, nil, func(string) {})
+
+	require.Error(t, err)
+	assert.Less(t, time.Since(start), 2*time.Second)
+	assert.Equal(t, 1, hits)
+}

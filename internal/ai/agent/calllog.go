@@ -18,6 +18,7 @@ const (
 	EndReasonTransfer     = "transfer_call"                   // handed over to a transfer destination
 	EndReasonCallerSilent = "user_idle_max_duration_exceeded" // caller silent twice
 	EndReasonMaxDuration  = "call_duration_exceeded"          // max_call_duration reached
+	EndReasonLLMDown      = "llm_unavailable"                 // the LLM failed several turns in a row
 	EndReasonUserHangup   = "user_hangup"                     // none of the above: the caller hung up
 )
 
@@ -126,6 +127,7 @@ func (l *CallLog) TurnStarted()        { l.count(func() { l.replies++ }) }
 // acts on these two Sink events.
 func (l *CallLog) TTFB(string, time.Duration)           {}
 func (l *CallLog) ToolCall(string, bool, time.Duration) {}
+func (l *CallLog) LLMFallback(string)                   {}
 
 // SpeechHeld / SpeechDelivered: see CallSummary.HeldSpeech.
 func (l *CallLog) SpeechHeld()      { l.count(func() { l.heldSpeech++ }) }
@@ -230,6 +232,12 @@ func (m multiSink) Error(stage string) {
 func (m multiSink) TTFB(service string, d time.Duration) {
 	for _, s := range m {
 		s.TTFB(service, d)
+	}
+}
+
+func (m multiSink) LLMFallback(kind string) {
+	for _, s := range m {
+		s.LLMFallback(kind)
 	}
 }
 

@@ -309,6 +309,8 @@ func (b *Builder) newAgentHandler(ctx context.Context, c Call, hooks Hooks) medi
 	// Conversation turns and variable extraction share this client.
 	llmClient := llm.NewClient(svc.LLM.BaseURL, svc.LLM.APIKey, svc.LLM.Model)
 	llmClient.OnUsage = func(u llm.Usage) { callLog.LLMUsage(dograh.UsageKeyLLM+svc.LLM.Model, u) }
+	llmClient.Retries, llmClient.RetryMaxWait = b.cfg.LLMRetries, b.cfg.LLMRetryMaxWait
+	llmClient.OnRetry = metrics.LLMRetry
 
 	h := agent.NewHandler(ctx, callID, agent.Config{
 		STT: sttClient,
@@ -323,6 +325,11 @@ func (b *Builder) newAgentHandler(ctx context.Context, c Call, hooks Hooks) medi
 			})
 		},
 		LLM:         llmClient,
+		LLMFailures: agent.LLMFailurePolicy{
+			MaxFailedTurns: b.cfg.LLMMaxFailedTurns,
+			Apology:        b.cfg.LLMFallbackText,
+			Language:       svc.TTS.Language,
+		},
 		Start:       wf.Start,
 		IdleTimeout: wf.IdleTimeout,
 		MaxDuration: wf.MaxDuration,

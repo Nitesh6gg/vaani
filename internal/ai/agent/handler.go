@@ -91,6 +91,9 @@ type Sink interface {
 	// "llm", or "tts" -- same values as CallLog.TTFBMeasured, which records
 	// the same spans for Dograh's UI; this is the Prometheus-metrics side).
 	TTFB(service string, d time.Duration)
+	// LLMFallback: a failed LLM turn was covered by a fixed spoken line
+	// (kind "apology": asks the caller to repeat; "hangup": goodbye, call ends).
+	LLMFallback(kind string)
 	// ToolCall: a tool run (runTool's t.Run branch) finished, ok reporting
 	// whether it returned an error.
 	ToolCall(tool string, ok bool, d time.Duration)
@@ -105,6 +108,7 @@ func (NoopSink) FalseInterruption()                   {}
 func (NoopSink) TurnStarted()                         {}
 func (NoopSink) Error(string)                         {}
 func (NoopSink) TTFB(string, time.Duration)           {}
+func (NoopSink) LLMFallback(string)                   {}
 func (NoopSink) ToolCall(string, bool, time.Duration) {}
 
 // Config bundles one call's agent dependencies.
@@ -193,6 +197,10 @@ type Config struct {
 	AckEndMargin time.Duration
 
 	Sink Sink
+	// LLMFailures says what happens when the LLM fails a turn; see
+	// LLMFailurePolicy. The zero value speaks the default apology and never
+	// ends the call.
+	LLMFailures LLMFailurePolicy
 	// Log, if set, records the call for Dograh's call history (see CallLog).
 	Log *CallLog
 }
@@ -436,6 +444,11 @@ type Handler struct {
 	// hangs up once the reply has played out.
 	turnToolMsgs    []llm.Message
 	hangupAfterTurn bool
+
+	// llmFailures counts consecutive turns the LLM failed with nothing
+	// spoken; any turn that works resets it. Written by runLLMTurn goroutines
+	// (one at a time: a new turn starts only after the old one is cancelled).
+	llmFailures atomic.Int32
 	// turn counts the caller's accepted turns (the log's turn=); turnTTFA and
 	// turnReplyLatency are the current reply's first-audio timings, logged on
 	// its turn.agent line (zero: not measured).
@@ -1396,6 +1409,7 @@ func (h *Handler) runLLMTurn(ctx context.Context, history []llm.Message, ttsClie
 		toolMsgs     []llm.Message
 		endCall      bool
 		transferred  bool
+		spoke        bool // any model text reached the caller this turn
 		err          error
 	)
 
@@ -1447,6 +1461,8 @@ func (h *Handler) runLLMTurn(ctx context.Context, history []llm.Message, ttsClie
 				h.sendToTTS(ctx, ttsClient, chunk, gen)
 			}
 		})
+
+		spoke = spoke || said.Len() > 0
 
 		if ctx.Err() != nil {
 			// Cancelled by barge-in or call teardown; a barge-in already
@@ -1540,6 +1556,27 @@ func (h *Handler) runLLMTurn(ctx context.Context, history []llm.Message, ttsClie
 		if endCall || transferred {
 			break
 		}
+	}
+
+	// A failed turn with nothing said would leave the caller in silence: say a
+	// fixed line instead (not through the LLM, which is what's failing), and
+	// after enough in a row, say goodbye and hang up.
+	if err != nil && ctx.Err() == nil && !spoke {
+		n := int(h.llmFailures.Add(1))
+		text, kind, hangup := h.cfg.LLMFailures.line(n)
+
+		h.cfg.Sink.LLMFallback(kind)
+		h.sendToTTS(ctx, ttsClient, text+" ", gen)
+		slog.Warn("llm failed; spoke fallback", "call_id", h.callID, "gen", gen, "event", "llm.fallback",
+			"kind", kind, "consecutive_failures", n)
+
+		if hangup {
+			endCall = true
+
+			h.cfg.Log.Ending(EndReasonLLMDown)
+		}
+	} else if err == nil {
+		h.llmFailures.Store(0)
 	}
 
 	// At an end node the reply just generated is the closing line: hang up

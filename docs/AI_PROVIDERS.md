@@ -176,6 +176,21 @@ logs what it resolved to, never the keys:
   said, nothing else is spoken, and the caller-silence clock starts. There is
   no retry or spoken fallback yet.
 
+### When the LLM fails (429, overload)
+
+`llm.Client.Stream` retries a request that fails *before any reply bytes*
+(HTTP 429/502/503/504 or a failed connection): `LLM_RETRIES` extra attempts
+(default 2), waiting 300 ms x attempt + jitter or the `Retry-After` header,
+never more than `LLM_RETRY_MAX_WAIT_MS` (2000). This covers the agent's turns,
+variable extraction and QA. Outcomes: `vaani_llm_retries_total{result=recovered|exhausted}`.
+
+If a turn still fails with nothing said, the agent speaks a fixed line through
+TTS (default Hindi for `hi-*` TTS languages, else English; `LLM_FALLBACK_TEXT`
+overrides) instead of staying silent, and the caller can repeat. After
+`LLM_MAX_FAILED_TURNS` (3) failed turns in a row it says goodbye and hangs up,
+end reason `llm_unavailable`. Counted in `vaani_llm_fallback_total{kind=apology|hangup}`.
+Retries cannot raise a provider's rate limit: sustained overload still fails.
+
 ## TTS — Sarvam Bulbul (e.g. `bulbul:v3`)
 
 - Transport: WebSocket, streaming, requesting 16kHz output -- matching the
