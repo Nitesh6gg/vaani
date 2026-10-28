@@ -96,6 +96,14 @@ func init() {
 		AgentErrorsTotal.WithLabelValues(stage)
 	}
 
+	for _, d := range []string{"inbound", "outbound"} {
+		CallsStartedTotal.WithLabelValues(d)
+	}
+
+	for _, st := range []string{"connected", "busy", "no-answer", "rejected", "failed"} {
+		CampaignOutcomesTotal.WithLabelValues(st)
+	}
+
 	for _, r := range []string{"recovered", "exhausted"} {
 		LLMRetriesTotal.WithLabelValues(r)
 	}

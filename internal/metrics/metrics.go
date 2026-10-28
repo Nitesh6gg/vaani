@@ -25,6 +25,11 @@ var (
 		Help: "Number of calls currently bridged to the media plane.",
 	})
 
+	CallsStartedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "vaani_calls_started_total",
+		Help: "Calls bridged to the media plane (answered), by direction (inbound, outbound). Rate it for calls started per minute.",
+	}, []string{"direction"})
+
 	CallDurationSeconds = promauto.NewHistogram(prometheus.HistogramOpts{
 		Name:    "vaani_call_duration_seconds",
 		Help:    "Duration of completed calls, from channel staging (answer) to teardown.",

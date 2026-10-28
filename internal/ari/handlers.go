@@ -477,6 +477,7 @@ func (m *Manager) completeBridge(c *call) {
 	m.mu.Unlock()
 
 	metrics.CallsActive.Inc()
+	metrics.CallsStartedTotal.WithLabelValues(c.Info.Direction).Inc()
 	slog.Info("call bridged", "event", "call.bridged",
 		"call_id", c.ID, "external_id", c.ExternalID, "port", c.Port,
 		"caller_number", c.Info.CallerNumber, "called_number", c.Info.CalledNumber, "direction", c.Info.Direction)

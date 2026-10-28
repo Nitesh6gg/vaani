@@ -362,6 +362,7 @@ func (m *Manager) runCall(c *call, ws *websocket.Conn, h http.Header) {
 	answered := time.Now()
 
 	metrics.CallsActive.Inc()
+	metrics.CallsStartedTotal.WithLabelValues("inbound").Inc()
 	defer func() {
 		metrics.CallsActive.Dec()
 		metrics.CallDurationSeconds.Observe(time.Since(answered).Seconds())
