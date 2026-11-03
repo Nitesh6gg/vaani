@@ -120,6 +120,7 @@ Real-time voice agent: Asterisk ARI (telephony) + Go media plane + Sarvam STT/TT
 - AI provider specs: `docs/AI_PROVIDERS.md`
 - Media pipeline: `docs/AUDIO_PIPELINE.md`
 - Outbound campaigns: `docs/OUTBOUND.md`
+- Load-test results and capacity (update after every test): `docs/BENCHMARK.md`
 - Build phases: `PLAN.md`
 
 ## Testing

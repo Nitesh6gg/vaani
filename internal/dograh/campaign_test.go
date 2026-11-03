@@ -228,6 +228,25 @@ func TestOrgConcurrencyLimit(t *testing.T) {
 	assert.False(t, ok, "unset: the caller's default applies")
 }
 
+func TestOrgDialRate(t *testing.T) {
+	s, pool := campaignDB(t)
+	sqlExec(t, pool, `INSERT INTO organization_configurations (organization_id, key, value) VALUES
+		(1, 'DIAL_RATE_LIMIT_PER_SECOND', '{"value": 8}'),
+		(1, 'CONCURRENT_CALL_LIMIT', '{"value": 12}'),
+		(3, 'DIAL_RATE_LIMIT_PER_SECOND', '{"value": null}')`)
+
+	n, ok, err := s.OrgDialRate(context.Background(), 1)
+	require.NoError(t, err)
+	assert.True(t, ok)
+	assert.Equal(t, 8, n, "its own key, not the concurrency one")
+
+	for _, org := range []int{2, 3} {
+		_, ok, err = s.OrgDialRate(context.Background(), org)
+		require.NoError(t, err)
+		assert.False(t, ok, "org %d: no row, or a cleared one: the campaign's own rate applies", org)
+	}
+}
+
 func TestClaimRuns_RetriesFirstThenLoadingOrder(t *testing.T) {
 	s, pool := campaignDB(t)
 	now := time.Now()

@@ -279,17 +279,30 @@ func (s *Store) VaaniCampaigns(ctx context.Context) ([]Campaign, error) {
 // OrgConcurrencyLimit is the organization's CONCURRENT_CALL_LIMIT, and false
 // when it has none set (the caller then uses its default).
 func (s *Store) OrgConcurrencyLimit(ctx context.Context, orgID int) (int, bool, error) {
+	return s.orgConfigInt(ctx, orgID, "CONCURRENT_CALL_LIMIT")
+}
+
+// OrgDialRate is the organization's DIAL_RATE_LIMIT_PER_SECOND (set in Dograh's
+// superadmin page), and false when it has none set (the campaign's own
+// rate_limit_per_second then applies).
+func (s *Store) OrgDialRate(ctx context.Context, orgID int) (int, bool, error) {
+	return s.orgConfigInt(ctx, orgID, "DIAL_RATE_LIMIT_PER_SECOND")
+}
+
+// orgConfigInt reads an integer organization_configurations value of the form
+// {"value": n}; false when the row, or the number in it, is missing.
+func (s *Store) orgConfigInt(ctx context.Context, orgID int, key string) (int, bool, error) {
 	var raw string
 
 	err := s.pool.QueryRow(ctx, `
 		SELECT value::text FROM organization_configurations
-		WHERE organization_id = $1 AND key = 'CONCURRENT_CALL_LIMIT'`, orgID).Scan(&raw)
+		WHERE organization_id = $1 AND key = $2`, orgID, key).Scan(&raw)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, false, nil
 	}
 
 	if err != nil {
-		return 0, false, fmt.Errorf("dograh: org %d concurrency: %w", orgID, err)
+		return 0, false, fmt.Errorf("dograh: org %d %s: %w", orgID, key, err)
 	}
 
 	var v struct {

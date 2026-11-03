@@ -21,6 +21,7 @@ type Store interface {
 	CampaignRunning(ctx context.Context, id int) (bool, error)
 	SetCampaignState(ctx context.Context, id int, from, to string) (bool, error)
 	OrgConcurrencyLimit(ctx context.Context, orgID int) (int, bool, error)
+	OrgDialRate(ctx context.Context, orgID int) (int, bool, error)
 	WalletBlocks(ctx context.Context, orgID int) bool
 	ClaimRuns(ctx context.Context, campaignID, limit int, now time.Time) ([]dograh.QueuedRun, error)
 	SetRunState(ctx context.Context, runID int, state string) error
@@ -210,6 +211,22 @@ func (r *Runner) orgLimit(ctx context.Context, c dograh.Campaign) (int, error) {
 	return limit, nil
 }
 
+// dialRate is how many calls per second campaign c's organization may start:
+// its DIAL_RATE_LIMIT_PER_SECOND, which overrides the campaign's own
+// rate_limit_per_second, or that rate when the organization has none set.
+func (r *Runner) dialRate(ctx context.Context, c dograh.Campaign) (int, error) {
+	rate, ok, err := r.store.OrgDialRate(ctx, c.OrganizationID)
+	if err != nil {
+		return 0, err
+	}
+
+	if !ok {
+		return c.RatePerSecond, nil
+	}
+
+	return max(rate, 1), nil
+}
+
 // dialOne takes the next contact of campaign c and places the call, if the
 // campaign is running, inside its window, healthy, paid for, and under the
 // organization's rate and concurrency limits.
@@ -239,7 +256,13 @@ func (r *Runner) dialOne(ctx context.Context, c dograh.Campaign) (step, time.Dur
 		return stepStop, 0
 	}
 
-	ok, err := r.lim.AcquireToken(ctx, c.OrganizationID, c.RatePerSecond)
+	rate, err := r.dialRate(ctx, c)
+	if err != nil {
+		slog.Error("campaign: organization dial rate unreadable", "component", "campaign", "event", "campaign.limit_failed", "campaign_id", c.ID, "error", err)
+		return stepStop, 0
+	}
+
+	ok, err := r.lim.AcquireToken(ctx, c.OrganizationID, rate)
 	if err != nil {
 		slog.Error("campaign: rate limiter failed", "component", "campaign", "event", "campaign.limiter_failed", "campaign_id", c.ID, "error", err)
 		return stepStop, 0

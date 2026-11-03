@@ -50,6 +50,15 @@ workflow, else the first of `from_numbers`.
 3. Takes a rate token and a concurrency slot (Redis), **then** claims one
    contact (`queued_runs`, retries first, `FOR UPDATE SKIP LOCKED`). A contact is
    never held while waiting for a slot.
+
+   Where the limits are set: concurrency and dial rate are both in Dograh's
+   superadmin → Organizations → **Concurrency** dialog (org keys
+   `CONCURRENT_CALL_LIMIT` and `DIAL_RATE_LIMIT_PER_SECOND`, 1–20 calls/s). The
+   dial rate overrides every campaign's own `campaigns.rate_limit_per_second`
+   (default 1, not editable in Dograh's campaign UI); blank = that column applies.
+   Both are read on every dial, so a change applies to a running campaign
+   without pause/resume. The campaign's `max_concurrency` can only lower the
+   concurrency limit.
 4. Creates the Dograh run (`WR-CAMPAIGN-<campaign>-<row>`, call type outbound,
    state `initialized`) so even an unanswered call is recorded, then dials
    (`internal/ari/outbound.go`): `POST /channels` into Stasis app `vaani` with

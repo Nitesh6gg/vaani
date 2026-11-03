@@ -29,6 +29,7 @@ type memStore struct {
 	failedRows int
 	notConn    []string // statuses of runs completed as not connected
 	orgLimit   *int
+	orgRate    *int
 	wallet     bool
 	settings   dograh.DialSettings
 	paused     []string
@@ -85,6 +86,14 @@ func (s *memStore) OrgConcurrencyLimit(context.Context, int) (int, bool, error) 
 	}
 
 	return *s.orgLimit, true, nil
+}
+
+func (s *memStore) OrgDialRate(context.Context, int) (int, bool, error) {
+	if s.orgRate == nil {
+		return 0, false, nil
+	}
+
+	return *s.orgRate, true, nil
 }
 
 func (s *memStore) WalletBlocks(context.Context, int) bool { return s.wallet }
@@ -357,6 +366,39 @@ func TestRunner_RateLimitWaits(t *testing.T) {
 	res, _ = rr.r.dialOne(ctx, rr.camp)
 	assert.Equal(t, stepDialed, res)
 }
+
+func TestRunner_OrgDialRateOverridesTheCampaignRate(t *testing.T) {
+	for name, tt := range map[string]struct {
+		orgRate *int
+		want    int
+	}{
+		"no org rate: the campaign's 2":  {nil, 2},
+		"org rate 4 beats the campaign": {ptr(4), 4},
+	} {
+		t.Run(name, func(t *testing.T) {
+			rr := newRunnerRig(t, 8)
+			ten := 10
+			rr.store.orgLimit = &ten
+			rr.store.orgRate = tt.orgRate
+			rr.camp.RatePerSecond = 2
+
+			dialed := 0
+
+			for ; dialed < 8; dialed++ {
+				res, _ := rr.r.dialOne(context.Background(), rr.camp)
+				if res != stepDialed {
+					break
+				}
+
+				rr.advance(10 * time.Millisecond)
+			}
+
+			assert.Equal(t, tt.want, dialed, "starts inside one second")
+		})
+	}
+}
+
+func ptr(n int) *int { return &n }
 
 func TestRunner_DoesNotDialWhenNotAllowed(t *testing.T) {
 	ist, err := time.LoadLocation("Asia/Kolkata")
