@@ -590,6 +590,13 @@ func (h *Handler) nodeName() string {
 // its last words: Config.Log is then complete.
 func (h *Handler) Done() <-chan struct{} { return h.done }
 
+// agentError counts a pipeline error by stage and logs it with the stage, so a
+// dashboard panel of vaani_agent_errors_total can link to the matching lines.
+func (h *Handler) agentError(stage string) {
+	h.cfg.Sink.Error(stage)
+	slog.Warn("agent error", "call_id", h.callID, "event", "agent.error", "stage", stage)
+}
+
 // Close ends the STT connection. The current TTS connection (if any) and the
 // background goroutines are cleaned up when the call's context is cancelled,
 // not here -- see the concurrency-design comment on Handler.
@@ -613,7 +620,7 @@ func (h *Handler) ProcessFrame(_ context.Context, _ string, pcm []byte) [][]byte
 	// of answers given over the agent: observed live, "महंगाई" transcribed as
 	// "हाँ जी" and "नहीं" with its first syllable missing.
 	if err := h.feedSTT(pcm); err != nil {
-		h.cfg.Sink.Error("stt")
+		h.agentError("stt")
 	}
 
 	if h.cfg.STTFlushAfter > 0 && h.clock != nil {
@@ -769,7 +776,7 @@ func (h *Handler) processSpeakingFrame(pcm []byte) [][]byte {
 	h.emptyTicks++
 	if h.emptyTicks >= speakingDrainTimeoutTicks {
 		h.emptyTicks = 0
-		h.cfg.Sink.Error("tts_drain_timeout")
+		h.agentError("tts_drain_timeout")
 		slog.Warn("speaking with empty outbound queue and no tts delivery-done for 10s; forcing turn end (tts connection likely dead)",
 			"call_id", h.callID)
 
@@ -834,7 +841,7 @@ func (h *Handler) maybeFlushSTT() {
 	h.sttFlushAt.Store(time.Now().UnixNano())
 
 	if err := h.cfg.STT.Flush(); err != nil {
-		h.cfg.Sink.Error("stt")
+		h.agentError("stt")
 		slog.Warn("stt flush failed", "call_id", h.callID, "event", "stt.error", "error", err)
 
 		return
@@ -1121,7 +1128,7 @@ func (h *Handler) openTTS(gen uint64) bool {
 
 	t, err := h.cfg.NewTTS()
 	if err != nil {
-		h.cfg.Sink.Error("tts_open")
+		h.agentError("tts_open")
 		h.state.Store(int32(StateListening))
 		slog.Error("tts open failed", "call_id", h.callID, "event", "tts.error", "gen", gen, "error", err)
 
@@ -1870,7 +1877,7 @@ func (h *Handler) sendToTTS(ctx context.Context, ttsClient tts.Client, text stri
 	}
 
 	if err := ttsClient.Speak(text, gen); err != nil {
-		h.cfg.Sink.Error("tts_speak")
+		h.agentError("tts_speak")
 
 		if ctx.Err() != nil {
 			slog.Debug("tts speak failed after turn cancellation; expected",
@@ -1993,12 +2000,12 @@ func (h *Handler) handleTTSClosed(conn uint64) {
 	switch State(h.state.Load()) {
 	case StateThinking:
 		slog.Warn("tts connection lost before the reply's audio; ending the turn", "call_id", h.callID, "event", "tts.lost", "gen", h.curGen)
-		h.cfg.Sink.Error("tts_closed")
+		h.agentError("tts_closed")
 		h.cancelTurn()
 		h.finishTurn(h.curGen)
 	case StateSpeaking:
 		slog.Warn("tts connection lost mid-reply; playing what arrived, then ending the turn", "call_id", h.callID, "event", "tts.lost", "gen", h.curGen)
-		h.cfg.Sink.Error("tts_closed")
+		h.agentError("tts_closed")
 		h.cancelTurn()
 		h.ttsDeliveryDone.Store(true) // no more audio is coming for this generation
 	}
@@ -2084,7 +2091,7 @@ func (h *Handler) handleTTSAudio(pcm []byte, gen, req uint64, text string) {
 		select {
 		case h.outbound <- outFrame{pcm: frame, req: req, gen: gen}:
 		default:
-			h.cfg.Sink.Error("tts_outbound_full")
+			h.agentError("tts_outbound_full")
 
 			if h.dropWarnedGen != gen {
 				h.dropWarnedGen = gen
@@ -2273,7 +2280,7 @@ func (h *Handler) startTurnChunks() {
 
 func (h *Handler) handleLLMDone(e llmDoneEvent) {
 	if e.err != nil {
-		h.cfg.Sink.Error("llm")
+		h.agentError("llm")
 	}
 
 	if e.gen != h.curGen {
@@ -2409,7 +2416,7 @@ func (h *Handler) cutReply() {
 
 	if h.tts != nil {
 		if err := h.tts.Cancel(); err != nil {
-			h.cfg.Sink.Error("tts_cancel")
+			h.agentError("tts_cancel")
 		}
 
 		h.tts = nil // reopen fresh next turn; this connection is being torn down

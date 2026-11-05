@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -195,7 +196,18 @@ func ConfigureLogging() (shutdown func(context.Context) error) {
 
 	applied = logSettings{env: env, format: format, level: strings.ToLower(level.String()), pii: pii}
 
-	return otelShutdown
+	// Traces use the same endpoint variables, so they are set up (and flushed)
+	// along with the logs.
+	traceShutdown, err := otelTraces(context.Background(), env)
+	if err != nil {
+		slog.Warn("otlp trace export disabled; could not configure it", "error", err)
+
+		traceShutdown = func(context.Context) error { return nil }
+	}
+
+	return func(ctx context.Context) error {
+		return errors.Join(traceShutdown(ctx), otelShutdown(ctx))
+	}
 }
 
 // parseLogPII reads LOG_PII: whether logs may carry personal data in full

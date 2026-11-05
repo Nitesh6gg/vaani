@@ -15,6 +15,8 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+
 	"github.com/nitesh/vaani/assets"
 	"github.com/nitesh/vaani/internal/ai/agent"
 	"github.com/nitesh/vaani/internal/ai/agent/tenvad"
@@ -283,6 +285,11 @@ func (b *Builder) newAgentHandler(ctx context.Context, c Call, hooks Hooks) medi
 
 	svc := wf.Services
 
+	// The call's trace: its LLM requests are child spans. Ended once the agent
+	// has left the call (just below, after the handler exists).
+	ctx, span := config.StartCallSpan(ctx, callID)
+	span.SetAttributes(attribute.Int("workflow.id", wf.ID), attribute.Int64("run.id", c.RunID))
+
 	sttClient, err := dialWithRetry(ctx, callID, "stt connect", func() (stt.Client, error) {
 		return stt.NewSarvamClient(ctx, callID, stt.Config{
 			APIKey:   svc.STT.APIKey,
@@ -296,6 +303,8 @@ func (b *Builder) newAgentHandler(ctx context.Context, c Call, hooks Hooks) medi
 	})
 	if err != nil {
 		slog.Error("agent: STT connect failed after retries, falling back to loopback", "call_id", callID, "component", "stt", "event", "stt.connect_failed", "error", err)
+		span.End()
+
 		return nil
 	}
 
@@ -311,6 +320,7 @@ func (b *Builder) newAgentHandler(ctx context.Context, c Call, hooks Hooks) medi
 	llmClient.OnUsage = func(u llm.Usage) { callLog.LLMUsage(dograh.UsageKeyLLM+svc.LLM.Model, u) }
 	llmClient.Retries, llmClient.RetryMaxWait = b.cfg.LLMRetries, b.cfg.LLMRetryMaxWait
 	llmClient.OnRetry = metrics.LLMRetry
+	llmClient.OnRequest = func(i llm.RequestInfo) { logLLMRequest(callID, svc.LLM.Model, i) }
 
 	h := agent.NewHandler(ctx, callID, agent.Config{
 		STT: sttClient,
@@ -358,6 +368,11 @@ func (b *Builder) newAgentHandler(ctx context.Context, c Call, hooks Hooks) medi
 	})
 
 	rec := media.NewMixRecorder(h)
+
+	go func() {
+		<-h.Done()
+		span.End()
+	}()
 
 	// recordRun logs about this call after its teardown: keep its trace_id
 	// (and run_id) on those lines until it's done.
@@ -472,6 +487,32 @@ func (b *Builder) recordRun(c Call, wf *dograh.Workflow, callLog *agent.CallLog,
 
 // logCallSummary writes the call's one summary line: what to chart and alert
 // on (duration, turns, reply latency, interruptions, errors, outcome).
+// slowLLMRequest is how long a successful LLM request takes to deserve an INFO
+// line; faster ones are DEBUG, failed ones WARN.
+const slowLLMRequest = 3 * time.Second
+
+// logLLMRequest records one LLM HTTP attempt with the ids its provider's
+// support asks for (request_id, completion_id).
+func logLLMRequest(callID, model string, i llm.RequestInfo) {
+	level := slog.LevelDebug
+
+	switch {
+	case i.Err != nil && !errors.Is(i.Err, context.Canceled):
+		level = slog.LevelWarn
+	case i.Err == nil && i.Total >= slowLLMRequest:
+		level = slog.LevelInfo
+	}
+
+	args := []any{"call_id", callID, "event", "llm.request", "model", model, "attempt", i.Attempt,
+		"status", i.Status, "request_id", i.HeaderID, "completion_id", i.ChunkID,
+		"headers_ms", i.Headers.Milliseconds(), "duration_ms", i.Total.Milliseconds()}
+	if i.Err != nil {
+		args = append(args, "error", i.Err)
+	}
+
+	slog.Log(context.Background(), level, "llm request", args...)
+}
+
 func logCallSummary(callID string, duration time.Duration, disposition string, s agent.CallSummary, recordingBytes int) {
 	args := []any{"call_id", callID, "component", "agent", "event", "call.summary",
 		"duration_s", int(math.Round(duration.Seconds())), "disposition", disposition,

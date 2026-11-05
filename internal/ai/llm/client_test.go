@@ -417,3 +417,41 @@ func TestClient_Stream_CancelDuringRetryWait(t *testing.T) {
 	assert.Less(t, time.Since(start), 2*time.Second)
 	assert.Equal(t, 1, hits)
 }
+
+func TestClient_Stream_ReportsEachRequestWithItsIDs(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls++; calls == 1 {
+			w.Header().Set("X-Request-Id", "req-1")
+			http.Error(w, "busy", http.StatusServiceUnavailable)
+
+			return
+		}
+
+		w.Header().Set("X-Request-Id", "req-2")
+		_, _ = fmt.Fprintln(w, `data: {"id":"chatcmpl-9","choices":[{"delta":{"content":"hi"}}]}`)
+		_, _ = fmt.Fprintln(w, `data: [DONE]`)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "k", "m")
+	c.RetryMaxWait = time.Millisecond
+
+	var got []RequestInfo
+
+	c.OnRequest = func(i RequestInfo) { got = append(got, i) }
+
+	_, err := c.Stream(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, func(string) {})
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+
+	assert.Equal(t, 1, got[0].Attempt)
+	assert.Equal(t, http.StatusServiceUnavailable, got[0].Status)
+	assert.Equal(t, "req-1", got[0].HeaderID)
+	assert.Error(t, got[0].Err)
+
+	assert.Equal(t, 2, got[1].Attempt)
+	assert.Equal(t, "req-2", got[1].HeaderID)
+	assert.Equal(t, "chatcmpl-9", got[1].ChunkID)
+	assert.NoError(t, got[1].Err)
+}

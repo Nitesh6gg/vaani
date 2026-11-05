@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+
+	"github.com/nitesh/vaani/internal/ai/reqid"
 )
 
 // sarvamTTSBaseURL is Sarvam's production Bulbul v3 endpoint, used when
@@ -148,10 +150,12 @@ func (c *sarvamClient) dial(ctx context.Context) (*websocket.Conn, error) {
 	header := http.Header{}
 	header.Set("api-subscription-key", c.cfg.APIKey)
 
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, endpoint, header)
+	conn, resp, err := websocket.DefaultDialer.DialContext(ctx, endpoint, header)
 	if err != nil {
 		return nil, err
 	}
+
+	slog.Info("tts connected", "call_id", c.callID, "event", "tts.connected", "request_id", reqid.FromHeader(resp.Header))
 
 	return conn, nil
 }

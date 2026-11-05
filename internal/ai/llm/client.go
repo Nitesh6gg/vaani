@@ -15,7 +15,15 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+
+	"github.com/nitesh/vaani/internal/ai/reqid"
 )
+
+var tracer = otel.Tracer("vaani/llm")
 
 // SharedHTTPClient is the one global client for every outbound HTTP request
 // (LLM, Dograh http_api tools, MinIO uploads), per CLAUDE.md invariant #5:
@@ -151,6 +159,18 @@ func (u Usage) Add(o Usage) Usage {
 	}
 }
 
+// RequestInfo describes one HTTP attempt of a Stream: what to quote to the
+// provider's support, and how long the attempt took.
+type RequestInfo struct {
+	Attempt  int           // 1 for the first try
+	Status   int           // HTTP status, 0 when no response came
+	HeaderID string        // the response's request id header, if any
+	ChunkID  string        // the completion's own id, from the stream
+	Headers  time.Duration // until the response headers arrived
+	Total    time.Duration // until the attempt ended
+	Err      error         // nil when the stream completed
+}
+
 // Client streams chat completions from an OpenAI-compatible /chat/completions
 // endpoint (baseURL should NOT include the /chat/completions suffix).
 type Client struct {
@@ -167,6 +187,10 @@ type Client struct {
 	// OnRetry, if set, is told how a Stream that needed retries ended:
 	// "recovered" (a later attempt worked) or "exhausted" (it still failed).
 	OnRetry func(result string)
+
+	// OnRequest, if set, gets every HTTP attempt once it ends, including
+	// failed and cancelled ones.
+	OnRequest func(RequestInfo)
 
 	// Retries is how many extra attempts a retryable failure gets (0 = none);
 	// RetryMaxWait caps the wait before each, including a Retry-After.
@@ -199,7 +223,7 @@ func (c *Client) Stream(ctx context.Context, messages []Message, tools []Tool, o
 	idle := time.AfterFunc(c.idleTimeout, func() { cancel(errStreamIdle) })
 	defer idle.Stop()
 
-	calls, err := c.stream(ctx, messages, tools, onToken, func() { idle.Reset(c.idleTimeout) })
+	calls, err := c.stream(ctx, 1, messages, tools, onToken, func() { idle.Reset(c.idleTimeout) })
 
 	retried := false
 
@@ -209,7 +233,7 @@ func (c *Client) Stream(ctx context.Context, messages []Message, tools []Tool, o
 		}
 
 		retried = true
-		calls, err = c.stream(ctx, messages, tools, onToken, func() { idle.Reset(c.idleTimeout) })
+		calls, err = c.stream(ctx, attempt+1, messages, tools, onToken, func() { idle.Reset(c.idleTimeout) })
 	}
 
 	if retried && c.OnRetry != nil && ctx.Err() == nil {
@@ -253,7 +277,35 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-func (c *Client) stream(ctx context.Context, messages []Message, tools []Tool, onToken func(string), alive func()) ([]ToolCall, error) {
+func (c *Client) stream(ctx context.Context, attempt int, messages []Message, tools []Tool, onToken func(string), alive func()) (_ []ToolCall, err error) {
+	start := time.Now()
+	info := RequestInfo{Attempt: attempt}
+
+	ctx, span := tracer.Start(ctx, "llm.request")
+
+	defer func() {
+		info.Total, info.Err = time.Since(start), err
+
+		span.SetAttributes(
+			attribute.String("llm.model", c.model),
+			attribute.Int("llm.attempt", attempt),
+			attribute.Int("http.status_code", info.Status),
+			attribute.String("llm.request_id", info.HeaderID),
+			attribute.String("llm.completion_id", info.ChunkID),
+		)
+
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+
+		span.End()
+
+		if c.OnRequest != nil {
+			c.OnRequest(info)
+		}
+	}()
+
 	body := map[string]any{
 		"model":          c.model,
 		"messages":       messages,
@@ -297,6 +349,8 @@ func (c *Client) stream(ctx context.Context, messages []Message, tools []Tool, o
 		return nil, &requestError{err}
 	}
 	defer func() { _ = resp.Body.Close() }()
+
+	info.Status, info.HeaderID, info.Headers = resp.StatusCode, reqid.FromHeader(resp.Header), time.Since(start)
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
@@ -343,6 +397,10 @@ func (c *Client) stream(ctx context.Context, messages []Message, tools []Tool, o
 		var chunk chatCompletionChunk
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 			continue
+		}
+
+		if info.ChunkID == "" {
+			info.ChunkID = chunk.ID
 		}
 
 		if len(chunk.Error) > 0 && string(chunk.Error) != "null" {
@@ -394,6 +452,8 @@ func truncateBytes(b []byte, n int) string {
 }
 
 type chatCompletionChunk struct {
+	// ID is the completion's id, the same on every chunk of a stream.
+	ID string `json:"id"`
 	// Error is an error object some OpenAI-compatible providers send inside
 	// a 200 stream instead of a non-2xx status.
 	Error json.RawMessage `json:"error"`

@@ -173,6 +173,17 @@ stderr JSON/text output -- the same env var name and endpoint shape a Spring
 Boot app's `management.otlp.logging.endpoint` would use. Unset (the
 default): no OTLP client is even constructed, zero overhead.
 
+Traces use the same endpoint variable (or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`).
+Each call is one trace with a `call` span, and each LLM HTTP attempt a child
+`llm.request` span (model, attempt, status, `llm.request_id`,
+`llm.completion_id`). The call's trace id is the `trace_id` on its log lines,
+so a log line finds the call's trace. For support tickets, the same ids are in
+the logs: `llm.request` (`request_id`, `completion_id`; INFO when the request
+took 3 s or more, WARN when it failed, DEBUG otherwise) and `stt.connected` /
+`tts.connected` (`request_id` from the connection handshake, when the provider
+sends one). Pipeline errors are also logged as `agent.error` with their
+`stage`, so a `vaani_agent_errors_total` panel can link to the lines.
+
 ## Memory limit (`GOMEMLIMIT`)
 
 Set Go's soft memory limit to about **90% of the memory Vaani may use**

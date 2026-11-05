@@ -162,7 +162,7 @@ func (h *Handler) playClip(ctx context.Context, ttsClient tts.Client, clip *Clip
 	}
 
 	if err := ttsClient.Play(clip.PCM, text, gen); err != nil {
-		h.cfg.Sink.Error("tts_speak")
+		h.agentError("tts_speak")
 
 		if ctx.Err() == nil {
 			slog.Warn("recorded clip failed", "call_id", h.callID, "gen", gen, "event", "tts.error",

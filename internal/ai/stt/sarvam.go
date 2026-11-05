@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+
+	"github.com/nitesh/vaani/internal/ai/reqid"
 )
 
 // sarvamSTTBaseURL is Sarvam's production saaras realtime endpoint, used when
@@ -147,10 +149,12 @@ func (c *sarvamClient) dial(ctx context.Context) (*websocket.Conn, error) {
 
 	dialer := websocket.Dialer{Proxy: http.ProxyFromEnvironment, HandshakeTimeout: dialTimeout}
 
-	conn, _, err := dialer.DialContext(ctx, endpoint, header)
+	conn, resp, err := dialer.DialContext(ctx, endpoint, header)
 	if err != nil {
 		return nil, err
 	}
+
+	slog.Info("stt connected", "call_id", c.callID, "event", "stt.connected", "request_id", reqid.FromHeader(resp.Header))
 
 	return conn, nil
 }
