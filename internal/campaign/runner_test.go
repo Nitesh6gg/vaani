@@ -32,8 +32,10 @@ type memStore struct {
 	orgRate    *int
 	wallet     bool
 	settings   dograh.DialSettings
+	noSettings bool // the organization has no telephony configuration
 	paused     []string
 	nextRun    int64
+	claims     int
 
 	future      map[int]bool // retry rows not due yet: ClaimRuns skips them
 	recovered   int
@@ -59,11 +61,20 @@ func newMemStore(contacts int) *memStore {
 
 func (s *memStore) VaaniCampaigns(context.Context) ([]dograh.Campaign, error) { return nil, nil }
 
-func (s *memStore) CampaignRunning(context.Context, int) (bool, error) {
+func (s *memStore) DialCheck(context.Context, int, int) (dograh.DialCheck, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	return s.state == "running", nil
+	d := dograh.DialCheck{Running: s.state == "running", WalletBlocks: s.wallet, Settings: s.settings, HasSettings: !s.noSettings}
+	if s.orgLimit != nil {
+		d.ConcurrentMax, d.HasConcurrent = *s.orgLimit, true
+	}
+
+	if s.orgRate != nil {
+		d.DialRate, d.HasDialRate = *s.orgRate, true
+	}
+
+	return d, nil
 }
 
 func (s *memStore) SetCampaignState(_ context.Context, _ int, from, to string) (bool, error) {
@@ -80,24 +91,6 @@ func (s *memStore) SetCampaignState(_ context.Context, _ int, from, to string) (
 	return true, nil
 }
 
-func (s *memStore) OrgConcurrencyLimit(context.Context, int) (int, bool, error) {
-	if s.orgLimit == nil {
-		return 0, false, nil
-	}
-
-	return *s.orgLimit, true, nil
-}
-
-func (s *memStore) OrgDialRate(context.Context, int) (int, bool, error) {
-	if s.orgRate == nil {
-		return 0, false, nil
-	}
-
-	return *s.orgRate, true, nil
-}
-
-func (s *memStore) WalletBlocks(context.Context, int) bool { return s.wallet }
-
 func (s *memStore) ClaimRuns(_ context.Context, _ int, _ int, _ time.Time) ([]dograh.QueuedRun, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -105,6 +98,7 @@ func (s *memStore) ClaimRuns(_ context.Context, _ int, _ int, _ time.Time) ([]do
 	for _, r := range s.rows {
 		if s.rowState[r.ID] == "queued" && !s.future[r.ID] {
 			s.rowState[r.ID] = "processing"
+			s.claims++
 			return []dograh.QueuedRun{r}, nil
 		}
 	}
@@ -234,11 +228,23 @@ type recPlacer struct {
 	mu   sync.Mutex
 	reqs []ari.DialRequest
 	err  error
+
+	delay    time.Duration // how long placing a call takes
+	cur, max int           // placements going on now, and at most at once
 }
 
 func (p *recPlacer) Dial(_ context.Context, req ari.DialRequest) (string, error) {
 	p.mu.Lock()
+	p.cur++
+	p.max = max(p.max, p.cur)
+	p.mu.Unlock()
+
+	time.Sleep(p.delay)
+
+	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	p.cur--
 
 	if p.err != nil {
 		return "", p.err
@@ -372,7 +378,7 @@ func TestRunner_OrgDialRateOverridesTheCampaignRate(t *testing.T) {
 		orgRate *int
 		want    int
 	}{
-		"no org rate: the campaign's 2":  {nil, 2},
+		"no org rate: the campaign's 2": {nil, 2},
 		"org rate 4 beats the campaign": {ptr(4), 4},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -468,8 +474,8 @@ func TestRunner_FailedCallsTripTheBreaker(t *testing.T) {
 	}
 
 	require.Eventually(t, func() bool {
-		ok, _ := rr.store.CampaignRunning(context.Background(), 1)
-		return !ok
+		chk, _ := rr.store.DialCheck(context.Background(), 1, 7)
+		return !chk.Running
 	}, time.Second, 5*time.Millisecond, "5 of 5 failed: paused")
 }
 
@@ -565,10 +571,134 @@ func TestRunner_NonARIProviderPausesAndKeepsTheContact(t *testing.T) {
 
 	assert.Empty(t, rr.placer.dialed())
 	assert.Equal(t, "paused", rr.store.state)
-	assert.Equal(t, "queued", rr.store.stateOf(1), "given back, not lost")
+	assert.Equal(t, "queued", rr.store.stateOf(1), "never claimed, so nothing to give back")
+	assert.Zero(t, rr.store.claims, "checked before a contact is claimed")
 
 	n, _ := rr.l.ActiveSlots(context.Background(), 7)
 	assert.Zero(t, n)
+}
+
+func TestRunner_NoTelephonyConfigurationKeepsTheContacts(t *testing.T) {
+	rr := newRunnerRig(t, 2)
+	rr.store.noSettings = true
+
+	rr.dialAll(t)
+
+	assert.Empty(t, rr.placer.dialed())
+	assert.Zero(t, rr.store.claims)
+	assert.Equal(t, "running", rr.store.state, "a missing configuration is an error to fix, not a reason to pause")
+}
+
+// workersRig is a rig whose Runner has the workers parallel dial workers and
+// real clocks (the limiter's entries are stored under their timestamp).
+func workersRig(t *testing.T, contacts, workers, orgLimit int) *runnerRig {
+	t.Helper()
+
+	rr := newRunnerRig(t, contacts)
+	rr.r.cfg.Workers = workers
+	rr.r.now = time.Now
+	rr.l.now = time.Now
+	rr.store.orgLimit = &orgLimit
+	rr.camp.RatePerSecond = 100000
+	rr.placer.delay = 10 * time.Millisecond
+
+	return rr
+}
+
+// stopped waits for every dial worker to end.
+func (rr *runnerRig) stopped(t *testing.T) {
+	t.Helper()
+
+	done := make(chan struct{})
+	go func() { rr.r.wg.Wait(); close(done) }()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("dial workers never stopped")
+	}
+}
+
+func TestRunner_WorkersDialEveryContactExactlyOnce(t *testing.T) {
+	rr := workersRig(t, 100, 10, 100)
+
+	rr.r.startWorker(context.Background(), rr.camp, false)
+	rr.stopped(t)
+
+	got := rr.placer.dialed()
+	require.Len(t, got, 100)
+
+	runs := map[int64]bool{}
+	for _, req := range got {
+		runs[req.RunID] = true
+	}
+
+	assert.Len(t, runs, 100, "every call has its own run: no contact was dialed twice")
+
+	for id := 1; id <= 100; id++ {
+		assert.Equal(t, "processed", rr.store.stateOf(id), "contact %d", id)
+	}
+
+	assert.Equal(t, 10, rr.placer.max, "ramped up to the 10 workers, and no further")
+	assert.Equal(t, 100, rr.store.claims)
+	assert.Equal(t, 100, rr.r.InFlight(rr.camp.ID))
+	assert.Empty(t, rr.r.workers, "no worker left behind")
+	assert.Zero(t, rr.r.total)
+}
+
+func TestRunner_WorkersStayUnderTheOrgLimit(t *testing.T) {
+	rr := workersRig(t, 100, 10, 30)
+
+	rr.r.startWorker(context.Background(), rr.camp, false)
+	rr.stopped(t)
+
+	assert.Len(t, rr.placer.dialed(), 30, "30 slots, however many workers")
+
+	n, _ := rr.l.ActiveSlots(context.Background(), 7)
+	assert.Equal(t, 30, n)
+	assert.Equal(t, 30, rr.store.claims, "a contact is claimed only with a slot in hand")
+}
+
+func TestRunner_WorkersHonourTheOrgRate(t *testing.T) {
+	rr := workersRig(t, 100, 10, 100)
+	rr.store.orgRate = new(int)
+	*rr.store.orgRate = 5
+
+	rr.r.startWorker(context.Background(), rr.camp, false)
+	time.Sleep(300 * time.Millisecond) // well inside one rate window
+
+	assert.Len(t, rr.placer.dialed(), 5, "5 a second in all, not per worker")
+}
+
+func TestRunner_APauseStopsEveryWorker(t *testing.T) {
+	rr := workersRig(t, 100, 10, 100)
+
+	rr.r.startWorker(context.Background(), rr.camp, false)
+	require.Eventually(t, func() bool { return len(rr.placer.dialed()) >= 5 }, 5*time.Second, time.Millisecond)
+
+	rr.store.mu.Lock()
+	rr.store.state = "paused" // Pause in Dograh's UI
+	rr.store.mu.Unlock()
+
+	rr.stopped(t)
+
+	n := len(rr.placer.dialed())
+	assert.Less(t, n, 30, "the 10 workers finish the contact in hand, no more")
+}
+
+func TestRunner_ScanStartsOneWorkerPerCampaign(t *testing.T) {
+	rr := workersRig(t, 100, 10, 100)
+	rr.placer.delay = 50 * time.Millisecond
+
+	rr.r.startWorker(context.Background(), rr.camp, false)
+	rr.r.startWorker(context.Background(), rr.camp, false) // the next scan
+
+	rr.r.mu.Lock()
+	n := rr.r.workers[rr.camp.ID]
+	rr.r.mu.Unlock()
+
+	assert.Equal(t, 1, n, "a campaign that has a worker gets no second one from a scan")
+	rr.stopped(t)
 }
 
 func TestRunner_DialErrorFailsTheContactAndFreesTheSlot(t *testing.T) {

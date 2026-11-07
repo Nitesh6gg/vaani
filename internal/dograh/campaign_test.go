@@ -213,40 +213,6 @@ func TestVaaniCampaigns_OnlyRunningCampaignsOfVaaniOrgs(t *testing.T) {
 	assert.Equal(t, 5, got[0].MaxConcurrency)
 }
 
-func TestOrgConcurrencyLimit(t *testing.T) {
-	s, pool := campaignDB(t)
-	sqlExec(t, pool, `INSERT INTO organization_configurations (organization_id, key, value)
-		VALUES (1, 'CONCURRENT_CALL_LIMIT', '{"value": 12}')`)
-
-	n, ok, err := s.OrgConcurrencyLimit(context.Background(), 1)
-	require.NoError(t, err)
-	assert.True(t, ok)
-	assert.Equal(t, 12, n)
-
-	_, ok, err = s.OrgConcurrencyLimit(context.Background(), 2)
-	require.NoError(t, err)
-	assert.False(t, ok, "unset: the caller's default applies")
-}
-
-func TestOrgDialRate(t *testing.T) {
-	s, pool := campaignDB(t)
-	sqlExec(t, pool, `INSERT INTO organization_configurations (organization_id, key, value) VALUES
-		(1, 'DIAL_RATE_LIMIT_PER_SECOND', '{"value": 8}'),
-		(1, 'CONCURRENT_CALL_LIMIT', '{"value": 12}'),
-		(3, 'DIAL_RATE_LIMIT_PER_SECOND', '{"value": null}')`)
-
-	n, ok, err := s.OrgDialRate(context.Background(), 1)
-	require.NoError(t, err)
-	assert.True(t, ok)
-	assert.Equal(t, 8, n, "its own key, not the concurrency one")
-
-	for _, org := range []int{2, 3} {
-		_, ok, err = s.OrgDialRate(context.Background(), org)
-		require.NoError(t, err)
-		assert.False(t, ok, "org %d: no row, or a cleared one: the campaign's own rate applies", org)
-	}
-}
-
 func TestClaimRuns_RetriesFirstThenLoadingOrder(t *testing.T) {
 	s, pool := campaignDB(t)
 	now := time.Now()
@@ -321,6 +287,68 @@ func TestClaimRuns_TwoClaimersNeverShareARow(t *testing.T) {
 	}
 }
 
+func TestDialCheck(t *testing.T) {
+	s, pool := campaignDB(t)
+	ctx := context.Background()
+
+	sqlExec(t, pool, `INSERT INTO campaigns (organization_id, state) VALUES (1, 'running'), (2, 'running'), (3, 'paused')`)
+	sqlExec(t, pool, `INSERT INTO organizations (id, billing_mode, billing_rate_per_min_inr, credit_limit_inr, wallet_balance_inr) VALUES
+		(1, NULL, NULL, NULL, 0),            -- billing off
+		(2, 'prepaid', 1.5, NULL, 1.4),      -- less than a minute left
+		(3, 'prepaid', 1.5, NULL, 1.5),      -- exactly a minute
+		(4, 'postpaid', 1.5, 100, -100),     -- at the credit limit
+		(5, 'postpaid', 1.5, 100, -99.99),
+		(6, 'postpaid', 1.5, NULL, -5000)    -- no limit`)
+	sqlExec(t, pool, `INSERT INTO organization_configurations (organization_id, key, value) VALUES
+		(1, 'CONCURRENT_CALL_LIMIT', '{"value": 12}'),
+		(1, 'DIAL_RATE_LIMIT_PER_SECOND', '{"value": 8}'),
+		(1, 'TELEPHONY_CONFIGURATION', '{"provider": "ari", "sip_technology": "pjsip", "outbound_trunk": " trunk ", "from_numbers": ["7317185732"], "number_workflow_map": {"7317185799": 19}}'),
+		(2, 'DIAL_RATE_LIMIT_PER_SECOND', '{"value": null}'),
+		(2, 'TELEPHONY_CONFIGURATION', '{"provider": "twilio"}')`)
+
+	// Limits, rate and telephony of an organization that has them: its own keys, not each other's.
+	chk, err := s.DialCheck(ctx, 1, 1)
+	require.NoError(t, err)
+	assert.True(t, chk.Running)
+	assert.True(t, chk.HasConcurrent)
+	assert.Equal(t, 12, chk.ConcurrentMax)
+	assert.True(t, chk.HasDialRate)
+	assert.Equal(t, 8, chk.DialRate)
+	assert.False(t, chk.WalletBlocks)
+	assert.True(t, chk.HasSettings)
+	assert.Equal(t, DialSettings{Provider: "ari", Technology: "PJSIP", Trunk: "trunk", FromNumbers: []string{"7317185732"},
+		WorkflowCLI: map[int]string{19: "7317185799"}}, chk.Settings)
+
+	// A cleared value, an organization with a wallet that is nearly out, and a provider that isn't ARI.
+	chk, err = s.DialCheck(ctx, 2, 2)
+	require.NoError(t, err)
+	assert.False(t, chk.HasConcurrent, "no row: the caller's default applies")
+	assert.False(t, chk.HasDialRate, "a cleared value: the campaign's own rate applies")
+	assert.True(t, chk.WalletBlocks)
+	assert.Equal(t, "twilio", chk.Settings.Provider)
+
+	// A paused campaign, an organization with no row of its own and no telephony configuration.
+	chk, err = s.DialCheck(ctx, 3, 99)
+	require.NoError(t, err)
+	assert.False(t, chk.Running, "Pause is seen at once")
+	assert.False(t, chk.HasSettings)
+	assert.False(t, chk.WalletBlocks)
+
+	// No such campaign: not running.
+	chk, err = s.DialCheck(ctx, 99, 1)
+	require.NoError(t, err)
+	assert.False(t, chk.Running)
+
+	// Wallet rules, as Dograh's can_start_call.
+	for org, want := range map[int]bool{1: false, 2: true, 3: false, 4: true, 5: false, 6: false, 99: false} {
+		sqlExec(t, pool, `UPDATE campaigns SET organization_id = $1 WHERE id = 1`, org)
+
+		chk, err := s.DialCheck(ctx, 1, org)
+		require.NoError(t, err)
+		assert.Equal(t, want, chk.WalletBlocks, "org %d", org)
+	}
+}
+
 func TestSetRunState_CountsInTheCampaign(t *testing.T) {
 	s, pool := campaignDB(t)
 	ctx := context.Background()
@@ -343,6 +371,39 @@ func TestSetRunState_CountsInTheCampaign(t *testing.T) {
 	var state string
 	require.NoError(t, pool.QueryRow(ctx, `SELECT state::text FROM queued_runs WHERE id = 3`).Scan(&state))
 	assert.Equal(t, "queued", state, "given back")
+}
+
+// Dial workers finish contacts at the same time: no counter increment is lost.
+func TestSetRunState_ConcurrentUpdatesLoseNoCount(t *testing.T) {
+	s, pool := campaignDB(t)
+	ctx := context.Background()
+
+	sqlExec(t, pool, `INSERT INTO campaigns (organization_id, state) VALUES (1, 'running')`)
+	sqlExec(t, pool, `INSERT INTO queued_runs (campaign_id, source_uuid, state) SELECT 1, 'r' || g, 'processing' FROM generate_series(1, 40) g`)
+
+	var wg sync.WaitGroup
+
+	for id := 1; id <= 40; id++ {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			state := RunProcessed
+			if id%4 == 0 {
+				state = RunFailed
+			}
+
+			assert.NoError(t, s.SetRunState(ctx, id, state))
+		}()
+	}
+
+	wg.Wait()
+
+	var processed, failed int
+	require.NoError(t, pool.QueryRow(ctx, `SELECT processed_rows, failed_rows FROM campaigns WHERE id = 1`).Scan(&processed, &failed))
+	assert.Equal(t, 30, processed)
+	assert.Equal(t, 10, failed)
 }
 
 func TestScheduleRetry(t *testing.T) {
@@ -517,14 +578,6 @@ func TestCampaignState(t *testing.T) {
 
 	sqlExec(t, pool, `INSERT INTO campaigns (organization_id, state) VALUES (1, 'running')`)
 
-	running, err := s.CampaignRunning(ctx, 1)
-	require.NoError(t, err)
-	assert.True(t, running)
-
-	running, err = s.CampaignRunning(ctx, 99)
-	require.NoError(t, err)
-	assert.False(t, running, "no such campaign")
-
 	moved, err := s.SetCampaignState(ctx, 1, "paused", "completed")
 	require.NoError(t, err)
 	assert.False(t, moved, "it is not paused: a state changed meanwhile wins")
@@ -533,8 +586,9 @@ func TestCampaignState(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, moved)
 
-	running, _ = s.CampaignRunning(ctx, 1)
-	assert.False(t, running)
+	chk, err := s.DialCheck(ctx, 1, 1)
+	require.NoError(t, err)
+	assert.False(t, chk.Running)
 
 	require.NoError(t, s.AddFailedRow(ctx, 1))
 	require.NoError(t, s.AddFailedRow(ctx, 1))
@@ -542,23 +596,6 @@ func TestCampaignState(t *testing.T) {
 	var failed int
 	require.NoError(t, pool.QueryRow(ctx, `SELECT failed_rows FROM campaigns WHERE id = 1`).Scan(&failed))
 	assert.Equal(t, 2, failed)
-}
-
-func TestWalletBlocks(t *testing.T) {
-	s, pool := campaignDB(t)
-	ctx := context.Background()
-
-	sqlExec(t, pool, `INSERT INTO organizations (id, billing_mode, billing_rate_per_min_inr, credit_limit_inr, wallet_balance_inr) VALUES
-		(1, NULL, NULL, NULL, 0),            -- billing off
-		(2, 'prepaid', 1.5, NULL, 1.4),      -- less than a minute left
-		(3, 'prepaid', 1.5, NULL, 1.5),      -- exactly a minute
-		(4, 'postpaid', 1.5, 100, -100),     -- at the credit limit
-		(5, 'postpaid', 1.5, 100, -99.99),
-		(6, 'postpaid', 1.5, NULL, -5000)    -- no limit`)
-
-	for org, want := range map[int]bool{1: false, 2: true, 3: false, 4: true, 5: false, 6: false, 99: false} {
-		assert.Equal(t, want, s.WalletBlocks(ctx, org), "org %d", org)
-	}
 }
 
 func TestRecoverContacts_OnlyVaaniCampaigns(t *testing.T) {
