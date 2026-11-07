@@ -31,6 +31,7 @@ In `.env` (see `.env.example`):
 | `OUTBOUND_MAX_CALLS` | 20 | Campaign calls this Vaani may have up at once (own key `vaani_capacity:calls`, not Dograh's fleet cap). 0 = org limits only. |
 | `OUTBOUND_DEFAULT_ORG_CONCURRENCY` | 2 | Limit of an organization with none set (Dograh's default). |
 | `CAMPAIGN_POLL_SECONDS` | 5 | How often Dograh's database is scanned. A call ending wakes the scan at once. |
+| `CAMPAIGN_DIAL_WORKERS` | 10 | Contacts of one campaign dialed at the same time (see "How fast it dials"). 1 = one at a time. |
 | `OUTBOUND_RING_TIMEOUT_SECONDS` | 30 | Ring time before a call counts as unanswered. |
 | `OUTBOUND_TEST_CALL` | | `"<number>,<org id>,<workflow id>"`: dial once at startup, outside any campaign, to try outbound calling. |
 
@@ -41,12 +42,39 @@ connection from `.env`, never the config's ARI password):
 `<tech>/<number minus prefix>@<trunk>`, caller ID = the number mapped to the
 workflow, else the first of `from_numbers`.
 
+## How fast it dials
+
+`DIAL_RATE_LIMIT_PER_SECOND` is a **maximum**, not a target. Dialing one contact
+takes ~10 sequential round trips (Postgres, Redis, Asterisk) -- measured at about
+0.2 s on a Vaani away from its database -- so one dial worker tops out near 5
+calls a second whatever the limit. Each campaign therefore has up to
+`CAMPAIGN_DIAL_WORKERS` workers (default 10): a scan starts one, and every worker
+that dials a contact starts the next, so a campaign with no room (concurrency
+full) costs one attempt per scan, not ten. At most twice that many workers run in
+all campaigns. Everything they share is atomic: `FOR UPDATE SKIP LOCKED` hands
+each contact to one worker, and the rate and slot counters are Redis scripts, so
+the organization's limits hold across all workers together.
+
+Round trips per dial were cut as well: the campaign's state, the organization's
+limits, wallet and telephony settings come in **one** query (`Store.DialCheck`,
+read fresh every dial so a Pause takes effect at the next contact), together
+with the circuit breaker check; the telephony provider is checked *before* a
+contact is claimed; a contact's final state and the campaign's counter are one
+statement.
+
+The real limits are, in order: the organization's concurrency limit,
+`OUTBOUND_MAX_CALLS`, the dial rate, and your SIP trunk's calls-per-second limit
+(ask the provider). **Ramp up**: set the organization's dial rate to 10 first,
+then 15, then 20, watching the trunk's rejections (`campaign.paused` with
+`breaker`). The workers use `DOGRAH_DB_MAX_CONNS` (default 80), shared with the
+calls being set up.
+
 ## One call
 
 1. The dialer finds a `running` campaign of a `vaani` organization.
 2. Checks, in order: campaign still running, inside its schedule window
    (`orchestrator_metadata.schedule_config`; none = always), circuit breaker
-   closed, wallet not empty.
+   closed, wallet not empty, telephony provider `ari`.
 3. Takes a rate token and a concurrency slot (Redis), **then** claims one
    contact (`queued_runs`, retries first, `FOR UPDATE SKIP LOCKED`). A contact is
    never held while waiting for a slot.

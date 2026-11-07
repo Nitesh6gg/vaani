@@ -272,9 +272,10 @@ func newCampaignRunner(ctx context.Context, cfg config.Config, store *dograh.Sto
 	}
 
 	slog.Info("campaign dialer enabled", "event", "campaign.enabled", "max_calls", cfg.OutboundMaxCalls,
-		"default_org_limit", cfg.OutboundDefaultOrgLimit, "poll_s", int(cfg.CampaignPoll.Seconds()))
+		"default_org_limit", cfg.OutboundDefaultOrgLimit, "poll_s", int(cfg.CampaignPoll.Seconds()), "dial_workers", cfg.CampaignDialWorkers)
 
 	return campaign.NewRunner(store, campaign.NewLimiter(rdb, cfg.OutboundMaxCalls), mgr, campaign.RunnerConfig{
 		Poll: cfg.CampaignPoll, DefaultOrgLimit: cfg.OutboundDefaultOrgLimit, RingTimeout: cfg.OutboundRingTimeout,
+		Workers: cfg.CampaignDialWorkers,
 	}), nil
 }

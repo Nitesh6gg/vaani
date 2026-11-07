@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"strconv"
 	"sync"
 	"time"
@@ -18,11 +19,8 @@ type Store interface {
 	runStore
 
 	VaaniCampaigns(ctx context.Context) ([]dograh.Campaign, error)
-	CampaignRunning(ctx context.Context, id int) (bool, error)
+	DialCheck(ctx context.Context, campaignID, orgID int) (dograh.DialCheck, error)
 	SetCampaignState(ctx context.Context, id int, from, to string) (bool, error)
-	OrgConcurrencyLimit(ctx context.Context, orgID int) (int, bool, error)
-	OrgDialRate(ctx context.Context, orgID int) (int, bool, error)
-	WalletBlocks(ctx context.Context, orgID int) bool
 	ClaimRuns(ctx context.Context, campaignID, limit int, now time.Time) ([]dograh.QueuedRun, error)
 	SetRunState(ctx context.Context, runID int, state string) error
 	ScheduleRetry(ctx context.Context, run dograh.QueuedRun, reason string, delay time.Duration, now time.Time) error
@@ -43,10 +41,18 @@ type RunnerConfig struct {
 	// none set (Dograh's DEFAULT_ORG_CONCURRENCY_LIMIT, 2).
 	DefaultOrgLimit int
 	RingTimeout     time.Duration
+	// Workers is how many contacts of one campaign are dialed at the same
+	// time (CAMPAIGN_DIAL_WORKERS); 0 means 1. Dialing one contact takes
+	// ~10 round trips to Postgres, Redis and Asterisk, so one worker tops out
+	// near 5 calls a second whatever the dial rate; the organization's rate
+	// and concurrency limits still decide the real speed. At most twice this
+	// many workers run across all campaigns, so they can't take the whole
+	// database pool from the calls being set up.
+	Workers int
 }
 
 // Runner dials the campaigns of organizations whose media engine is "vaani":
-// it claims contacts from Dograh's queue one at a time, each under the
+// it claims contacts from Dograh's queue, each under the
 // organization's rate and concurrency limits, places the call, and decides
 // retries and the circuit breaker from how it ends. Dograh's UI starts, pauses
 // and resumes campaigns; the Runner only follows their state.
@@ -62,8 +68,9 @@ type Runner struct {
 	ctx context.Context
 
 	mu       sync.Mutex
-	draining map[int]bool // campaigns a drain goroutine is working on
-	inflight map[int]int  // calls placed and not yet over, per campaign
+	workers  map[int]int // dial workers running, per campaign
+	total    int         // ... and in all
+	inflight map[int]int // calls placed and not yet over, per campaign
 	liveRuns map[int64]bool
 	wakeCh   chan struct{}
 	wg       sync.WaitGroup
@@ -71,9 +78,11 @@ type Runner struct {
 
 // NewRunner returns a Runner.
 func NewRunner(store Store, lim *Limiter, placer CallPlacer, cfg RunnerConfig) *Runner {
+	cfg.Workers = max(cfg.Workers, 1)
+
 	return &Runner{
 		store: store, lim: lim, placer: placer, cfg: cfg, now: time.Now, ctx: context.Background(),
-		draining: map[int]bool{}, inflight: map[int]int{}, liveRuns: map[int64]bool{}, wakeCh: make(chan struct{}, 1),
+		workers: map[int]int{}, inflight: map[int]int{}, liveRuns: map[int64]bool{}, wakeCh: make(chan struct{}, 1),
 	}
 }
 
@@ -121,28 +130,42 @@ func (r *Runner) scan(ctx context.Context) {
 	}
 
 	for _, c := range campaigns {
-		r.mu.Lock()
-		busy := r.draining[c.ID]
-		r.draining[c.ID] = true
-		r.mu.Unlock()
-
-		if busy {
-			continue
-		}
-
-		r.wg.Add(1)
-
-		go func() {
-			defer r.wg.Done()
-			defer func() {
-				r.mu.Lock()
-				delete(r.draining, c.ID)
-				r.mu.Unlock()
-			}()
-
-			r.drain(ctx, c)
-		}()
+		r.startWorker(ctx, c, false)
 	}
+}
+
+// startWorker starts a dial worker for campaign c, unless it has its share
+// already. A scan starts one; each worker that dials a contact starts the next
+// (grow), up to Workers, so a campaign with no room (a full slot limit) costs
+// one failed attempt per scan, not Workers of them.
+func (r *Runner) startWorker(ctx context.Context, c dograh.Campaign, grow bool) {
+	r.mu.Lock()
+
+	if r.workers[c.ID] >= r.cfg.Workers || r.total >= 2*r.cfg.Workers || (!grow && r.workers[c.ID] > 0) {
+		r.mu.Unlock()
+		return
+	}
+
+	r.workers[c.ID]++
+	r.total++
+	r.wg.Add(1)
+	r.mu.Unlock()
+
+	go func() {
+		defer r.wg.Done()
+		defer func() {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+
+			if r.workers[c.ID]--; r.workers[c.ID] <= 0 {
+				delete(r.workers, c.ID)
+			}
+
+			r.total--
+		}()
+
+		r.drain(ctx, c)
+	}()
 }
 
 // step is what one attempt to dial a contact came to.
@@ -161,10 +184,13 @@ func (r *Runner) drain(ctx context.Context, c dograh.Campaign) {
 
 		switch res {
 		case stepDialed:
-			continue
+			r.startWorker(ctx, c, true)
 		case stepWait:
+			wait = min(max(wait, 10*time.Millisecond), time.Second)
+			wait += rand.N(wait/4 + 1) // workers waiting for the same token don't all ask again at once
+
 			select {
-			case <-time.After(min(max(wait, 10*time.Millisecond), time.Second)):
+			case <-time.After(wait):
 			case <-ctx.Done():
 			}
 		default:
@@ -194,45 +220,53 @@ func (r *Runner) pause(ctx context.Context, c dograh.Campaign, kind, why string)
 // orgLimit is how many calls campaign c's organization may have at once: its
 // CONCURRENT_CALL_LIMIT or the default, lowered by the campaign's own
 // max_concurrency.
-func (r *Runner) orgLimit(ctx context.Context, c dograh.Campaign) (int, error) {
-	limit, ok, err := r.store.OrgConcurrencyLimit(ctx, c.OrganizationID)
-	if err != nil {
-		return 0, err
-	}
-
-	if !ok {
-		limit = r.cfg.DefaultOrgLimit
+func (r *Runner) orgLimit(c dograh.Campaign, chk dograh.DialCheck) int {
+	limit := r.cfg.DefaultOrgLimit
+	if chk.HasConcurrent {
+		limit = chk.ConcurrentMax
 	}
 
 	if c.MaxConcurrency > 0 && c.MaxConcurrency < limit {
 		limit = c.MaxConcurrency
 	}
 
-	return limit, nil
+	return limit
 }
 
 // dialRate is how many calls per second campaign c's organization may start:
 // its DIAL_RATE_LIMIT_PER_SECOND, which overrides the campaign's own
 // rate_limit_per_second, or that rate when the organization has none set.
-func (r *Runner) dialRate(ctx context.Context, c dograh.Campaign) (int, error) {
-	rate, ok, err := r.store.OrgDialRate(ctx, c.OrganizationID)
-	if err != nil {
-		return 0, err
+func dialRate(c dograh.Campaign, chk dograh.DialCheck) int {
+	if !chk.HasDialRate {
+		return c.RatePerSecond
 	}
 
-	if !ok {
-		return c.RatePerSecond, nil
-	}
-
-	return max(rate, 1), nil
+	return max(chk.DialRate, 1)
 }
 
 // dialOne takes the next contact of campaign c and places the call, if the
 // campaign is running, inside its window, healthy, paid for, and under the
 // organization's rate and concurrency limits.
 func (r *Runner) dialOne(ctx context.Context, c dograh.Campaign) (step, time.Duration) {
-	running, err := r.store.CampaignRunning(ctx, c.ID)
-	if err != nil || !running {
+	// The breaker (Redis) and the database checks don't depend on each other,
+	// so they are read at the same time.
+	type breaker struct {
+		open  bool
+		stats BreakerStats
+		err   error
+	}
+
+	br := make(chan breaker, 1)
+
+	go func() {
+		open, stats, err := r.lim.BreakerOpen(ctx, c.ID, c.Breaker)
+		br <- breaker{open, stats, err}
+	}()
+
+	chk, err := r.store.DialCheck(ctx, c.ID, c.OrganizationID)
+	b := <-br
+
+	if err != nil || !chk.Running {
 		return stepStop, 0
 	}
 
@@ -240,27 +274,33 @@ func (r *Runner) dialOne(ctx context.Context, c dograh.Campaign) (step, time.Dur
 		return stepStop, 0
 	}
 
-	if open, stats, err := r.lim.BreakerOpen(ctx, c.ID, c.Breaker); err == nil && open {
-		r.pause(ctx, c, "breaker", fmt.Sprintf("circuit breaker: %d of %d calls failed", stats.Failures, stats.Total()))
+	if b.err == nil && b.open {
+		r.pause(ctx, c, "breaker", fmt.Sprintf("circuit breaker: %d of %d calls failed", b.stats.Failures, b.stats.Total()))
 		return stepStop, 0
 	}
 
-	if r.store.WalletBlocks(ctx, c.OrganizationID) {
+	if chk.WalletBlocks {
 		r.pause(ctx, c, "wallet", "the organization's wallet is out of credit")
 		return stepStop, 0
 	}
 
-	limit, err := r.orgLimit(ctx, c)
-	if err != nil {
-		slog.Error("campaign: organization limit unreadable", "component", "campaign", "event", "campaign.limit_failed", "campaign_id", c.ID, "error", err)
+	// Checked before a contact is claimed, so there is nothing to give back.
+	if !chk.HasSettings {
+		slog.Error("campaign: the organization's telephony settings are unreadable", "component", "campaign", "event", "campaign.place_failed",
+			"campaign_id", c.ID, "error", fmt.Errorf("organization %d has no telephony configuration", c.OrganizationID))
+
 		return stepStop, 0
 	}
 
-	rate, err := r.dialRate(ctx, c)
-	if err != nil {
-		slog.Error("campaign: organization dial rate unreadable", "component", "campaign", "event", "campaign.limit_failed", "campaign_id", c.ID, "error", err)
+	if chk.Settings.Provider != "ari" {
+		r.pause(ctx, c, "provider", fmt.Sprintf("the organization's telephony provider is %q, not ari", chk.Settings.Provider))
+		slog.Error("campaign: cannot dial over ARI", "component", "campaign", "event", "campaign.place_failed",
+			"campaign_id", c.ID, "error", fmt.Errorf("provider %q", chk.Settings.Provider))
+
 		return stepStop, 0
 	}
+
+	limit, rate := r.orgLimit(c, chk), dialRate(c, chk)
 
 	ok, err := r.lim.AcquireToken(ctx, c.OrganizationID, rate)
 	if err != nil {
@@ -296,7 +336,7 @@ func (r *Runner) dialOne(ctx context.Context, c dograh.Campaign) (step, time.Dur
 		return stepStop, 0
 	}
 
-	return r.place(ctx, c, runs[0], slot), 0
+	return r.place(ctx, c, runs[0], chk.Settings, slot), 0
 }
 
 func (r *Runner) release(slot Slot) {
@@ -320,7 +360,7 @@ func phoneOf(vars map[string]any) string {
 
 // place dials claimed contact q. It owns slot from here: released when the
 // call is over, or at once if it was never placed.
-func (r *Runner) place(ctx context.Context, c dograh.Campaign, q dograh.QueuedRun, slot Slot) step {
+func (r *Runner) place(ctx context.Context, c dograh.Campaign, q dograh.QueuedRun, settings dograh.DialSettings, slot Slot) step {
 	phone := phoneOf(q.Variables)
 	if phone == "" {
 		slog.Warn("campaign: contact has no phone_number; failing it", "component", "campaign", "event", "campaign.no_number",
@@ -340,16 +380,6 @@ func (r *Runner) place(ctx context.Context, c dograh.Campaign, q dograh.QueuedRu
 		r.setRunState(ctx, q, dograh.RunQueued)
 
 		return stepStop
-	}
-
-	settings, err := r.store.DialSettings(ctx, c.OrganizationID)
-	if err != nil {
-		return giveBack("the organization's telephony settings are unreadable", err)
-	}
-
-	if settings.Provider != "ari" {
-		r.pause(ctx, c, "provider", fmt.Sprintf("the organization's telephony provider is %q, not ari", settings.Provider))
-		return giveBack("cannot dial over ARI", fmt.Errorf("provider %q", settings.Provider))
 	}
 
 	caller := settings.CallerID(c.WorkflowID)

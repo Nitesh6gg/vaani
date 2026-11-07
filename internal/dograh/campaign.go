@@ -276,44 +276,91 @@ func (s *Store) VaaniCampaigns(ctx context.Context) ([]Campaign, error) {
 	return out, errors.Join(bad...)
 }
 
-// OrgConcurrencyLimit is the organization's CONCURRENT_CALL_LIMIT, and false
-// when it has none set (the caller then uses its default).
-func (s *Store) OrgConcurrencyLimit(ctx context.Context, orgID int) (int, bool, error) {
-	return s.orgConfigInt(ctx, orgID, "CONCURRENT_CALL_LIMIT")
-}
-
-// OrgDialRate is the organization's DIAL_RATE_LIMIT_PER_SECOND (set in Dograh's
-// superadmin page), and false when it has none set (the campaign's own
-// rate_limit_per_second then applies).
-func (s *Store) OrgDialRate(ctx context.Context, orgID int) (int, bool, error) {
-	return s.orgConfigInt(ctx, orgID, "DIAL_RATE_LIMIT_PER_SECOND")
-}
-
-// orgConfigInt reads an integer organization_configurations value of the form
-// {"value": n}; false when the row, or the number in it, is missing.
-func (s *Store) orgConfigInt(ctx context.Context, orgID int, key string) (int, bool, error) {
-	var raw string
-
-	err := s.pool.QueryRow(ctx, `
-		SELECT value::text FROM organization_configurations
-		WHERE organization_id = $1 AND key = $2`, orgID, key).Scan(&raw)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, false, nil
-	}
-
-	if err != nil {
-		return 0, false, fmt.Errorf("dograh: org %d %s: %w", orgID, key, err)
-	}
-
+// configInt is the integer in an organization_configurations value of the form
+// {"value": n}; false when there is none.
+func configInt(raw string) (int, bool) {
 	var v struct {
 		Value *int `json:"value"`
 	}
 
 	if json.Unmarshal([]byte(raw), &v) != nil || v.Value == nil {
-		return 0, false, nil
+		return 0, false
 	}
 
-	return *v.Value, true, nil
+	return *v.Value, true
+}
+
+// DialCheck is everything the dialer needs to know before it dials a contact
+// of a campaign, read in one round trip.
+type DialCheck struct {
+	Running       bool // the campaign is still 'running'
+	ConcurrentMax int  // the organization's CONCURRENT_CALL_LIMIT, if HasConcurrent
+	HasConcurrent bool
+	DialRate      int // the organization's DIAL_RATE_LIMIT_PER_SECOND, if HasDialRate
+	HasDialRate   bool
+	WalletBlocks  bool
+	// Settings is the organization's telephony configuration; HasSettings is
+	// false when it has none.
+	Settings    DialSettings
+	HasSettings bool
+}
+
+// DialCheck reads campaign campaignID's state, its organization's limits,
+// wallet and telephony settings at once. The campaign's state is read fresh
+// every time (not cached), so a Pause in Dograh's UI stops dialing at the next
+// contact. A campaign that doesn't exist is not running.
+func (s *Store) DialCheck(ctx context.Context, campaignID, orgID int) (DialCheck, error) {
+	var (
+		d                                    DialCheck
+		limitRaw, rateRaw                    *string
+		mode                                 *string
+		rate, balance, credit                *float64
+		hasSettings                          bool
+		provider, tech, trunk, strip, fromJS string
+		mapJS                                string
+	)
+
+	err := s.pool.QueryRow(ctx, `
+		SELECT c.state = 'running',
+			(SELECT value::text FROM organization_configurations WHERE organization_id = $2 AND key = 'CONCURRENT_CALL_LIMIT' LIMIT 1),
+			(SELECT value::text FROM organization_configurations WHERE organization_id = $2 AND key = 'DIAL_RATE_LIMIT_PER_SECOND' LIMIT 1),
+			o.billing_mode, o.billing_rate_per_min_inr::float8, o.wallet_balance_inr::float8, o.credit_limit_inr::float8,
+			t.v IS NOT NULL,
+			COALESCE(t.v->>'provider', 'twilio'), COALESCE(t.v->>'sip_technology', 'PJSIP'),
+			COALESCE(t.v->>'outbound_trunk', ''), COALESCE(t.v->>'strip_number_prefix', ''),
+			COALESCE((t.v->'from_numbers')::text, '[]'), COALESCE((t.v->'number_workflow_map')::text, '{}')
+		FROM campaigns c
+		LEFT JOIN organizations o ON o.id = $2
+		LEFT JOIN LATERAL (SELECT value::text::jsonb AS v FROM organization_configurations
+			WHERE organization_id = $2 AND key = 'TELEPHONY_CONFIGURATION' LIMIT 1) t ON true
+		WHERE c.id = $1`, campaignID, orgID).
+		Scan(&d.Running, &limitRaw, &rateRaw, &mode, &rate, &balance, &credit, &hasSettings,
+			&provider, &tech, &trunk, &strip, &fromJS, &mapJS)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return d, nil
+	}
+
+	if err != nil {
+		return d, fmt.Errorf("dograh: campaign %d dial check: %w", campaignID, err)
+	}
+
+	if limitRaw != nil {
+		d.ConcurrentMax, d.HasConcurrent = configInt(*limitRaw)
+	}
+
+	if rateRaw != nil {
+		d.DialRate, d.HasDialRate = configInt(*rateRaw)
+	}
+
+	d.WalletBlocks = walletBlocks(mode, rate, balance, credit)
+
+	if hasSettings {
+		d.HasSettings = true
+		d.Settings = DialSettings{Provider: provider, Technology: tech, Trunk: trunk, StripPrefix: strip}
+		d.Settings.finish(fromJS, mapJS)
+	}
+
+	return d, nil
 }
 
 // ClaimRuns takes up to limit runs that are due, scheduled retries first (the
@@ -379,30 +426,31 @@ func (s *Store) SetRunState(ctx context.Context, runID int, state string) error 
 		return fmt.Errorf("dograh: run %d: unknown state %q", runID, state)
 	}
 
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("dograh: run %d: %w", runID, err)
+	// One statement, so one round trip: the run's new state and, for a
+	// contact that was handled, the campaign's counter (incremented in SQL, so
+	// concurrent updates can't lose one).
+	query := `
+		WITH u AS (
+			UPDATE queued_runs SET state = $2::queued_run_state,
+				processed_at = CASE WHEN $2 = 'queued' THEN NULL ELSE now() END
+			WHERE id = $1 RETURNING campaign_id)`
+
+	if column := map[string]string{RunProcessed: "processed_rows", RunFailed: "failed_rows"}[state]; column != "" {
+		query += `, c AS (UPDATE campaigns SET ` + column + ` = ` + column + ` + 1 FROM u WHERE campaigns.id = u.campaign_id)`
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
 
-	var campaignID int
+	query += ` SELECT count(*) FROM u`
 
-	err = tx.QueryRow(ctx, `
-		UPDATE queued_runs SET state = $2::queued_run_state,
-			processed_at = CASE WHEN $2 = 'queued' THEN NULL ELSE now() END
-		WHERE id = $1 RETURNING campaign_id`, runID, state).Scan(&campaignID)
-	if err != nil {
+	var n int
+	if err := s.pool.QueryRow(ctx, query, runID, state).Scan(&n); err != nil {
 		return fmt.Errorf("dograh: run %d to %s: %w", runID, state, err)
 	}
 
-	column := map[string]string{RunProcessed: "processed_rows", RunFailed: "failed_rows"}[state]
-	if column != "" {
-		if _, err := tx.Exec(ctx, "UPDATE campaigns SET "+column+" = "+column+" + 1 WHERE id = $1", campaignID); err != nil {
-			return fmt.Errorf("dograh: campaign %d counter: %w", campaignID, err)
-		}
+	if n == 0 {
+		return fmt.Errorf("dograh: run %d to %s: no such run", runID, state)
 	}
 
-	return tx.Commit(ctx)
+	return nil
 }
 
 // ScheduleRetry adds a new run for run's contact, due after delay, as Dograh's
@@ -439,22 +487,6 @@ func (s *Store) ScheduleRetry(ctx context.Context, run QueuedRun, reason string,
 	return nil
 }
 
-// CampaignRunning says whether campaign id is still in the 'running' state: a
-// Pause in Dograh's UI takes effect at the next call to be placed.
-func (s *Store) CampaignRunning(ctx context.Context, id int) (bool, error) {
-	var running bool
-
-	if err := s.pool.QueryRow(ctx, `SELECT state = 'running' FROM campaigns WHERE id = $1`, id).Scan(&running); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return false, nil
-		}
-
-		return false, fmt.Errorf("dograh: campaign %d state: %w", id, err)
-	}
-
-	return running, nil
-}
-
 // SetCampaignState moves campaign id from one state to another, only if it is
 // still in from (a Pause or Resume made meanwhile in Dograh's UI wins). It
 // says whether it moved.
@@ -475,25 +507,6 @@ func (s *Store) AddFailedRow(ctx context.Context, campaignID int) error {
 	}
 
 	return nil
-}
-
-// WalletBlocks says whether the organization's wallet forbids new calls:
-// Dograh's wallet_blocks_calls / can_start_call. Billing off, or a lookup that
-// fails, never blocks.
-func (s *Store) WalletBlocks(ctx context.Context, orgID int) bool {
-	var (
-		mode                  *string
-		rate, balance, credit *float64
-	)
-
-	err := s.pool.QueryRow(ctx, `
-		SELECT billing_mode, billing_rate_per_min_inr::float8, wallet_balance_inr::float8, credit_limit_inr::float8
-		FROM organizations WHERE id = $1`, orgID).Scan(&mode, &rate, &balance, &credit)
-	if err != nil {
-		return false
-	}
-
-	return walletBlocks(mode, rate, balance, credit)
 }
 
 // walletBlocks is Dograh's can_start_call, inverted: prepaid needs at least a

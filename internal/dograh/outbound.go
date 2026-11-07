@@ -50,6 +50,14 @@ func (s *Store) DialSettings(ctx context.Context, orgID int) (DialSettings, erro
 		return d, fmt.Errorf("dograh: telephony configuration of organization %d: %w", orgID, err)
 	}
 
+	d.finish(fromJSON, mapJSON)
+
+	return d, nil
+}
+
+// finish normalizes the strings read from the telephony configuration and
+// parses its from_numbers and number_workflow_map JSON.
+func (d *DialSettings) finish(fromJSON, mapJSON string) {
 	d.Technology = strings.ToUpper(strings.TrimSpace(d.Technology))
 	if d.Technology == "" {
 		d.Technology = "PJSIP"
@@ -81,8 +89,6 @@ func (s *Store) DialSettings(ctx context.Context, orgID int) (DialSettings, erro
 			}
 		}
 	}
-
-	return d, nil
 }
 
 // Endpoint is the Asterisk dial string for number: used as given when it

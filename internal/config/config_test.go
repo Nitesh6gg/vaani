@@ -212,7 +212,7 @@ func TestLoad_AgentMode_SucceedsOnceAllRequiredSettingsAreSet(t *testing.T) {
 	assert.Equal(t, 19, cfg.DograhWorkflowID)
 }
 
-// TestLoad_DograhDBMaxConns: the Dograh database pool defaults to 50 and
+// TestLoad_DograhDBMaxConns: the Dograh database pool defaults to 80 and
 // DOGRAH_DB_MAX_CONNS changes it; zero or garbage is refused.
 func TestLoad_DograhDBMaxConns(t *testing.T) {
 	restoreWD := chdir(t, t.TempDir())
@@ -224,13 +224,13 @@ func TestLoad_DograhDBMaxConns(t *testing.T) {
 
 	cfg, err := Load()
 	require.NoError(t, err)
-	assert.Equal(t, 50, cfg.DograhDBMaxConns)
+	assert.Equal(t, 80, cfg.DograhDBMaxConns)
 
-	t.Setenv("DOGRAH_DB_MAX_CONNS", "80")
+	t.Setenv("DOGRAH_DB_MAX_CONNS", "120")
 
 	cfg, err = Load()
 	require.NoError(t, err)
-	assert.Equal(t, 80, cfg.DograhDBMaxConns)
+	assert.Equal(t, 120, cfg.DograhDBMaxConns)
 
 	for _, bad := range []string{"0", "-3", "many"} {
 		t.Setenv("DOGRAH_DB_MAX_CONNS", bad)
@@ -415,5 +415,29 @@ func TestLoad_Campaigns(t *testing.T) {
 		assert.Error(t, err, k)
 
 		t.Setenv(k, map[string]string{"OUTBOUND_MAX_CALLS": "20", "OUTBOUND_DEFAULT_ORG_CONCURRENCY": "2", "CAMPAIGN_POLL_SECONDS": "5"}[k])
+	}
+}
+
+// TestLoad_CampaignDialWorkers: 10 dial workers per campaign by default;
+// CAMPAIGN_DIAL_WORKERS changes it; zero or garbage is refused.
+func TestLoad_CampaignDialWorkers(t *testing.T) {
+	restoreWD := chdir(t, t.TempDir())
+	defer restoreWD()
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, 10, cfg.CampaignDialWorkers)
+
+	t.Setenv("CAMPAIGN_DIAL_WORKERS", "3")
+
+	cfg, err = Load()
+	require.NoError(t, err)
+	assert.Equal(t, 3, cfg.CampaignDialWorkers)
+
+	for _, bad := range []string{"0", "-1", "many"} {
+		t.Setenv("CAMPAIGN_DIAL_WORKERS", bad)
+
+		_, err = Load()
+		assert.ErrorContains(t, err, "CAMPAIGN_DIAL_WORKERS", bad)
 	}
 }

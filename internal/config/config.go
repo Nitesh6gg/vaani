@@ -135,6 +135,13 @@ type Config struct {
 	// CampaignPoll (CAMPAIGN_POLL_SECONDS, default 5) is how often Dograh's
 	// database is scanned for campaigns to dial.
 	CampaignPoll time.Duration
+	// CampaignDialWorkers (CAMPAIGN_DIAL_WORKERS, default 10) is how many
+	// contacts of one campaign are dialed at the same time. Dialing one takes
+	// ~10 round trips to Postgres, Redis and Asterisk, so a single worker tops
+	// out near 5 calls a second however high the organization's dial rate is.
+	// The organization's rate and concurrency limits still decide the real
+	// speed; this only lifts the ceiling. 1 = the old one-at-a-time dialer.
+	CampaignDialWorkers int
 
 	// DograhDBURL is the Postgres connection string of a self-hosted Dograh
 	// deployment (DOGRAH_DB_URL), and DograhWorkflowID the Dograh workflow
@@ -143,12 +150,13 @@ type Config struct {
 	// Both required when AppMode is "agent".
 	DograhDBURL      string
 	DograhWorkflowID int
-	// DograhDBMaxConns (DOGRAH_DB_MAX_CONNS, default 50) caps the connection
+	// DograhDBMaxConns (DOGRAH_DB_MAX_CONNS, default 80) caps the connection
 	// pool to Dograh's Postgres. Every call reads its workflow, tools and
 	// recordings when it starts and writes its run, so a burst of calls
 	// queues on the pool: the library's own default (16 on a 16-CPU host)
 	// is too small for that. Dograh gives its Asterisk call manager, the
-	// same one-process funnel, 40+60. A pool_max_conns in DOGRAH_DB_URL wins.
+	// same one-process funnel, 40+60. The campaign dial workers share this pool
+	// with the calls being set up. A pool_max_conns in DOGRAH_DB_URL wins.
 	DograhDBMaxConns int
 
 	// Dograh's MinIO, where each call's recording and transcript are
@@ -290,7 +298,7 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 
-	if cfg.DograhDBMaxConns, err = getEnvInt("DOGRAH_DB_MAX_CONNS", 50); err != nil {
+	if cfg.DograhDBMaxConns, err = getEnvInt("DOGRAH_DB_MAX_CONNS", 80); err != nil {
 		return Config{}, err
 	}
 
@@ -402,6 +410,14 @@ func Load() (Config, error) {
 	}
 
 	cfg.CampaignPoll = time.Duration(pollSeconds) * time.Second
+
+	if cfg.CampaignDialWorkers, err = getEnvInt("CAMPAIGN_DIAL_WORKERS", 10); err != nil {
+		return Config{}, err
+	}
+
+	if cfg.CampaignDialWorkers < 1 {
+		return Config{}, fmt.Errorf("config: CAMPAIGN_DIAL_WORKERS must be at least 1, got %d", cfg.CampaignDialWorkers)
+	}
 
 	if cfg.CampaignsEnabled && (cfg.RedisURL == "" || cfg.DograhDBURL == "") {
 		return Config{}, fmt.Errorf("config: CAMPAIGNS_ENABLED=1 needs REDIS_URL and DOGRAH_DB_URL")
