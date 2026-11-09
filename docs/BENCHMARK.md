@@ -52,6 +52,7 @@ Times are IST. Windows are 1 hour (Oct 27 evening: 30 min).
 | Nov 5 18:07–18:10 (campaign 21, "test_up_2000" resumed, paused after 726 dials) | sarvam-105b-conversations | 378 | 231 min | **94** (1-min max) | 179 | 2.49 / 15.5% | **0.036** | 696 MB | 447 MB | 1442 |
 | Nov 6 14:50–14:55 (campaign 21 again, 1197 dials, paused by hand) | sarvam-105b-conversations | 631 | 261 min | 70 (1-min max) | 169 | 2.19 / 13.7% | 0.038 | 585 MB | 382 MB | 1120 |
 | Nov 9 12:28 (campaign 21, **parallel dial workers**, contact list ran out: 299 dials) | sarvam-105b-conversations | 137 | 58 min | 73 (1-min max) | **266** | 1.03 / 6.5% (1-min avg; the dial burst lasted ~10 s) | 0.048 (short run, see log) | 512 MB | 314 MB | 1089 |
+| Nov 9 16:30 (campaign 22, **475 dials in 10 s**, paused by the circuit breaker) | sarvam-105b-conversations | 150 | 5,167 s (86 min) | **94** (1-min max) | **468** | 1.50 / 9.4% (1-min avg) | **0.037** | not pulled | not pulled | not pulled |
 
 Idle Vaani: 0.002 core, ~51 MB RSS, 19 goroutines, 23 OS threads (constant under load).
 After a run RSS stays high (~300 MB on Nov 2) because Go keeps freed memory; the heap itself returned to ~32 MB within ~6 minutes, so there is no leak.
@@ -102,6 +103,7 @@ Stable across three tests. Extrapolated to 250 talking calls (not measured): ~10
 | Nov 5 (campaign 21, sarvam-105b) | 9 (stt 6, tts_open 2, tts_drain_timeout 1) | 0 / 0 | 0 | not available (SigNoz: `vaani_pacer_drift_ms` never received) | 259 ms / 976 ms (from `llm.first_token` logs) | 398 ms / 1.14 s (from `tts.first_audio` logs) | 17 (4 calls hung up as media dead) |
 | Nov 6 (campaign 21, sarvam-105b) | 5 (all `tts_closed`; plus 9 "tts websocket closed by provider" ERROR logs) | 0 / 0 | 0 | not available (never received) | 238 ms / 488 ms (from `llm.first_token` logs) | 340 ms / 683 ms (from `tts.first_audio` logs) | 23 (2 calls hung up as media dead) |
 | Nov 9 (campaign 21, parallel dialing, sarvam-105b) | 0 | 0 / 0 | 0 (not queried; no `media dropped` logs) | not available | 195 ms / 367 ms (from `llm.first_token` logs) | p95 576 ms (p50 not pulled) | 3 (1 call hung up as media dead) |
+| Nov 9 16:30 (campaign 22, 475 dials in 10 s) | 0 | 0 / 0 | not queried | not available | p95 438 ms (p50 not pulled) | not pulled | 72 (34 calls hung up as media dead, 47 `media.silent`) |
 
 Reference, Oct 28 (Sarvam LLM): LLM TTFT p50 ~200 ms / p95 ~390 ms; TTS TTFA p95 ~760 ms; STT endpoint p95 ~100–390 ms. Bifrost dashboard (Nov 1–2): gemini-3.1-flash-lite avg 1.08 s per request, 99.7% success; sarvam-105b avg 187 ms. Older tests' errors / drift were not re-pulled: fill the blanks in when re-checking.
 
@@ -166,6 +168,16 @@ Reference, Oct 28 (Sarvam LLM): LLM TTFT p50 ~200 ms / p95 ~390 ms; TTS TTFA p95
 - CPU: 168 CPU-s for 3,485 talk-s = **0.048 core per talking call**, higher than 0.036–0.038 only because the run was short: the dial burst and ring-time work is spread over few talking seconds. Not comparable with the longer tests. Peak 1.03 cores in a 1-minute average (the burst itself, ~10 s, was not measured finer). Heap 314 MB, RSS 512 MB, 1089 goroutines at 266 in flight.
 - LLM first token p50 195 ms / p95 367 ms; TTS first audio p95 576 ms; 0 LLM requests ≥3 s; 0 retries, 0 fallbacks; 0 agent errors, no "tts websocket closed" (Nov 6 had 9, at ~70 talking). 3 media watchdog timeouts, 1 call hung up as media dead. 13 `tts.clip_missing` (recording `34bk399q`).
 - **What this does not show**: how Asterisk, the SIP trunk and Sarvam behave with a *sustained* high dial rate and 150+ talking calls. For that: a campaign with at least ~3,000 contacts so it keeps dialing for several minutes, and a dial rate stepped up 10 → 15 → 20.
+
+### Nov 9, 2026 — campaign 22, 475 dials in 10 seconds (breaker paused it)
+
+- Build: parallel dial workers; org `CONCURRENT_CALL_LIMIT` 600, `DIAL_RATE_LIMIT_PER_SECOND` 100 (stored value not re-read). Dialed 16:30:10–16:30:20 IST (11:00 UTC): 174, 261, 40 per 5-s bucket, ~50/s peak. **468 calls in flight**, record.
+- **The breaker paused the campaign at 16:30:20** ("circuit breaker: 3 of 5 calls failed"), but all 475 calls were already out. It judges the last 5 results, so with parallel dialing it trips after the burst, not during it.
+- **Funnel of the 475 dials:** 197 no result from Asterisk (`outbound.timeout`, hung up ~16:31), 63 no-answer cause 19, 16 rejected cause 21, 47 failed (36 cause 0, 8 cause 16, 3 cause 38), 188 answered. Of those 188: 26 `call.setup_failed` (24 "add caller to bridge" 400, 2 "answer" 404) and 12 abandoned, so **150 were bridged** (31% of dials, vs 46% answered on the 271-dial run).
+- **Media failures: 34 of the 150 bridged calls (23%) hung up as media dead** (no inbound audio), 72 "no inbound rtp" watchdog warnings, 47 `media.silent`. The timeouts, setup failures and dead-media hangups all fell between 16:30:30 and 16:31:30, right after the burst. No pipeline error alongside them (0 agent errors in every stage).
+- **Reading (not proven):** Asterisk or the SIP trunk could not set up ~190 answered calls at once; the agent side is not the cause. The 197 no-result calls could also be genuine ring timeouts. Needs Asterisk and trunk logs for 16:30:30–16:31:30 to settle.
+- CPU: 192 CPU-s for 5,167 talk-s = **0.037 core per talking call** (same as Nov 5, 0.036). Peak 1.50 cores in a 1-minute average at 94 talking. LLM first token p95 438 ms, 0 retries, 0 fallbacks, 0 agent errors.
+- **Next:** rerun at a lower dial rate, 10 → 15 → 20/s; confirm the trunk's calls-per-second and channel limits; make the breaker work on a per-second dial budget (not agreed yet).
 
 ## Capacity estimates (NOT measured)
 
