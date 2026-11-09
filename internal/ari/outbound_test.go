@@ -390,6 +390,42 @@ func TestStartCall_SetupTimesOutWhenTheMediaChannelNeverArrives(t *testing.T) {
 	assert.Zero(t, r.ports.InUse(), "the port is free again")
 }
 
+// The timeout runs in the call's queue: while that call's events are being
+// handled it waits, so it can't abort a call its StasisStart is bridging.
+func TestStartCall_SetupTimeoutWaitsForTheCallsQueue(t *testing.T) {
+	r := newOutboundRig(t)
+
+	old := setupTimeout
+	setupTimeout = 100 * time.Millisecond
+
+	t.Cleanup(func() { setupTimeout = old })
+
+	r.channels.On("Get", mock.Anything).Return(ari.NewChannelHandle(ari.NewKey(ari.ChannelKey, "caller-1"), r.channels, nil))
+	r.channels.On("Answer", mock.Anything).Return(nil)
+	r.channels.On("ExternalMedia", mock.Anything, mock.Anything).Return(nil, nil)
+
+	r.m.onStasisStart(context.Background(), &ari.StasisStart{Channel: ari.ChannelData{ID: "caller-1"}})
+	require.Equal(t, 1, r.m.SettingUp())
+
+	release := make(chan struct{})
+	r.m.exec.do("caller-1", func() { <-release }) // the call's queue is busy
+
+	hung := func() int {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+
+		return len(r.hungUp)
+	}
+
+	time.Sleep(300 * time.Millisecond) // past the timeout
+	assert.Zero(t, hung(), "the timeout waits behind the call's running handler")
+	assert.Equal(t, 1, r.m.SettingUp())
+
+	close(release)
+	require.Eventually(t, func() bool { return hung() == 2 }, 3*time.Second, 10*time.Millisecond)
+	assert.Zero(t, r.m.SettingUp())
+}
+
 // The media channel arriving in time stops the timer.
 func TestStartCall_MediaChannelInTimeKeepsTheCall(t *testing.T) {
 	r := newOutboundRig(t)

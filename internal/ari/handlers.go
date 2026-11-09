@@ -538,7 +538,9 @@ func (m *Manager) startCall(ctx context.Context, e *ari.StasisStart) {
 
 	// Armed after the pending insert: if the media channel never enters Stasis
 	// (its event lost, Asterisk wedged) nothing else would ever end this call.
-	c.setupTimer = time.AfterFunc(setupTimeout, func() { m.setupTimedOut(c) })
+	// It runs in the call's own queue, so it can't race the media channel's
+	// StasisStart: whichever is handled first wins, the other finds nothing.
+	c.setupTimer = time.AfterFunc(setupTimeout, func() { m.exec.do(c.ID, func() { m.setupTimedOut(c) }) })
 
 	c.SetState(session.StateStaged)
 
