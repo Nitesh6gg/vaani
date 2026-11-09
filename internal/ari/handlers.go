@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -28,6 +29,20 @@ const audioSocketAcceptTimeout = 10 * time.Second
 // watcher; it only needs to be fast relative to how long a zombie would
 // otherwise survive.
 const connectivityPollInterval = time.Second
+
+// eventQueueSize is how many ARI events can wait to be handled. The library's
+// own buffer holds 100 and silently drops the rest, so events are moved out of it
+// at once into this one.
+const eventQueueSize = 20000
+
+// setupTimeout is how long a staged call may wait for its media channel to enter
+// Stasis before it is hung up (a var for the tests).
+var setupTimeout = 15 * time.Second
+
+// maxConcurrentSetups bounds the call setups (answer, externalMedia, bridge)
+// running against Asterisk at once; a burst waits its turn here, in Vaani,
+// instead of piling onto Asterisk.
+const maxConcurrentSetups = 16
 
 // call tracks the ARI/media-specific state of one bridged caller<->externalMedia
 // pair; *session.Call carries the lifecycle state and the once-guaranteed
@@ -62,6 +77,11 @@ type call struct {
 	// cap is reached however healthy it looks -- a backstop against a wedged
 	// call burning billable telephony time forever. Stopped inside teardown.
 	maxDur *time.Timer
+
+	// setupTimer hangs the call up if its media channel never enters Stasis
+	// (see setupTimeout). Armed in startCall, stopped when the bridge starts
+	// or the call ends.
+	setupTimer *time.Timer
 
 	// Synchronization: cm and bridge are written on the Stasis event loop
 	// before any other goroutine can discover this call. asm is written by the
@@ -113,6 +133,14 @@ type Manager struct {
 	// agents builds each call's agent and records it in Dograh.
 	agents *callagent.Builder
 
+	// overloaded, when set, says the machine is too busy for another call.
+	overloaded func() bool
+
+	// exec runs the event handlers, one call's events in order, calls in parallel.
+	exec *serial
+	// setupSem bounds the setups running against Asterisk at once.
+	setupSem chan struct{}
+
 	mu        sync.Mutex
 	pending   map[string]*call            // keyed by the externalMedia channel ID, awaiting its StasisStart
 	active    map[string]*call            // keyed by callerID and externalID once bridged (plus transferChannel after a transfer)
@@ -131,10 +159,16 @@ func NewManager(cl ari.Client, cfg config.Config, ports *media.PortAllocator, st
 		active:    make(map[string]*call),
 		transfers: make(map[string]*pendingTransfer),
 		outbound:  make(map[string]*outboundCall),
+		exec:      newSerial(),
+		setupSem:  make(chan struct{}, maxConcurrentSetups),
 	}
 
 	return m
 }
+
+// SetOverloaded makes the Manager refuse new inbound calls while f says the
+// machine is overloaded (the CPU load guard). Call it before Run.
+func (m *Manager) SetOverloaded(f func() bool) { m.overloaded = f }
 
 // Run subscribes to the Stasis events this app cares about and dispatches them
 // until ctx is cancelled.
@@ -146,44 +180,129 @@ func (m *Manager) Run(ctx context.Context) {
 	sub := m.cl.Bus().Subscribe(nil, "StasisStart", "StasisEnd", "ChannelDtmfReceived", "ChannelDestroyed")
 	defer sub.Cancel()
 
+	events := make(chan ari.Event, eventQueueSize)
+
+	go m.pump(ctx, sub, events)
 	go m.watchConnectivity(ctx)
+	go m.sweepOrphans(ctx)
 
 	for {
 		select {
 		case <-ctx.Done():
+			m.exec.idle(5 * time.Second) // handlers in the middle of a setup finish first
 			m.teardownAll()
 			m.agents.Wait() // the calls' Dograh records (bounded by finishRun's timeout)
 
+			return
+		case evt, ok := <-events:
+			if !ok {
+				return
+			}
+
+			metrics.AriEventQueue.Set(float64(len(events)))
+			m.dispatch(ctx, evt)
+		}
+	}
+}
+
+// pump moves events out of the ARI library's subscription as fast as they
+// arrive. The library buffers 100 events and drops any more without a word, so
+// the loop that handles them must never be what the buffer waits on.
+func (m *Manager) pump(ctx context.Context, sub ari.Subscription, events chan<- ari.Event) {
+	defer close(events)
+
+	var warned time.Time
+
+	for {
+		select {
+		case <-ctx.Done():
 			return
 		case evt, ok := <-sub.Events():
 			if !ok {
 				return
 			}
 
-			switch e := evt.(type) {
-			case *ari.StasisStart:
-				m.onStasisStart(ctx, e)
-			case *ari.StasisEnd:
-				m.onStasisEnd(e)
-			case *ari.ChannelDtmfReceived:
-				slog.Debug("dtmf received", "call_id", e.Channel.ID, "digit", e.Digit)
-			case *ari.ChannelDestroyed:
-				// StasisEnd alone doesn't say WHY a channel left.
-				// ChannelDestroyed carries the hangup cause, which
-				// distinguishes a normal caller hangup (16, "Normal
-				// Clearing") from carrier drops, busy/congestion, and
-				// Asterisk-initiated kicks (e.g. its AudioSocket read
-				// timeout) -- without it, every teardown looks identical.
-				// channel_id is whichever leg this is; call_id the call it
-				// belongs to (when it's still known), so the line groups with
-				// the call's others.
-				slog.Info("channel destroyed", "call_id", m.callIDFor(e.Channel.ID), "channel_id", e.Channel.ID,
-					"cause", e.Cause, "cause_txt", e.CauseTxt, "event", "channel.destroyed")
-				m.onTransferLegDestroyed(e)
-				m.onOutboundDestroyed(e)
+			queued := len(sub.Events())
+			metrics.AriLibraryQueue.Set(float64(queued))
+
+			if queued >= 80 && time.Since(warned) > 10*time.Second {
+				warned = time.Now()
+				slog.Warn("ari library event buffer nearly full: events may be dropped", "event", "ari.events_backlog", "queued", queued)
+			}
+
+			select {
+			case events <- evt:
+			default:
+				metrics.AriEventsDropped.Inc()
+				slog.Error("ari event queue full: event dropped", "event", "ari.event_dropped", "type", evt.GetType())
 			}
 		}
 	}
+}
+
+// dispatch hands one event to the executor under its call's key, so a call's
+// events run in order and other calls' events don't wait for them.
+func (m *Manager) dispatch(ctx context.Context, evt ari.Event) {
+	switch e := evt.(type) {
+	case *ari.StasisStart:
+		m.exec.do(m.callKey(e.Channel.ID), func() { m.timed("StasisStart", func() { m.onStasisStart(ctx, e) }) })
+	case *ari.StasisEnd:
+		m.exec.do(m.callKey(e.Channel.ID), func() { m.timed("StasisEnd", func() { m.onStasisEnd(e) }) })
+	case *ari.ChannelDtmfReceived:
+		slog.Debug("dtmf received", "call_id", e.Channel.ID, "digit", e.Digit)
+	case *ari.ChannelDestroyed:
+		m.exec.do(m.callKey(e.Channel.ID), func() { m.timed("ChannelDestroyed", func() { m.onChannelDestroyed(e) }) })
+	}
+
+	metrics.CallsSettingUp.Set(float64(m.SettingUp()))
+}
+
+func (m *Manager) timed(event string, fn func()) {
+	start := time.Now()
+	fn()
+	metrics.AriHandlerSeconds.WithLabelValues(event).Observe(time.Since(start).Seconds())
+}
+
+// callKey is the key a channel's events are ordered under: its call's ID (the
+// caller channel's ID, also for the externalMedia leg once the call is known),
+// or the channel's own ID.
+func (m *Manager) callKey(channelID string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if c := m.active[channelID]; c != nil {
+		return c.ID
+	}
+
+	if c := m.pending[channelID]; c != nil {
+		return c.ID
+	}
+
+	return channelID
+}
+
+// SettingUp is how many answered calls are staged and not yet bridged.
+func (m *Manager) SettingUp() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return len(m.pending) / 2 // each staged call is in pending under both its channel IDs
+}
+
+// onChannelDestroyed logs a channel's end with its hangup cause, and settles
+// the transfer or outbound call waiting on it.
+func (m *Manager) onChannelDestroyed(e *ari.ChannelDestroyed) {
+	// StasisEnd alone doesn't say WHY a channel left. ChannelDestroyed carries
+	// the hangup cause, which distinguishes a normal caller hangup (16, "Normal
+	// Clearing") from carrier drops, busy/congestion, and Asterisk-initiated
+	// kicks (e.g. its AudioSocket read timeout) -- without it, every teardown
+	// looks identical. channel_id is whichever leg this is; call_id the call it
+	// belongs to (when it's still known), so the line groups with the call's
+	// others.
+	slog.Info("channel destroyed", "call_id", m.callIDFor(e.Channel.ID), "channel_id", e.Channel.ID,
+		"cause", e.Cause, "cause_txt", e.CauseTxt, "event", "channel.destroyed")
+	m.onTransferLegDestroyed(e)
+	m.onOutboundDestroyed(e)
 }
 
 // watchConnectivity polls the ARI client's WebSocket state and tears down every
@@ -271,7 +390,21 @@ func (m *Manager) onStasisStart(ctx context.Context, e *ari.StasisStart) {
 	m.mu.Unlock()
 
 	if isExternal {
+		if pc.setupTimer != nil {
+			pc.setupTimer.Stop()
+		}
+
 		m.completeBridge(pc)
+
+		return
+	}
+
+	// A media channel of ours that no call is waiting for (its call was already
+	// aborted or timed out) is not a new caller: hang it up.
+	if strings.HasPrefix(e.Channel.Name, "AudioSocket/") || strings.HasPrefix(e.Channel.Name, "UnicastRTP/") {
+		slog.Warn("media channel entered Stasis but its call is gone; hanging it up", "channel_id", id, "event", "call.media_orphan", "name", e.Channel.Name)
+		hangupChannel(m.cl, id, id)
+
 		return
 	}
 
@@ -283,10 +416,30 @@ func (m *Manager) onStasisStart(ctx context.Context, e *ari.StasisStart) {
 // (see completeBridge).
 func (m *Manager) startCall(ctx context.Context, e *ari.StasisStart) {
 	id := e.Channel.ID
-	channel := m.cl.Channel().Get(e.Key(ari.ChannelKey, id))
 
 	// A call we dialed is already answered (it only enters Stasis on answer).
 	out := m.outboundFor(id)
+
+	// Over the CPU limit, a new caller is refused before it is answered, as
+	// congestion (SIP 503): the trunk can try another server, and the calls
+	// already up keep their CPU. Calls we placed ourselves are not refused here
+	// (the dialer stops placing them while overloaded).
+	if out == nil && m.overloaded != nil && m.overloaded() {
+		metrics.CallsRejectedTotal.WithLabelValues("cpu", "inbound").Inc()
+		slog.Warn("call refused: cpu over the limit", "call_id", id, "event", "call.rejected", "reason", "cpu")
+
+		if err := m.cl.Channel().Hangup(ari.NewKey(ari.ChannelKey, id), "congestion"); err != nil {
+			slog.Debug("hangup failed", "call_id", id, "channel_id", id, "error", err)
+		}
+
+		return
+	}
+
+	// Only so many setups run against Asterisk at once; a burst waits here.
+	m.setupSem <- struct{}{}
+	defer func() { <-m.setupSem }()
+
+	channel := m.cl.Channel().Get(e.Key(ari.ChannelKey, id))
 
 	if out == nil {
 		if err := channel.Answer(); err != nil {
@@ -383,6 +536,12 @@ func (m *Manager) startCall(ctx context.Context, e *ari.StasisStart) {
 		})
 	}
 
+	// Armed after the pending insert: if the media channel never enters Stasis
+	// (its event lost, Asterisk wedged) nothing else would ever end this call.
+	// It runs in the call's own queue, so it can't race the media channel's
+	// StasisStart: whichever is handled first wins, the other finds nothing.
+	c.setupTimer = time.AfterFunc(setupTimeout, func() { m.exec.do(c.ID, func() { m.setupTimedOut(c) }) })
+
 	c.SetState(session.StateStaged)
 
 	externalHost := fmt.Sprintf("%s:%d", m.cfg.MediaIP, port)
@@ -435,6 +594,9 @@ func (m *Manager) startCall(ctx context.Context, e *ari.StasisStart) {
 // creates the bridge, adds both channels, and starts the media plane appropriate
 // to the configured encapsulation.
 func (m *Manager) completeBridge(c *call) {
+	m.setupSem <- struct{}{}
+	defer func() { <-m.setupSem }()
+
 	bridgeKey := ari.NewKey(ari.BridgeKey, rid.New(rid.Bridge))
 
 	bh, err := m.cl.Bridge().Create(bridgeKey, "mixing", bridgeKey.ID)
@@ -647,6 +809,23 @@ func (m *Manager) startAudioSocketMedia(c *call) {
 	asm.Run(c.mediaCtx) // blocking is fine: already running in its own goroutine
 }
 
+// setupTimedOut hangs up a call whose media channel never entered Stasis in
+// time, if it is still waiting for it.
+func (m *Manager) setupTimedOut(c *call) {
+	m.mu.Lock()
+	staged := m.pending[c.ID] == c
+	m.mu.Unlock()
+
+	if !staged {
+		return
+	}
+
+	slog.Warn("call setup timed out: its media channel never entered Stasis; hanging it up", "call_id", c.ID, "external_id", c.ExternalID,
+		"event", "call.setup_timeout", "after_s", int(setupTimeout.Seconds()))
+	metrics.CallsSetupTimeoutTotal.Inc()
+	m.abort(c)
+}
+
 // abort releases a call's port when bridging fails before the media plane starts.
 // It goes through the same Teardown once-guard as a normal hangup so a subsequent
 // StasisEnd for either channel (which Asterisk will still deliver once we hang
@@ -658,6 +837,10 @@ func (m *Manager) abort(c *call) {
 	m.mu.Unlock()
 
 	c.Teardown(func() {
+		if c.setupTimer != nil {
+			c.setupTimer.Stop()
+		}
+
 		closeMediaSocket(c) // the media plane never started; nothing else will close this
 
 		m.ports.Free(c.Port)
@@ -727,6 +910,10 @@ func (m *Manager) teardown(c *call) {
 	c.Teardown(func() {
 		if c.maxDur != nil {
 			c.maxDur.Stop()
+		}
+
+		if c.setupTimer != nil {
+			c.setupTimer.Stop()
 		}
 
 		// Remove the call from both maps: teardown can be triggered from paths

@@ -25,6 +25,7 @@ import (
 	"github.com/nitesh/vaani/internal/config"
 	"github.com/nitesh/vaani/internal/dograh"
 	"github.com/nitesh/vaani/internal/freeswitch"
+	"github.com/nitesh/vaani/internal/load"
 	"github.com/nitesh/vaani/internal/media"
 	"github.com/nitesh/vaani/internal/metrics"
 )
@@ -108,6 +109,12 @@ func run() error {
 	ports := media.NewPortAllocator(cfg.MediaPortBase, cfg.MediaPortCount)
 	mgr := vaaniari.NewManager(cl, cfg, ports, store, storage)
 
+	// Over LOAD_SHED_CPU_PERCENT: no new calls, in or out (calls up are kept).
+	guard := load.New(cfg.LoadShedCPUPercent, cfg.LoadResumePercent)
+	mgr.SetOverloaded(guard.Overloaded)
+
+	go guard.Run(ctx)
+
 	slog.Info("vaani running", "metrics_addr", cfg.MetricsAddr, "media_ip", cfg.MediaIP, "app_mode", cfg.AppMode,
 		"event", "service.started")
 
@@ -123,7 +130,7 @@ func run() error {
 	}
 
 	if cfg.CampaignsEnabled {
-		runner, err := newCampaignRunner(ctx, cfg, store, mgr)
+		runner, err := newCampaignRunner(ctx, cfg, store, mgr, guard)
 		if err != nil {
 			return err
 		}
@@ -252,7 +259,7 @@ func runOutboundTestCall(ctx context.Context, cfg config.Config, store *dograh.S
 // concurrency counters live (Dograh's own, so limits hold across both
 // engines), and returns the runner that dials the campaigns Dograh's
 // MEDIA_ENGINE setting hands to Vaani.
-func newCampaignRunner(ctx context.Context, cfg config.Config, store *dograh.Store, mgr *vaaniari.Manager) (*campaign.Runner, error) {
+func newCampaignRunner(ctx context.Context, cfg config.Config, store *dograh.Store, mgr *vaaniari.Manager, guard *load.Guard) (*campaign.Runner, error) {
 	if store == nil {
 		return nil, fmt.Errorf("CAMPAIGNS_ENABLED=1 needs the Dograh database (DOGRAH_DB_URL, APP_MODE=agent)")
 	}
@@ -276,6 +283,7 @@ func newCampaignRunner(ctx context.Context, cfg config.Config, store *dograh.Sto
 
 	return campaign.NewRunner(store, campaign.NewLimiter(rdb, cfg.OutboundMaxCalls), mgr, campaign.RunnerConfig{
 		Poll: cfg.CampaignPoll, DefaultOrgLimit: cfg.OutboundDefaultOrgLimit, RingTimeout: cfg.OutboundRingTimeout,
-		Workers: cfg.CampaignDialWorkers,
+		Workers: cfg.CampaignDialWorkers, Overloaded: guard.Overloaded,
+		SettingUp: mgr.SettingUp, MaxSettingUp: cfg.OutboundMaxSetup,
 	}), nil
 }

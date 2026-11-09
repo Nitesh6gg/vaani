@@ -25,6 +25,57 @@ var (
 		Help: "Number of calls currently bridged to the media plane.",
 	})
 
+	CPULoadRatio = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "vaani_cpu_load_ratio",
+		Help: "The machine's CPU use over the last 5 seconds, 0..1 (only with LOAD_SHED_CPU_PERCENT set).",
+	})
+
+	Overloaded = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "vaani_overloaded",
+		Help: "1 while the CPU is over LOAD_SHED_CPU_PERCENT and new calls are refused.",
+	})
+
+	CallsRejectedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "vaani_calls_rejected_total",
+		Help: "Calls Vaani refused to take, by reason (cpu: the machine was over LOAD_SHED_CPU_PERCENT; setup: OUTBOUND_MAX_SETUP calls were still being set up), and direction (inbound, outbound: a contact left in the queue).",
+	}, []string{"reason", "direction"})
+
+	AriEventQueue = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "vaani_ari_event_queue_length",
+		Help: "ARI events read from Asterisk and waiting to be handled (our own queue, 20000 events).",
+	})
+
+	AriLibraryQueue = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "vaani_ari_library_queue_length",
+		Help: "Events waiting in the ARI library's own 100-event buffer when we read one. The library silently drops events once it is full; near 100 means events are being lost.",
+	})
+
+	AriEventsDropped = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "vaani_ari_events_dropped_total",
+		Help: "ARI events dropped because our own 20000-event queue was full (should be 0).",
+	})
+
+	AriHandlerSeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "vaani_ari_event_handler_seconds",
+		Help:    "How long handling one ARI event took (it makes blocking calls to Asterisk), by event type.",
+		Buckets: prometheus.ExponentialBuckets(0.005, 2, 12), // 5 ms .. ~10 s
+	}, []string{"event"})
+
+	CallsSettingUp = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "vaani_calls_setting_up",
+		Help: "Calls answered and staged (externalMedia requested) but not yet bridged.",
+	})
+
+	CallsSetupTimeoutTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "vaani_calls_setup_timeout_total",
+		Help: "Calls hung up because their media channel never entered Stasis within 15 seconds of being staged.",
+	})
+
+	OrphanChannelsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "vaani_orphan_channels_hung_up_total",
+		Help: "Asterisk channels in Vaani's Stasis app that Vaani had lost track of, hung up by the periodic sweep.",
+	})
+
 	CallsStartedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "vaani_calls_started_total",
 		Help: "Calls bridged to the media plane (answered), by direction (inbound, outbound). Rate it for calls started per minute.",

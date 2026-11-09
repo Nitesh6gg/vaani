@@ -567,6 +567,63 @@ call already finished`.
 - **`end_call` then an interruption:** the end-call still happens even if
   the interruption cancelled the turn the tool ran in.
 
+## ARI event handling (burst safety)
+
+Found on Nov 9 with a 475-call burst (see `docs/BENCHMARK.md`): the ARI library
+(`stdbus`) gives a subscriber a **100-event buffer and silently drops what
+doesn't fit** (`default: // never block`), and Vaani handled every event inline
+on one loop, each handler making blocking Asterisk requests (answer,
+externalMedia, bridge, hangups). A burst of answered calls filled the buffer:
+lost "answered" / "destroyed" events became `outbound.timeout` (a callee who did
+answer was hung up on), lost externalMedia `StasisStart`s left channels Up on
+Asterisk for ever (nothing ever hung them up, and their calls stayed "in flight"),
+and late handling gave `add caller to bridge 400`.
+
+Now:
+- `Manager.pump` moves events out of the library's buffer at once into Vaani's own
+  20,000-event queue (`vaani_ari_library_queue_length` shows how close to 100 the
+  library ever got; `vaani_ari_events_dropped_total` should stay 0).
+- `Manager.dispatch` hands each event to `serial` (`serial.go`): **one call's events
+  in order, different calls in parallel.** A call's key is its caller channel's ID
+  (an externalMedia leg's events are keyed by its call). No call waits on another's
+  Asterisk requests. At most 16 setups (answer/externalMedia, bridge) run against
+  Asterisk at once (`maxConcurrentSetups`); the rest wait in Vaani.
+- **Setup timeout:** a staged call whose media channel doesn't enter Stasis in 15 s
+  is hung up and its port freed (`call.setup_timeout`). A media channel that enters
+  Stasis with no call waiting for it is hung up, not taken for a new caller.
+- **Orphan sweep** (`ORPHAN_SWEEP_SECONDS`, default 30, `sweep.go`): every 30 s
+  `GET /channels`; a channel in this ARI app, older than 90 s, that Vaani doesn't
+  track (pending, active, transfer, dialed) is hung up (`channel.orphan`).
+- **The dialer follows the setup backlog:** it places no call while
+  `OUTBOUND_MAX_SETUP` (30) answered calls are staged and not yet bridged
+  (`vaani_calls_setting_up`, `vaani_calls_rejected_total{reason="setup"}`).
+- Metrics: `vaani_ari_event_handler_seconds{event}` (how long handling an event
+  takes), `vaani_ari_event_queue_length`, `vaani_calls_setup_timeout_total`,
+  `vaani_orphan_channels_hung_up_total`.
+
+## CPU guard (`LOAD_SHED_CPU_PERCENT`, default 90)
+
+Past a CPU level the calls already up start missing their 20ms ticks and the
+callers hear jitter. `internal/load` samples the **whole machine's** CPU from
+`/proc/stat` every second (Asterisk shares the box, and a starved Asterisk is as
+bad as a starved Vaani) and averages the last 5 seconds. At or over the limit it
+turns *overloaded*; it turns back only after 10 seconds under
+`LOAD_SHED_RESUME_PERCENT` (80), so it can't flap. Like LiveKit's agent workers
+(`load_threshold`), it only **stops taking new work**; calls in progress are
+never dropped.
+
+- **Inbound:** `startCall` hangs a new caller up as `congestion` (SIP 503)
+  *before answering*, so the trunk can try another server. Nothing is allocated.
+  Calls Vaani dialed itself and transfer legs are not touched.
+- **Outbound:** `Runner.dialOne` waits (1 s) before reading, taking a rate token
+  or slot, or claiming a contact; the campaign carries on by itself afterwards.
+- Metrics: `vaani_cpu_load_ratio`, `vaani_overloaded`,
+  `vaani_calls_rejected_total{reason="cpu",direction}`. Events `load.overloaded`,
+  `load.recovered`, `call.rejected`. Alert on `vaani_overloaded` to add capacity:
+  scale out below this limit, as LiveKit advises.
+- Linux only; elsewhere (no `/proc/stat`) the guard logs `load.unavailable` and
+  never refuses. FreeSWITCH mode is not guarded.
+
 ## Operability endpoints
 
 All served by `internal/metrics.Serve` on `METRICS_ADDR` (default `:9091`), with

@@ -135,6 +135,25 @@ type Config struct {
 	// CampaignPoll (CAMPAIGN_POLL_SECONDS, default 5) is how often Dograh's
 	// database is scanned for campaigns to dial.
 	CampaignPoll time.Duration
+	// OutboundMaxSetup (OUTBOUND_MAX_SETUP, default 30; 0 = no cap): the dialer
+	// places no call while this many answered calls are still being set up
+	// (staged, not yet bridged), so it never dials faster than Vaani and Asterisk
+	// can set calls up.
+	OutboundMaxSetup int
+	// OrphanSweepInterval (ORPHAN_SWEEP_SECONDS, default 30; 0 = off) is how
+	// often Asterisk's channels are listed and the ones of Vaani's ARI app that
+	// Vaani lost track of are hung up. Needs this Vaani to be the only one on its
+	// ARI app name.
+	OrphanSweepInterval time.Duration
+	// LoadShedCPUPercent (LOAD_SHED_CPU_PERCENT, default 90; 0 = off): while the
+	// machine's CPU (a 5-second average, Asterisk included) is at or over it,
+	// new calls are refused -- inbound ones are hung up as congestion before
+	// they are answered, and campaigns don't dial -- so the calls already up
+	// don't get jitter. Calls in progress are never dropped. LoadResumePercent
+	// (LOAD_SHED_RESUME_PERCENT, default 80) is the level it must stay under
+	// for 10 seconds before new calls are taken again.
+	LoadShedCPUPercent int
+	LoadResumePercent  int
 	// CampaignDialWorkers (CAMPAIGN_DIAL_WORKERS, default 10) is how many
 	// contacts of one campaign are dialed at the same time. Dialing one takes
 	// ~10 round trips to Postgres, Redis and Asterisk, so a single worker tops
@@ -410,6 +429,35 @@ func Load() (Config, error) {
 	}
 
 	cfg.CampaignPoll = time.Duration(pollSeconds) * time.Second
+
+	if cfg.OutboundMaxSetup, err = getEnvInt("OUTBOUND_MAX_SETUP", 30); err != nil {
+		return Config{}, err
+	}
+
+	sweepSeconds, err := getEnvInt("ORPHAN_SWEEP_SECONDS", 30)
+	if err != nil {
+		return Config{}, err
+	}
+
+	if cfg.OutboundMaxSetup < 0 || sweepSeconds < 0 {
+		return Config{}, fmt.Errorf("config: OUTBOUND_MAX_SETUP and ORPHAN_SWEEP_SECONDS must be >= 0")
+	}
+
+	cfg.OrphanSweepInterval = time.Duration(sweepSeconds) * time.Second
+
+	if cfg.LoadShedCPUPercent, err = getEnvInt("LOAD_SHED_CPU_PERCENT", 90); err != nil {
+		return Config{}, err
+	}
+
+	if cfg.LoadResumePercent, err = getEnvInt("LOAD_SHED_RESUME_PERCENT", 80); err != nil {
+		return Config{}, err
+	}
+
+	if cfg.LoadShedCPUPercent < 0 || cfg.LoadShedCPUPercent > 100 ||
+		(cfg.LoadShedCPUPercent > 0 && (cfg.LoadResumePercent < 1 || cfg.LoadResumePercent >= cfg.LoadShedCPUPercent)) {
+		return Config{}, fmt.Errorf("config: LOAD_SHED_CPU_PERCENT must be 0 (off) to 100, and LOAD_SHED_RESUME_PERCENT from 1 to below it, got %d and %d",
+			cfg.LoadShedCPUPercent, cfg.LoadResumePercent)
+	}
 
 	if cfg.CampaignDialWorkers, err = getEnvInt("CAMPAIGN_DIAL_WORKERS", 10); err != nil {
 		return Config{}, err

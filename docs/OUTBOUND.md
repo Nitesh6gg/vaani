@@ -31,6 +31,7 @@ In `.env` (see `.env.example`):
 | `OUTBOUND_MAX_CALLS` | 20 | Campaign calls this Vaani may have up at once (own key `vaani_capacity:calls`, not Dograh's fleet cap). 0 = org limits only. |
 | `OUTBOUND_DEFAULT_ORG_CONCURRENCY` | 2 | Limit of an organization with none set (Dograh's default). |
 | `CAMPAIGN_POLL_SECONDS` | 5 | How often Dograh's database is scanned. A call ending wakes the scan at once. |
+| `OUTBOUND_MAX_SETUP` | 30 | The dialer places no call while this many answered calls are still being set up (staged, not yet bridged): it never dials faster than Vaani and Asterisk can set calls up. 0 = no cap. |
 | `CAMPAIGN_DIAL_WORKERS` | 10 | Contacts of one campaign dialed at the same time (see "How fast it dials"). 1 = one at a time. |
 | `OUTBOUND_RING_TIMEOUT_SECONDS` | 30 | Ring time before a call counts as unanswered. |
 | `OUTBOUND_TEST_CALL` | | `"<number>,<org id>,<workflow id>"`: dial once at startup, outside any campaign, to try outbound calling. |
