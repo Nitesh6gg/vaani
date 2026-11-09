@@ -25,6 +25,21 @@ var (
 		Help: "Number of calls currently bridged to the media plane.",
 	})
 
+	CPULoadRatio = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "vaani_cpu_load_ratio",
+		Help: "The machine's CPU use over the last 5 seconds, 0..1 (only with LOAD_SHED_CPU_PERCENT set).",
+	})
+
+	Overloaded = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "vaani_overloaded",
+		Help: "1 while the CPU is over LOAD_SHED_CPU_PERCENT and new calls are refused.",
+	})
+
+	CallsRejectedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "vaani_calls_rejected_total",
+		Help: "Calls Vaani refused to take, by reason (cpu: the machine was over LOAD_SHED_CPU_PERCENT), and direction (inbound, outbound: a contact left in the queue).",
+	}, []string{"reason", "direction"})
+
 	CallsStartedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "vaani_calls_started_total",
 		Help: "Calls bridged to the media plane (answered), by direction (inbound, outbound). Rate it for calls started per minute.",

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -576,6 +577,32 @@ func TestRunner_NonARIProviderPausesAndKeepsTheContact(t *testing.T) {
 
 	n, _ := rr.l.ActiveSlots(context.Background(), 7)
 	assert.Zero(t, n)
+}
+
+// Over the CPU limit nothing is dialed, no token or slot is taken and no
+// contact is claimed; once it is back under, dialing carries on.
+func TestRunner_DoesNotDialWhileOverloaded(t *testing.T) {
+	rr := newRunnerRig(t, 3)
+
+	var over atomic.Bool
+
+	over.Store(true)
+	rr.r.cfg.Overloaded = over.Load
+
+	res, wait := rr.r.dialOne(context.Background(), rr.camp)
+	assert.Equal(t, stepWait, res, "wait and look again: the campaign carries on by itself")
+	assert.Equal(t, time.Second, wait)
+
+	assert.Empty(t, rr.placer.dialed())
+	assert.Zero(t, rr.store.claims)
+
+	n, _ := rr.l.ActiveSlots(context.Background(), 7)
+	assert.Zero(t, n)
+	assert.Equal(t, "running", rr.store.state, "not a reason to pause the campaign")
+
+	over.Store(false)
+	rr.dialAll(t)
+	assert.Len(t, rr.placer.dialed(), 2, "back under the limit: dialing resumes (org limit 2)")
 }
 
 func TestRunner_NoTelephonyConfigurationKeepsTheContacts(t *testing.T) {

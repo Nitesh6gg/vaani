@@ -441,3 +441,37 @@ func TestLoad_CampaignDialWorkers(t *testing.T) {
 		assert.ErrorContains(t, err, "CAMPAIGN_DIAL_WORKERS", bad)
 	}
 }
+
+// TestLoad_LoadShed: new calls are refused at 90% CPU by default, resumed
+// under 80%; 0 turns it off; a resume level at or above the limit is refused.
+func TestLoad_LoadShed(t *testing.T) {
+	restoreWD := chdir(t, t.TempDir())
+	defer restoreWD()
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, 90, cfg.LoadShedCPUPercent)
+	assert.Equal(t, 80, cfg.LoadResumePercent)
+
+	t.Setenv("LOAD_SHED_CPU_PERCENT", "75")
+	t.Setenv("LOAD_SHED_RESUME_PERCENT", "60")
+
+	cfg, err = Load()
+	require.NoError(t, err)
+	assert.Equal(t, 75, cfg.LoadShedCPUPercent)
+	assert.Equal(t, 60, cfg.LoadResumePercent)
+
+	t.Setenv("LOAD_SHED_CPU_PERCENT", "0")
+
+	cfg, err = Load()
+	require.NoError(t, err)
+	assert.Zero(t, cfg.LoadShedCPUPercent, "off")
+
+	for _, bad := range [][2]string{{"101", "80"}, {"-1", "80"}, {"90", "90"}, {"90", "0"}, {"x", "80"}} {
+		t.Setenv("LOAD_SHED_CPU_PERCENT", bad[0])
+		t.Setenv("LOAD_SHED_RESUME_PERCENT", bad[1])
+
+		_, err = Load()
+		assert.Error(t, err, "%v", bad)
+	}
+}

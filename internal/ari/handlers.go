@@ -113,6 +113,9 @@ type Manager struct {
 	// agents builds each call's agent and records it in Dograh.
 	agents *callagent.Builder
 
+	// overloaded, when set, says the machine is too busy for another call.
+	overloaded func() bool
+
 	mu        sync.Mutex
 	pending   map[string]*call            // keyed by the externalMedia channel ID, awaiting its StasisStart
 	active    map[string]*call            // keyed by callerID and externalID once bridged (plus transferChannel after a transfer)
@@ -135,6 +138,10 @@ func NewManager(cl ari.Client, cfg config.Config, ports *media.PortAllocator, st
 
 	return m
 }
+
+// SetOverloaded makes the Manager refuse new inbound calls while f says the
+// machine is overloaded (the CPU load guard). Call it before Run.
+func (m *Manager) SetOverloaded(f func() bool) { m.overloaded = f }
 
 // Run subscribes to the Stasis events this app cares about and dispatches them
 // until ctx is cancelled.
@@ -283,10 +290,26 @@ func (m *Manager) onStasisStart(ctx context.Context, e *ari.StasisStart) {
 // (see completeBridge).
 func (m *Manager) startCall(ctx context.Context, e *ari.StasisStart) {
 	id := e.Channel.ID
-	channel := m.cl.Channel().Get(e.Key(ari.ChannelKey, id))
 
 	// A call we dialed is already answered (it only enters Stasis on answer).
 	out := m.outboundFor(id)
+
+	// Over the CPU limit, a new caller is refused before it is answered, as
+	// congestion (SIP 503): the trunk can try another server, and the calls
+	// already up keep their CPU. Calls we placed ourselves are not refused here
+	// (the dialer stops placing them while overloaded).
+	if out == nil && m.overloaded != nil && m.overloaded() {
+		metrics.CallsRejectedTotal.WithLabelValues("cpu", "inbound").Inc()
+		slog.Warn("call refused: cpu over the limit", "call_id", id, "event", "call.rejected", "reason", "cpu")
+
+		if err := m.cl.Channel().Hangup(ari.NewKey(ari.ChannelKey, id), "congestion"); err != nil {
+			slog.Debug("hangup failed", "call_id", id, "channel_id", id, "error", err)
+		}
+
+		return
+	}
+
+	channel := m.cl.Channel().Get(e.Key(ari.ChannelKey, id))
 
 	if out == nil {
 		if err := channel.Answer(); err != nil {

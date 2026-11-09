@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -263,4 +264,43 @@ func TestDial_ShutdownHangsUpWhatIsRinging(t *testing.T) {
 	r.mu.Lock()
 	assert.Contains(t, r.hungUp, id)
 	r.mu.Unlock()
+}
+
+// Over the CPU limit a new caller is hung up as congestion before it is
+// answered, and nothing is allocated for it.
+func TestStartCall_RefusedWhileOverloaded(t *testing.T) {
+	r := newOutboundRig(t)
+
+	var over atomic.Bool
+
+	r.m.SetOverloaded(over.Load)
+	over.Store(true)
+
+	r.m.onStasisStart(context.Background(), &ari.StasisStart{Channel: ari.ChannelData{ID: "caller-1"}})
+
+	r.channels.AssertCalled(t, "Hangup", mock.Anything, "congestion")
+	r.channels.AssertNotCalled(t, "Get", mock.Anything)
+	assert.Zero(t, r.ports.InUse(), "no media port was taken")
+	assert.Empty(t, r.m.pending)
+	assert.Equal(t, []string{"caller-1"}, r.hungUp)
+}
+
+// A call Vaani dialed is already answered; it is not refused here (the dialer
+// stops placing calls while overloaded).
+func TestStartCall_OutboundAnswerIsNotRefused(t *testing.T) {
+	r := newOutboundRig(t)
+	r.m.SetOverloaded(func() bool { return true })
+
+	id := r.dial(t, 30*time.Second)
+	r.channels.On("Get", mock.Anything).Return(ari.NewChannelHandle(ari.NewKey(ari.ChannelKey, id), r.channels, nil))
+	r.channels.On("ExternalMedia", mock.Anything, mock.Anything).Return(nil, nil)
+
+	r.m.onOutboundAnswered(context.Background(), &ari.StasisStart{Args: []string{"outbound", "931"}, Channel: ari.ChannelData{ID: id}})
+
+	r.m.mu.Lock()
+	_, staged := r.m.pending[id]
+	r.m.mu.Unlock()
+
+	assert.True(t, staged, "staged like any answered call")
+	r.channels.AssertNotCalled(t, "Hangup", mock.Anything, "congestion")
 }

@@ -567,6 +567,29 @@ call already finished`.
 - **`end_call` then an interruption:** the end-call still happens even if
   the interruption cancelled the turn the tool ran in.
 
+## CPU guard (`LOAD_SHED_CPU_PERCENT`, default 90)
+
+Past a CPU level the calls already up start missing their 20ms ticks and the
+callers hear jitter. `internal/load` samples the **whole machine's** CPU from
+`/proc/stat` every second (Asterisk shares the box, and a starved Asterisk is as
+bad as a starved Vaani) and averages the last 5 seconds. At or over the limit it
+turns *overloaded*; it turns back only after 10 seconds under
+`LOAD_SHED_RESUME_PERCENT` (80), so it can't flap. Like LiveKit's agent workers
+(`load_threshold`), it only **stops taking new work**; calls in progress are
+never dropped.
+
+- **Inbound:** `startCall` hangs a new caller up as `congestion` (SIP 503)
+  *before answering*, so the trunk can try another server. Nothing is allocated.
+  Calls Vaani dialed itself and transfer legs are not touched.
+- **Outbound:** `Runner.dialOne` waits (1 s) before reading, taking a rate token
+  or slot, or claiming a contact; the campaign carries on by itself afterwards.
+- Metrics: `vaani_cpu_load_ratio`, `vaani_overloaded`,
+  `vaani_calls_rejected_total{reason="cpu",direction}`. Events `load.overloaded`,
+  `load.recovered`, `call.rejected`. Alert on `vaani_overloaded` to add capacity:
+  scale out below this limit, as LiveKit advises.
+- Linux only; elsewhere (no `/proc/stat`) the guard logs `load.unavailable` and
+  never refuses. FreeSWITCH mode is not guarded.
+
 ## Operability endpoints
 
 All served by `internal/metrics.Serve` on `METRICS_ADDR` (default `:9091`), with
