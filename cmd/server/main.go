@@ -284,5 +284,6 @@ func newCampaignRunner(ctx context.Context, cfg config.Config, store *dograh.Sto
 	return campaign.NewRunner(store, campaign.NewLimiter(rdb, cfg.OutboundMaxCalls), mgr, campaign.RunnerConfig{
 		Poll: cfg.CampaignPoll, DefaultOrgLimit: cfg.OutboundDefaultOrgLimit, RingTimeout: cfg.OutboundRingTimeout,
 		Workers: cfg.CampaignDialWorkers, Overloaded: guard.Overloaded,
+		SettingUp: mgr.SettingUp, MaxSettingUp: cfg.OutboundMaxSetup,
 	}), nil
 }

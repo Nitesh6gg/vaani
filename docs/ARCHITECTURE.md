@@ -567,6 +567,40 @@ call already finished`.
 - **`end_call` then an interruption:** the end-call still happens even if
   the interruption cancelled the turn the tool ran in.
 
+## ARI event handling (burst safety)
+
+Found on Nov 9 with a 475-call burst (see `docs/BENCHMARK.md`): the ARI library
+(`stdbus`) gives a subscriber a **100-event buffer and silently drops what
+doesn't fit** (`default: // never block`), and Vaani handled every event inline
+on one loop, each handler making blocking Asterisk requests (answer,
+externalMedia, bridge, hangups). A burst of answered calls filled the buffer:
+lost "answered" / "destroyed" events became `outbound.timeout` (a callee who did
+answer was hung up on), lost externalMedia `StasisStart`s left channels Up on
+Asterisk for ever (nothing ever hung them up, and their calls stayed "in flight"),
+and late handling gave `add caller to bridge 400`.
+
+Now:
+- `Manager.pump` moves events out of the library's buffer at once into Vaani's own
+  20,000-event queue (`vaani_ari_library_queue_length` shows how close to 100 the
+  library ever got; `vaani_ari_events_dropped_total` should stay 0).
+- `Manager.dispatch` hands each event to `serial` (`serial.go`): **one call's events
+  in order, different calls in parallel.** A call's key is its caller channel's ID
+  (an externalMedia leg's events are keyed by its call). No call waits on another's
+  Asterisk requests. At most 16 setups (answer/externalMedia, bridge) run against
+  Asterisk at once (`maxConcurrentSetups`); the rest wait in Vaani.
+- **Setup timeout:** a staged call whose media channel doesn't enter Stasis in 15 s
+  is hung up and its port freed (`call.setup_timeout`). A media channel that enters
+  Stasis with no call waiting for it is hung up, not taken for a new caller.
+- **Orphan sweep** (`ORPHAN_SWEEP_SECONDS`, default 30, `sweep.go`): every 30 s
+  `GET /channels`; a channel in this ARI app, older than 90 s, that Vaani doesn't
+  track (pending, active, transfer, dialed) is hung up (`channel.orphan`).
+- **The dialer follows the setup backlog:** it places no call while
+  `OUTBOUND_MAX_SETUP` (30) answered calls are staged and not yet bridged
+  (`vaani_calls_setting_up`, `vaani_calls_rejected_total{reason="setup"}`).
+- Metrics: `vaani_ari_event_handler_seconds{event}` (how long handling an event
+  takes), `vaani_ari_event_queue_length`, `vaani_calls_setup_timeout_total`,
+  `vaani_orphan_channels_hung_up_total`.
+
 ## CPU guard (`LOAD_SHED_CPU_PERCENT`, default 90)
 
 Past a CPU level the calls already up start missing their 20ms ticks and the

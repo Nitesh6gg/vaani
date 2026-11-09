@@ -52,6 +52,12 @@ type RunnerConfig struct {
 	// Overloaded, when set, says the machine is too busy for another call: the
 	// dialer then places none and claims no contact (LOAD_SHED_CPU_PERCENT).
 	Overloaded func() bool
+	// SettingUp is how many answered calls are staged and not yet bridged, and
+	// MaxSettingUp (OUTBOUND_MAX_SETUP; 0 = no cap) the most the dialer lets
+	// pile up: it places no call while that many wait, so it never dials faster
+	// than Vaani and Asterisk can set calls up.
+	SettingUp    func() int
+	MaxSettingUp int
 }
 
 // Runner dials the campaigns of organizations whose media engine is "vaani":
@@ -256,6 +262,11 @@ func (r *Runner) dialOne(ctx context.Context, c dograh.Campaign) (step, time.Dur
 	if r.cfg.Overloaded != nil && r.cfg.Overloaded() {
 		metrics.CallsRejectedTotal.WithLabelValues("cpu", "outbound").Inc()
 		return stepWait, time.Second
+	}
+
+	if r.cfg.MaxSettingUp > 0 && r.cfg.SettingUp != nil && r.cfg.SettingUp() >= r.cfg.MaxSettingUp {
+		metrics.CallsRejectedTotal.WithLabelValues("setup", "outbound").Inc()
+		return stepWait, 200 * time.Millisecond
 	}
 
 	// The breaker (Redis) and the database checks don't depend on each other,
