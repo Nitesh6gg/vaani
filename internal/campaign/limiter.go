@@ -51,6 +51,7 @@ local key = KEYS[1]
 local now = tonumber(ARGV[1])
 local window_start = tonumber(ARGV[2])
 local max_requests = tonumber(ARGV[3])
+local member = ARGV[4]
 
 -- Remove timestamps older than window
 redis.call('ZREMRANGEBYSCORE', key, 0, window_start)
@@ -59,8 +60,8 @@ redis.call('ZREMRANGEBYSCORE', key, 0, window_start)
 local current_requests = redis.call('ZCARD', key)
 
 if current_requests < max_requests then
-    -- Add current timestamp
-    redis.call('ZADD', key, now, now)
+    -- Add current timestamp (a unique member: equal members would count two dials as one)
+    redis.call('ZADD', key, now, member)
     redis.call('EXPIRE', key, 2)  -- Expire after 2 seconds
     return 1
 else
@@ -170,7 +171,7 @@ func breakerKeys(campaign int) (string, string) {
 func (l *Limiter) AcquireToken(ctx context.Context, org, perSecond int) (bool, error) {
 	now := unixSeconds(l.now())
 
-	n, err := rateScript.Run(ctx, l.rdb, []string{rateKey(org)}, now, now-1.0, perSecond).Int()
+	n, err := rateScript.Run(ctx, l.rdb, []string{rateKey(org)}, now, now-1.0, perSecond, newSlotID(l.now())).Int()
 	if err != nil {
 		return false, fmt.Errorf("campaign: rate limit: %w", err)
 	}
