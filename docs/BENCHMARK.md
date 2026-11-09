@@ -52,6 +52,7 @@ Times are IST. Windows are 1 hour (Oct 27 evening: 30 min).
 | Nov 5 18:07–18:10 (campaign 21, "test_up_2000" resumed, paused after 726 dials) | sarvam-105b-conversations | 378 | 231 min | **94** (1-min max) | 179 | 2.49 / 15.5% | **0.036** | 696 MB | 447 MB | 1442 |
 | Nov 6 14:50–14:55 (campaign 21 again, 1197 dials, paused by hand) | sarvam-105b-conversations | 631 | 261 min | 70 (1-min max) | 169 | 2.19 / 13.7% | 0.038 | 585 MB | 382 MB | 1120 |
 | Nov 9 12:28 (campaign 21, **parallel dial workers**, contact list ran out: 299 dials) | sarvam-105b-conversations | 137 | 58 min | 73 (1-min max) | **266** | 1.03 / 6.5% (1-min avg; the dial burst lasted ~10 s) | 0.048 (short run, see log) | 512 MB | 314 MB | 1089 |
+| Nov 9 16:59–17:04 (campaign 22 resumed, 3,545 dials, org cap 600 held) | sarvam-105b-conversations | 1,050 | 35,631 s (594 min) | **141** (1-min max) | **602** (= org limit) | **4.23 / 26.4%** (1-min avg) | **0.031** | not pulled | not pulled | not pulled |
 | Nov 9 16:30 (campaign 22, **475 dials in 10 s**, paused by the circuit breaker) | sarvam-105b-conversations | 150 | 5,167 s (86 min) | **94** (1-min max) | **468** | 1.50 / 9.4% (1-min avg) | **0.037** | not pulled | not pulled | not pulled |
 
 Idle Vaani: 0.002 core, ~51 MB RSS, 19 goroutines, 23 OS threads (constant under load).
@@ -104,6 +105,7 @@ Stable across three tests. Extrapolated to 250 talking calls (not measured): ~10
 | Nov 6 (campaign 21, sarvam-105b) | 5 (all `tts_closed`; plus 9 "tts websocket closed by provider" ERROR logs) | 0 / 0 | 0 | not available (never received) | 238 ms / 488 ms (from `llm.first_token` logs) | 340 ms / 683 ms (from `tts.first_audio` logs) | 23 (2 calls hung up as media dead) |
 | Nov 9 (campaign 21, parallel dialing, sarvam-105b) | 0 | 0 / 0 | 0 (not queried; no `media dropped` logs) | not available | 195 ms / 367 ms (from `llm.first_token` logs) | p95 576 ms (p50 not pulled) | 3 (1 call hung up as media dead) |
 | Nov 9 16:30 (campaign 22, 475 dials in 10 s) | 0 | 0 / 0 | not queried | not available | p95 438 ms (p50 not pulled) | not pulled | 72 (34 calls hung up as media dead, 47 `media.silent`) |
+| Nov 9 16:59 (campaign 22 resumed, 3,545 dials) | 113 (all `stt`, 17:01–17:03, at 120–140 talking) | 0 / 0 | not queried | not available | p95 512 ms (p50 not pulled) | not pulled | 682 (325 calls hung up as media dead, 358 `media.silent`) |
 
 Reference, Oct 28 (Sarvam LLM): LLM TTFT p50 ~200 ms / p95 ~390 ms; TTS TTFA p95 ~760 ms; STT endpoint p95 ~100–390 ms. Bifrost dashboard (Nov 1–2): gemini-3.1-flash-lite avg 1.08 s per request, 99.7% success; sarvam-105b avg 187 ms. Older tests' errors / drift were not re-pulled: fill the blanks in when re-checking.
 
@@ -178,6 +180,16 @@ Reference, Oct 28 (Sarvam LLM): LLM TTFT p50 ~200 ms / p95 ~390 ms; TTS TTFA p95
 - **Reading (not proven):** Asterisk or the SIP trunk could not set up ~190 answered calls at once; the agent side is not the cause. The 197 no-result calls could also be genuine ring timeouts. Needs Asterisk and trunk logs for 16:30:30–16:31:30 to settle.
 - CPU: 192 CPU-s for 5,167 talk-s = **0.037 core per talking call** (same as Nov 5, 0.036). Peak 1.50 cores in a 1-minute average at 94 talking. LLM first token p95 438 ms, 0 retries, 0 fallbacks, 0 agent errors.
 - **Next:** rerun at a lower dial rate, 10 → 15 → 20/s; confirm the trunk's calls-per-second and channel limits; make the breaker work on a per-second dial budget (not agreed yet).
+
+### Nov 9, 2026 — campaign 22 resumed (3,545 dials, highest load so far)
+
+- Dialed 16:59:25–17:03:20 IST (11:29–11:33 UTC): 3,545 dials, avg ~14/s, 5-s peak 265 (~53/s), mostly 20–110 per 5 s. **In flight sat at 602 for four minutes: the org `CONCURRENT_CALL_LIMIT` 600 held** and throttled the dialer as designed. The breaker did not trip this time. Dialing stopped at ~17:03:20 with no `campaign.paused`/`completed` log (a pause in Dograh, or the list ended; not checked).
+- **Talking calls peaked at 141** (previous best 94; 121–141 for four minutes). CPU 1,107 CPU-s for 35,631 talk-s = **0.031 core per talking call**; peak **4.23 cores (26%)** in a 1-minute average. Per-call cost keeps falling with load; the Vaani box is far from its limit.
+- Outcomes of the 3,545 dials: 1,272 no result from Asterisk (`outbound.timeout`, 36%), 671 no-answer, 244 rejected cause 21, 142 failed cause 16, 116 failed cause 0, 7 cause 38, 4 busy; 1,204 answered (34%); 90 `call.setup_failed` (70 "add caller to bridge", 10 "answer"), 46 abandoned; **1,050 bridged**.
+- **Media dead: 325 of 1,050 bridged calls (31%)** hung up for no inbound audio (23% on the 475-dial burst), 682 "no inbound rtp" watchdog warnings, 358 `media.silent`. They rose with concurrency, 100 per minute at 16:59–17:01. Cause not found: the same suspects as the burst run (Asterisk, SIP trunk, network path to Vaani).
+- **113 STT agent errors**, all at 17:01–17:03 while 120–140 calls were talking (0 before). Error text not captured in the metric; the logs hold only `stage=stt`. Possible Sarvam STT stream limit near ~120+ concurrent streams; unconfirmed.
+- LLM first token p95 512 ms; 0 retries, 0 fallbacks; 95 `tts.clip_missing`. ~40 campaign calls were still shown in flight 2+ minutes after dialing stopped (not checked whether stuck).
+- **Next:** find why a third of bridged calls get no inbound audio (Asterisk/trunk logs at 16:59–17:04; compare with Asterisk channel count); get the STT error text and ask Sarvam about the stream limit; confirm the trunk's concurrent-channel limit.
 
 ## Capacity estimates (NOT measured)
 
