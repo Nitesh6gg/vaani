@@ -53,6 +53,7 @@ Times are IST. Windows are 1 hour (Oct 27 evening: 30 min).
 | Nov 6 14:50–14:55 (campaign 21 again, 1197 dials, paused by hand) | sarvam-105b-conversations | 631 | 261 min | 70 (1-min max) | 169 | 2.19 / 13.7% | 0.038 | 585 MB | 382 MB | 1120 |
 | Nov 9 12:28 (campaign 21, **parallel dial workers**, contact list ran out: 299 dials) | sarvam-105b-conversations | 137 | 58 min | 73 (1-min max) | **266** | 1.03 / 6.5% (1-min avg; the dial burst lasted ~10 s) | 0.048 (short run, see log) | 512 MB | 314 MB | 1089 |
 | Nov 9 16:59–17:04 (campaign 22 resumed, 3,545 dials, org cap 600 held) | sarvam-105b-conversations | 1,050 | 35,631 s (594 min) | **141** (1-min max) | **602** (= org limit) | **4.23 / 26.4%** (1-min avg) | **0.031** | not pulled | not pulled | not pulled |
+| Nov 9 19:18 (campaign 22, 385 dials, first run after the ARI event-loop fix; breaker paused it 3 times on cause-34 rejects) | sarvam-105b-conversations | 173 | 4,792 s (80 min) | 72 (1-min max) | 227 | 1.78 / 11.1% (1-min avg) | 0.046 (short burst) | 548 MB | 271 MB | 1107 |
 | Nov 9 16:30 (campaign 22, **475 dials in 10 s**, paused by the circuit breaker) | sarvam-105b-conversations | 150 | 5,167 s (86 min) | **94** (1-min max) | **468** | 1.50 / 9.4% (1-min avg) | **0.037** | not pulled | not pulled | not pulled |
 
 Idle Vaani: 0.002 core, ~51 MB RSS, 19 goroutines, 23 OS threads (constant under load).
