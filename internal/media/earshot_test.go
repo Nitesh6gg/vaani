@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -35,13 +36,16 @@ func TestEarshotCallMedia_ReframesAndEchoes(t *testing.T) {
 		media   *AudioSocketCallMedia
 	}
 	started := make(chan result, 1)
+	// Frames that arrive in a clump behind their tick are heard but not echoed (see LateHearer), so
+	// the audio is checked as the handler hears it: tick frames and late ones, in order.
+	heard := &orderedHandler{}
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ws, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
 		if !assert.NoError(t, err) {
 			return
 		}
-		m, stats := NewEarshotCallMedia("call-1", ws, nopAudioSocketSink{}, AudioSocketConfig{})
+		m, stats := NewEarshotCallMedia("call-1", ws, nopAudioSocketSink{}, AudioSocketConfig{Handler: heard})
 		started <- result{stats, m}
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -66,18 +70,8 @@ func TestEarshotCallMedia_ReframesAndEchoes(t *testing.T) {
 		rest = rest[n:]
 	}
 
-	var echoed []byte
-	_ = ws.SetReadDeadline(time.Now().Add(3 * time.Second))
-	for len(echoed) < len(sent) {
-		kind, msg, err := ws.ReadMessage()
-		require.NoError(t, err)
-		require.Equal(t, websocket.BinaryMessage, kind)
-		require.Len(t, msg, FrameSize, "every outbound message is exactly one frame")
-		if !bytes.Equal(msg, make([]byte, FrameSize)) { // skip the loopback's echoed silence
-			echoed = append(echoed, msg...)
-		}
-	}
-	assert.Equal(t, sent, echoed, "audio comes back byte for byte, in order")
+	require.Eventually(t, func() bool { return len(heard.audio()) >= len(sent) }, 3*time.Second, 5*time.Millisecond)
+	assert.Equal(t, sent, heard.audio(), "the audio is heard byte for byte, in order")
 
 	require.NoError(t, ws.WriteMessage(websocket.CloseMessage,
 		websocket.FormatCloseMessage(websocket.CloseNormalClosure, "hangup")))
@@ -144,4 +138,34 @@ func TestEarshot_ClearSendsEarshotsClearMessage(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, websocket.TextMessage, kind)
 	assert.JSONEq(t, `{"type":"clear"}`, string(msg))
+}
+
+// orderedHandler records the non-silent audio it hears, tick frames and late ones, in order.
+type orderedHandler struct {
+	mu  sync.Mutex
+	pcm []byte
+}
+
+func (h *orderedHandler) ProcessFrame(_ context.Context, _ string, pcm []byte) [][]byte {
+	h.HearLate(pcm)
+
+	return nil
+}
+
+func (h *orderedHandler) HearLate(pcm []byte) {
+	if bytes.Equal(pcm, make([]byte, FrameSize)) {
+		return
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.pcm = append(h.pcm, pcm...)
+}
+
+func (h *orderedHandler) audio() []byte {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	return append([]byte(nil), h.pcm...)
 }

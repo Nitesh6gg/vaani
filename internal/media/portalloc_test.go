@@ -83,3 +83,44 @@ func TestPortAllocator_ConcurrentAllocNeverDoubleAllocates(t *testing.T) {
 
 	assert.Len(t, seen, count)
 }
+
+func TestPortAllocator_FreedPortIsReusedLast(t *testing.T) {
+	a := NewPortAllocator(20000, 3)
+
+	first, err := a.Alloc()
+	require.NoError(t, err)
+
+	a.Free(first)
+
+	second, err := a.Alloc()
+	require.NoError(t, err)
+	assert.Equal(t, 20001, second, "the port that rested longest comes first")
+
+	third, err := a.Alloc()
+	require.NoError(t, err)
+	assert.Equal(t, 20002, third)
+
+	last, err := a.Alloc()
+	require.NoError(t, err)
+	assert.Equal(t, first, last, "the just-freed port only when the others are taken")
+}
+
+func TestPortAllocator_DoubleFreeDoesNotDuplicate(t *testing.T) {
+	a := NewPortAllocator(20000, 2)
+
+	p, err := a.Alloc()
+	require.NoError(t, err)
+
+	a.Free(p)
+	a.Free(p)
+	a.Free(20999) // never allocated
+
+	assert.Equal(t, 0, a.InUse())
+
+	_, err = a.Alloc()
+	require.NoError(t, err)
+	_, err = a.Alloc()
+	require.NoError(t, err)
+	_, err = a.Alloc()
+	assert.Error(t, err, "a double free must not hand the same port out twice")
+}

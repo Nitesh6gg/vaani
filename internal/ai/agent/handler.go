@@ -647,6 +647,24 @@ func (h *Handler) ProcessFrame(_ context.Context, _ string, pcm []byte) [][]byte
 	}
 }
 
+// HearLate takes a caller frame that arrived behind its tick (a clump from
+// Asterisk or the network): the STT and the voice detector hear it, in order,
+// but it produces no output, so the agent's 20 ms timeline is unchanged. The
+// frame that takes the tick goes through ProcessFrame as always.
+func (h *Handler) HearLate(pcm []byte) {
+	if h.hold.Load() != nil {
+		return
+	}
+
+	if err := h.feedSTT(pcm); err != nil {
+		h.agentError("stt")
+	}
+
+	if h.clock != nil {
+		h.cfg.BargeIn.Detect(pcm)
+	}
+}
+
 // STTAudio is the seconds of caller audio handed to the STT so far -- what
 // Sarvam bills -- and whether only speech was sent (Config.STTGate), as opposed
 // to every frame of the call.

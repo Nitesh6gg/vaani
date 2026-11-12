@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"errors"
 	"net"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/CyCoreSystems/ari/v5"
@@ -452,17 +454,6 @@ func (m *Manager) startCall(ctx context.Context, e *ari.StasisStart) {
 		}
 	}
 
-	port, err := m.ports.Alloc()
-	if err != nil {
-		slog.Error("failed to allocate media port", "call_id", id, "event", "call.setup_failed", "step", "port", "error", err)
-		_ = channel.Hangup()
-		m.outboundSetupFailed(id)
-
-		return
-	}
-
-	metrics.MediaPortsInUse.Set(float64(m.ports.InUse()))
-
 	// Bind/listen on the media socket BEFORE telling Asterisk where to send, so
 	// it's already ready the instant Asterisk's first packet or connection
 	// attempt can possibly arrive. Binding later (once the bridge is up, several
@@ -471,23 +462,50 @@ func (m *Manager) startCall(ctx context.Context, e *ari.StasisStart) {
 	// entirely across a routed/firewalled path (a real production incident --
 	// see docs/AUDIO_PIPELINE.md); for TCP/AudioSocket, Asterisk's connection
 	// attempt would simply be refused outright.
+	//
+	// A port whose previous call is still closing it is busy ("address already in
+	// use"): put it back at the end of the line and take the next one.
 	var (
+		port      int
 		udpConn   *net.UDPConn
 		listener  net.Listener
 		encap     string
 		transport string
+		err       error
 	)
 
-	switch m.cfg.MediaEncapsulation {
-	case "audiosocket":
-		encap, transport = "audiosocket", "tcp"
-		listener, err = net.Listen("tcp", fmt.Sprintf(":%d", port))
-	default:
-		encap, transport = "rtp", "udp"
-		udpConn, err = net.ListenUDP("udp", &net.UDPAddr{Port: port})
-	}
+	for try := 0; ; try++ {
+		port, err = m.ports.Alloc()
+		if err != nil {
+			slog.Error("failed to allocate media port", "call_id", id, "event", "call.setup_failed", "step", "port", "error", err)
+			_ = channel.Hangup()
+			m.outboundSetupFailed(id)
 
-	if err != nil {
+			return
+		}
+
+		metrics.MediaPortsInUse.Set(float64(m.ports.InUse()))
+
+		switch m.cfg.MediaEncapsulation {
+		case "audiosocket":
+			encap, transport = "audiosocket", "tcp"
+			listener, err = net.Listen("tcp", fmt.Sprintf(":%d", port))
+		default:
+			encap, transport = "rtp", "udp"
+			udpConn, err = net.ListenUDP("udp", &net.UDPAddr{Port: port})
+		}
+
+		if err == nil {
+			break
+		}
+
+		if try < 2 && errors.Is(err, syscall.EADDRINUSE) {
+			slog.Warn("media port still in use; trying the next one", "call_id", id, "event", "media.port_busy", "port", port)
+			m.ports.Free(port)
+
+			continue
+		}
+
 		slog.Error("failed to bind media socket", "call_id", id, "event", "call.setup_failed", "step", "bind", "port", port, "encapsulation", encap, "error", err)
 
 		m.ports.Free(port)

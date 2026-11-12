@@ -26,6 +26,26 @@ type AudioSocketSink interface {
 	AudioLevel(rms float64)
 }
 
+// inboundReporter is implemented by sinks that count caller frames: dropped
+// because the inbound queue was full, or late (arrived in a clump behind the
+// tick, but still heard). Optional, so other sinks need no change.
+type inboundReporter interface {
+	InboundDropped()
+	InboundLate()
+}
+
+// LateHearer is implemented by handlers that can take a caller frame that
+// arrived behind its tick (Asterisk or the network delivered a clump): the
+// frame is heard (STT, voice detector, recording) but produces no output, so
+// the agent's own 20 ms timeline is untouched.
+type LateHearer interface {
+	HearLate(pcm []byte)
+}
+
+// inboundQueue is how many caller frames can wait for the release tick: one
+// second of audio, so a clump or a slow start is heard instead of dropped.
+const inboundQueue = 50
+
 // AudioSocketConfig bundles an AudioSocket call's tunables. Handler defaults to
 // LoopbackHandler if nil, same as Config.
 type AudioSocketConfig struct {
@@ -185,7 +205,7 @@ func newFramedCallMedia(callID string, wire frameWire, sink AudioSocketSink, cfg
 		tap:          tap,
 		releasePacer: NewPacer(FrameInterval),
 		writePacer:   NewPacer(FrameInterval),
-		inbound:      make(chan *[]byte, 5),
+		inbound:      make(chan *[]byte, inboundQueue),
 		outbound:     make(chan *[]byte, 5),
 	}
 }
@@ -272,6 +292,10 @@ func (c *AudioSocketCallMedia) readLoop(ctx context.Context, done chan<- struct{
 		case c.inbound <- buf:
 		default:
 			PutFrame(buf) // release isn't keeping up; drop rather than block the reader
+
+			if r, ok := c.sink.(inboundReporter); ok {
+				r.InboundDropped()
+			}
 		}
 	}
 }
@@ -287,15 +311,7 @@ func (c *AudioSocketCallMedia) releaseLoop(ctx context.Context) {
 
 		c.observeDrift(now)
 
-		var raw *[]byte
-
-		select {
-		case f := <-c.inbound:
-			raw = f
-		default:
-			raw = silentFrame()
-		}
-
+		raw := c.takeInbound()
 		pcm := *raw
 
 		c.recorder.WriteIn(pcm)
@@ -326,6 +342,56 @@ func (c *AudioSocketCallMedia) releaseLoop(ctx context.Context) {
 
 		PutFrame(raw)
 	})
+}
+
+// takeInbound is the caller's frame for this tick: of the frames waiting, the
+// newest. Older ones (a clump that arrived behind its ticks) are heard by the
+// handler but take no tick -- taking one frame a tick would never catch up, and
+// the backlog would add delay to every reply. Silence if nothing has arrived.
+func (c *AudioSocketCallMedia) takeInbound() *[]byte {
+	var raw *[]byte
+
+drain:
+	for {
+		select {
+		case f := <-c.inbound:
+			if raw != nil {
+				c.hearLate(raw)
+			}
+
+			raw = f
+		default:
+			break drain
+		}
+	}
+
+	if raw == nil {
+		return silentFrame()
+	}
+
+	return raw
+}
+
+// hearLate hands a caller frame that missed its tick to the debug recorder and
+// tap, and to the handler if it can take one.
+func (c *AudioSocketCallMedia) hearLate(raw *[]byte) {
+	pcm := *raw
+
+	c.recorder.WriteIn(pcm)
+
+	if c.tap != nil {
+		c.tap.Publish(pcm)
+	}
+
+	if lh, ok := c.handler.(LateHearer); ok {
+		lh.HearLate(pcm)
+	}
+
+	if r, ok := c.sink.(inboundReporter); ok {
+		r.InboundLate()
+	}
+
+	PutFrame(raw)
 }
 
 // writeLoop drains the outbound queue on its own tick and sends each frame as a
