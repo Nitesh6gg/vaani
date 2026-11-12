@@ -122,6 +122,16 @@ var (
 		Help: "Total handler output frames dropped because the outbound queue was full (writer not keeping up).",
 	})
 
+	MediaInboundDropped = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "vaani_media_inbound_dropped_total",
+		Help: "Total caller audio frames dropped because the inbound queue (1 s) was full.",
+	})
+
+	MediaInboundLate = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "vaani_media_inbound_late_total",
+		Help: "Total caller audio frames that arrived in a clump behind their 20 ms tick and were still heard.",
+	})
+
 	MediaPortsInUse = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "vaani_media_ports_in_use",
 		Help: "Number of UDP media ports currently allocated.",
@@ -262,6 +272,8 @@ func (AudioSocketSink) SilenceSent()           { AudioSocketSilenceSent.Inc() }
 func (AudioSocketSink) SendError()             { AudioSocketSendErrors.Inc() }
 func (AudioSocketSink) Malformed()             { AudioSocketMalformed.Inc() }
 func (AudioSocketSink) QueueDropped()          { MediaQueueDropped.Inc() }
+func (AudioSocketSink) InboundDropped()        { MediaInboundDropped.Inc() }
+func (AudioSocketSink) InboundLate()           { MediaInboundLate.Inc() }
 func (AudioSocketSink) WatchdogTimeout()       { MediaWatchdogTimeouts.Inc() }
 func (AudioSocketSink) PacerDrift(ms float64)  { PacerDriftMs.Observe(ms) }
 func (AudioSocketSink) AudioLevel(rms float64) { AudioRMS.Set(rms) }

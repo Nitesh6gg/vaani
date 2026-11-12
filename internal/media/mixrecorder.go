@@ -29,7 +29,17 @@ type MixRecorder struct {
 	pcm       []byte
 	max       int  // maxMixRecording; smaller in tests
 	truncated bool // the cap was hit: the rest of the call isn't recorded
+	// silent holds the offsets of ticks recorded with no caller audio (the frame
+	// had not arrived yet): a late frame is mixed into the oldest of them, so
+	// the recording keeps its length and the audio lands where it belongs.
+	silent []int
 }
+
+// maxSilentSlots bounds silent: a stall longer than this (2 s) loses the
+// oldest slots, whose late audio is then not recorded.
+const maxSilentSlots = 100
+
+var zeroFrame = make([]byte, FrameSize)
 
 // NewMixRecorder wraps h.
 func NewMixRecorder(h Handler) *MixRecorder {
@@ -52,6 +62,14 @@ func (r *MixRecorder) ProcessFrame(ctx context.Context, callID string, pcm []byt
 	at := len(r.pcm)
 	r.pcm = append(r.pcm, pcm...)
 
+	if bytes.Equal(pcm, zeroFrame) {
+		if len(r.silent) == maxSilentSlots {
+			r.silent = r.silent[1:]
+		}
+
+		r.silent = append(r.silent, at)
+	}
+
 	// A Handler sends at most one frame a tick in practice; any more are
 	// mixed into the same slot rather than shifting the timeline.
 	for _, f := range out {
@@ -59,6 +77,27 @@ func (r *MixRecorder) ProcessFrame(ctx context.Context, callID string, pcm []byt
 	}
 
 	return out
+}
+
+// HearLate implements LateHearer: a caller frame that missed its tick is
+// passed on to the wrapped handler (if it can hear it) and mixed into the
+// oldest tick that was recorded without caller audio.
+func (r *MixRecorder) HearLate(pcm []byte) {
+	if lh, ok := r.Handler.(LateHearer); ok {
+		lh.HearLate(pcm)
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if len(r.silent) == 0 {
+		return
+	}
+
+	at := r.silent[0]
+	r.silent = r.silent[1:]
+
+	mixInto(r.pcm[at:min(at+FrameSize, len(r.pcm))], pcm)
 }
 
 // mixInto adds src's PCM16 LE samples into dst's, clipping at int16's range.

@@ -2128,3 +2128,18 @@ func TestHandler_NonInterruptibleNodeStillMutesTheCaller(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 	assert.Equal(t, 1, fLLM.streamCalls())
 }
+
+// A caller frame that arrived behind its tick reaches the STT but produces no
+// output and does not move the agent's state.
+func TestHandler_HearLateFeedsSTTAndReturnsNothing(t *testing.T) {
+	fSTT := newFakeSTT()
+	h := NewHandler(context.Background(), "call1", testConfig(fSTT, newFakeTTS(), &fakeLLM{}, 0, 0))
+
+	h.HearLate(constFrame(quietAmplitude))
+	h.HearLate(constFrame(quietAmplitude))
+	out := h.ProcessFrame(context.Background(), "call1", constFrame(quietAmplitude))
+
+	assert.Nil(t, out)
+	assert.Equal(t, 3, fSTT.fedCount(), "both late frames and the tick's frame reached the STT")
+	assert.Equal(t, StateListening, h.State())
+}
